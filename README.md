@@ -4,6 +4,8 @@
 
 服务端**不带任何模型**，也不需要 API key。决策由 MCP 客户端负责，ShellGate 只负责安全地执行。
 
+> 路由器（OpenWrt / ImmortalWrt）请看 [`openwrt/`](openwrt/README.md)：Rust 单文件版本，约 1.4 MB。
+
 ## 特点
 
 | | |

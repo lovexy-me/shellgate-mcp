@@ -12,6 +12,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client  # noqa: E402
 
 TOKEN = "t" * 48
+# Set SHELLGATE_BIN=/path/to/shellgate to run the same suite against the Rust (OpenWrt) build.
+BIN = os.environ.get("SHELLGATE_BIN")
 
 # Talk to the local server directly, never through a configured HTTP proxy.
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -37,7 +39,8 @@ def server(tmp_path_factory):
                SHELLGATE_ENV_FILE=str(tmp / "cfg" / "env"),
                SHELLGATE_STATE_DIR=str(tmp / "state"),
                SHELLGATE_ALLOWED_DIRS=str(work))
-    proc = subprocess.Popen([sys.executable, "-m", "shellgate"], env=env,
+    cmd = [BIN] if BIN else [sys.executable, "-m", "shellgate"]
+    proc = subprocess.Popen(cmd, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     url = f"http://127.0.0.1:{port}"
     for _ in range(50):
@@ -75,7 +78,9 @@ async def test_tools_listed(server):
         async with ClientSession(r, w) as s:
             await s.initialize()
             names = {t.name for t in (await s.list_tools()).tools}
-    assert {"run_command", "start_job", "read_file", "edit_file", "docker_ps", "system_info"} <= names
+    assert {"run_command", "start_job", "read_file", "edit_file", "system_info"} <= names
+    if not BIN:
+        assert "docker_ps" in names
 
 
 async def test_run_command(server):

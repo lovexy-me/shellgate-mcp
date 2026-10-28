@@ -13,3 +13,15 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
       - run: pytest -q
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - working-directory: openwrt
+        run: cargo test --release && cargo build --release
+      - run: pip install -e ".[dev]"
+      - run: SHELLGATE_BIN=$PWD/openwrt/target/release/shellgate pytest -q tests/test_e2e.py

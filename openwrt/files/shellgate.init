@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# procd service for ShellGate MCP. Install as /etc/init.d/shellgate
+START=99
+STOP=10
+USE_PROCD=1
+PROG=/usr/bin/shellgate
+CONF=/etc/shellgate/env
+
+start_service() {
+	[ -x "$PROG" ] || { echo "shellgate: $PROG missing"; return 1; }
+	[ -f "$CONF" ] || { echo "shellgate: $CONF missing"; return 1; }
+	procd_open_instance
+	procd_set_param command "$PROG" --env-file "$CONF"
+	procd_set_param env HOME=/root
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONF"
+	procd_close_instance
+}

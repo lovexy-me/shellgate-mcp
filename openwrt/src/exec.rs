@@ -83,12 +83,30 @@ fn command(s: &Settings, cmd: &str, cwd: &str) -> Command {
     c
 }
 
-pub async fn run_once(s: &Settings, sem: &Semaphore, cmd: &str, cwd: &str, timeout: u64) -> Result<Value, String> {
+pub async fn run_once(s: &Settings, sem: &Semaphore, cmd: &str, cwd: &str, timeout: u64, stdin: Option<&str>) -> Result<Value, String> {
+    run_argv(s, sem, &s.shell, &["-c".to_string(), cmd.to_string()], cwd, timeout, stdin).await
+}
+
+/// Run a program in its own process group; stdin text (if any) is written then closed.
+pub async fn run_argv(s: &Settings, sem: &Semaphore, prog: &str, args: &[String], cwd: &str, timeout: u64,
+                      stdin: Option<&str>) -> Result<Value, String> {
     let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
     let start = Instant::now();
-    let mut child = command(s, cmd, cwd)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+    let mut child = Command::new(prog)
+        .args(args).current_dir(cwd).process_group(0).kill_on_drop(true)
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let writer = match (stdin, child.stdin.take()) {
+        (Some(data), Some(mut pipe)) => {
+            let data = data.as_bytes().to_vec();
+            Some(tokio::spawn(async move {
+                let _ = pipe.write_all(&data).await;
+                let _ = pipe.shutdown().await;
+            }))
+        }
+        _ => None,
+    };
     let out = tokio::spawn(collect(child.stdout.take().unwrap(), s.max_output_bytes));
     let err = tokio::spawn(collect(child.stderr.take().unwrap(), s.max_output_bytes));
     let mut timed_out = false;
@@ -100,8 +118,18 @@ pub async fn run_once(s: &Settings, sem: &Semaphore, cmd: &str, cwd: &str, timeo
             child.wait().await.ok()
         }
     };
-    let (stdout, t1) = out.await.map_err(|e| e.to_string())?.finish();
-    let (stderr, t2) = err.await.map_err(|e| e.to_string())?.finish();
+    if let Some(w) = writer {
+        w.abort();
+    }
+    // a grandchild that escaped the process group could hold the pipes open; don't wait forever
+    let grab = |h: tokio::task::JoinHandle<HeadTail>| async move {
+        match tokio::time::timeout(Duration::from_secs(5), h).await {
+            Ok(Ok(ht)) => ht.finish(),
+            _ => (String::new(), false),
+        }
+    };
+    let (stdout, t1) = grab(out).await;
+    let (stderr, t2) = grab(err).await;
     Ok(json!({
         "exit_code": status.and_then(|s| s.code()),
         "stdout": stdout,

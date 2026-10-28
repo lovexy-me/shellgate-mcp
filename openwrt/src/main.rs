@@ -7,6 +7,7 @@ mod audit;
 mod config;
 mod exec;
 mod policy;
+mod redact;
 mod tools;
 
 use std::net::SocketAddr;
@@ -29,6 +30,9 @@ const INSTRUCTIONS: &str = "ShellGate runs commands and edits files on the user'
 - Commands run as the service user via /bin/sh -c; cwd and env do not persist between calls.\n\
 - On OpenWrt prefer uci, logread, ubus, /etc/init.d/<service> for configuration and services.\n\
 - Long tasks (opkg install, downloads): use start_job, then poll job_output.\n\
+- Multi-line scripts: use run_script, or run_command with stdin (e.g. `ssh host sh -s`).\n\
+- Output is redacted on the server (public IPs, MACs, keys, tokens, secrets); placeholders like\n  \
+<ip> or <x> are not the real values, so never write them back into config files.\n\
 - If a tool answers status=confirmation_required, show the user the command and reasons,\n  \
 and only call again with confirm_code after the user explicitly agrees.\n\
 - Prefer read_file/edit_file over sed/cat for files under the allowed directories.";
@@ -172,13 +176,15 @@ async fn serve(settings: config::Settings) {
     let audit = audit::Audit::new(&settings.audit_log, settings.audit_max_bytes);
     let sem = Semaphore::new(settings.max_concurrent.max(1));
     let mode = if settings.mode_allowlist { "allowlist" } else { "full" };
+    let redactor = redact::Redactor::new(settings.redact, &settings.redact_domains);
+    let redact_state = if settings.redact { "on" } else { "OFF" };
     let audit_path = settings.audit_log.clone();
     let env_file = settings.env_file.clone();
     let policy = match policy::Policy::new(settings) {
         Ok(p) => p,
         Err(e) => { eprintln!("{e}"); std::process::exit(2) }
     };
-    let app = Arc::new(App { policy, audit, jobs: Mutex::new(Default::default()), sem });
+    let app = Arc::new(App { policy, audit, jobs: Mutex::new(Default::default()), sem, redactor });
     let ctx = Arc::new(Ctx { app, expected });
 
     let router = Router::new()
@@ -191,7 +197,7 @@ async fn serve(settings: config::Settings) {
         Ok(l) => l,
         Err(e) => { eprintln!("cannot listen on {addr}: {e}"); std::process::exit(1) }
     };
-    eprintln!("ShellGate {VERSION} (rust) on http://{addr}/mcp (mode={mode}, config={env_file}, audit={audit_path})");
+    eprintln!("ShellGate {VERSION} (rust) on http://{addr}/mcp (mode={mode}, redact={redact_state}, config={env_file}, audit={audit_path})");
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
         tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }

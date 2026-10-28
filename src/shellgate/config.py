@@ -51,6 +51,8 @@ class Settings:
     shell: str = "/bin/bash"
     backup_on_write: bool = True
     env_file: str = ""
+    redact: bool = True
+    redact_domains: list[str] = field(default_factory=list)
 
     @property
     def danger_regexes(self) -> list[re.Pattern[str]]:
@@ -110,4 +112,6 @@ def load_settings(env_file: str | None = None) -> Settings:
         shell=env("SHELLGATE_SHELL", "/bin/bash"),
         backup_on_write=env("SHELLGATE_BACKUP_ON_WRITE", "true").lower() in {"1", "true", "yes"},
         env_file=str(path),
+        redact=env("SHELLGATE_REDACT", "1").strip().lower() not in {"0", "false", "no", "off"},
+        redact_domains=_split(env("SHELLGATE_REDACT_DOMAINS", "")),
     )

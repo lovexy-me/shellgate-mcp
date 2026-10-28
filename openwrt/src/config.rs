@@ -29,6 +29,8 @@ pub struct Settings {
     pub shell: String,
     pub backup_on_write: bool,
     pub env_file: String,
+    pub redact: bool,
+    pub redact_domains: Vec<String>,
 }
 
 fn load_env_file(path: &Path) {
@@ -125,5 +127,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
         shell: get("SHELLGATE_SHELL", "/bin/sh"),
         backup_on_write: matches!(get("SHELLGATE_BACKUP_ON_WRITE", "true").to_lowercase().as_str(), "1" | "true" | "yes"),
         env_file: path.to_string_lossy().to_string(),
+        redact: !matches!(get("SHELLGATE_REDACT", "1").trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        redact_domains: split(&get("SHELLGATE_REDACT_DOMAINS", "")),
     })
 }

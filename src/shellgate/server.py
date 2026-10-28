@@ -4,11 +4,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import hashlib
 import hmac
 import json
 import os
 import platform
+import secrets
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -19,13 +22,21 @@ from mcp.server.transport_security import TransportSecuritySettings
 from . import __version__
 from .audit import AuditLog, client_ip
 from .config import Settings, load_settings
-from .policy import ConfirmStore, allowlist_violations, check_path, danger_reasons
-from .runner import JobManager, run_once
+from .policy import (ConfirmStore, allowlist_violations, check_path, feeds_interpreter,
+                     referenced_scripts, text_danger_reasons)
+from .redact import Redactor, footer
+from .runner import JobManager, run_once, run_process
+
+SCRIPT_INTERPRETERS = ("sh", "bash", "python3", "ash")
+MAX_STDIN = 5_000_000
 
 INSTRUCTIONS = """\
 ShellGate runs commands and edits files on the user's own Linux (WSL2) machine.
 - Commands run as the service user in a fresh login shell; cwd and env do not persist between calls.
 - Long tasks (builds, docker pulls, updates): use start_job, then poll job_output.
+- Multi-line scripts: use run_script, or run_command with stdin (e.g. `ssh host bash -s`).
+- Output is redacted on the server (public IPs, MACs, keys, tokens, secrets); placeholders like
+  <ip> or <x> are not the real values, so never write them back into config files.
 - If a tool answers status=confirmation_required, show the user the command and reasons,
   and only call again with confirm_code after the user explicitly agrees.
 - Windows is reachable from WSL via powershell.exe / cmd.exe in run_command.
@@ -38,6 +49,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
     confirms = ConfirmStore(settings.confirm_ttl)
     jobs = JobManager(settings)
     sem = asyncio.Semaphore(settings.max_concurrent)
+    redactor = Redactor(settings.redact, settings.redact_domains)
     home = str(Path.home())
 
     mcp = FastMCP(
@@ -55,18 +67,26 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
             start = time.monotonic()
+            # inputs run unmodified; only what is returned (and logged) is redacted
+            logged_args, _ = redactor.value(kwargs)
             try:
                 result = await fn(*args, **kwargs)
+                result, counts = redactor.value(result)
                 status = result.get("status", "ok") if isinstance(result, dict) else "ok"
                 extra = {}
                 if isinstance(result, dict) and "exit_code" in result:
                     extra["exit_code"] = result["exit_code"]
-                audit.write(fn.__name__, kwargs, status, int((time.monotonic() - start) * 1000), **extra)
+                if counts and isinstance(result, dict):
+                    result["redacted"] = extra["redacted"] = footer(counts)
+                audit.write(fn.__name__, logged_args, status, int((time.monotonic() - start) * 1000), **extra)
                 return result
             except Exception as e:  # noqa: BLE001 - report every failure to the client and audit
-                audit.write(fn.__name__, kwargs, "error", int((time.monotonic() - start) * 1000),
-                            error=f"{type(e).__name__}: {e}")
-                return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+                err, counts = redactor.text(f"{type(e).__name__}: {e}")
+                audit.write(fn.__name__, logged_args, "error", int((time.monotonic() - start) * 1000), error=err)
+                out = {"status": "error", "error": err}
+                if counts:
+                    out["redacted"] = footer(counts)
+                return out
         return wrapper
 
     def resolve_cwd(cwd: str | None) -> str:
@@ -75,42 +95,111 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
             raise FileNotFoundError(f"cwd does not exist: {path}")
         return str(path.resolve())
 
-    def gate(kind: str, command: str, cwd: str, confirm_code: str | None) -> dict | None:
-        """Return a refusal/confirmation dict, or None when the command may run."""
+    def _digest(text: str | None) -> str:
+        return hashlib.sha256((text or "").encode()).hexdigest()
+
+    def gate(kind: str, command: str, cwd: str, confirm_code: str | None, *, stdin: str | None = None,
+             script: str | None = None, extra: tuple = ()) -> dict | None:
+        """Return a refusal/confirmation dict, or None when the command may run.
+
+        Scans the command, every line of an inline script, local script files the command runs,
+        and stdin when it feeds a shell/python interpreter.
+        """
         violations = allowlist_violations(command, settings)
+        if script is not None and settings.mode == "allowlist":
+            violations += [v for v in allowlist_violations(script, settings) if v not in violations]
         if violations:
             return {"status": "denied", "reasons": violations}
-        reasons = danger_reasons(command, settings)
+        reasons = text_danger_reasons(command, settings)
+        fp_parts: list[str] = [kind, command, cwd, *map(str, extra)]
+        if script is not None:
+            reasons += [f"{w} (in script)" for w in text_danger_reasons(script, settings)]
+            fp_parts.append(_digest(script))
+        code_text = command + "\n" + (script or "")
+        if stdin and feeds_interpreter(code_text):
+            reasons += [f"{w} (in stdin)" for w in text_danger_reasons(stdin, settings)]
+        fp_parts.append(_digest(stdin))
+        for path, body in referenced_scripts(command, cwd) + (
+                referenced_scripts(script, cwd) if script is not None and kind == "script" else []):
+            reasons += [f"{w} (in {path})" for w in text_danger_reasons(body, settings)]
+            fp_parts += [path, _digest(body)]
         if not reasons:
             return None
-        fp = confirms.fingerprint(kind, command, cwd)
+        fp = confirms.fingerprint(*fp_parts)
         if confirms.redeem(confirm_code, fp):
             return None
         return {
             "status": "confirmation_required",
-            "reasons": reasons,
+            "reasons": list(dict.fromkeys(reasons)),
             "command": command,
             "cwd": cwd,
             "confirm_code": confirms.issue(fp),
             "expires_in_s": settings.confirm_ttl,
-            "next": "Ask the user. Only if they explicitly agree, call again with the same "
-                    "command, cwd and this confirm_code.",
+            "next": "Ask the user. Only if they explicitly agree, call again with exactly the same "
+                    "arguments plus this confirm_code.",
         }
+
+    def clamp_timeout(timeout: int | None) -> int:
+        return max(1, min(timeout or settings.default_timeout, settings.max_timeout))
+
+    def check_stdin(stdin: str | None) -> None:
+        if stdin is not None and len(stdin.encode()) > MAX_STDIN:
+            raise ValueError("stdin larger than 5 MB")
 
     # ------------------------------------------------------------------ commands
     @mcp.tool()
     @audited
     async def run_command(command: str, cwd: str | None = None, timeout: int | None = None,
-                          confirm_code: str | None = None) -> dict:
+                          stdin: str | None = None, confirm_code: str | None = None) -> dict:
         """Run a shell command (bash -lc) and wait for it. Returns exit_code, stdout, stderr.
 
         timeout is in seconds (default 60, max 600). For longer work use start_job.
+        stdin (optional) is written to the command's standard input, e.g. command="ssh host bash -s"
+        with the script body in stdin, which avoids nested quoting.
         """
         wd = resolve_cwd(cwd)
-        if (blocked := gate("run", command, wd, confirm_code)):
+        check_stdin(stdin)
+        if (blocked := gate("run", command, wd, confirm_code, stdin=stdin)):
             return blocked
-        t = max(1, min(timeout or settings.default_timeout, settings.max_timeout))
-        return {"status": "ok", **await run_once(command, wd, t, settings, sem)}
+        return {"status": "ok", **await run_once(command, wd, clamp_timeout(timeout), settings, sem, stdin)}
+
+    @mcp.tool()
+    @audited
+    async def run_script(script: str, interpreter: str = "sh", args: list[str] | None = None,
+                         stdin: str | None = None, timeout: int | None = None, cwd: str | None = None,
+                         confirm_code: str | None = None) -> dict:
+        """Run a multi-line script with sh, bash, python3 or ash and wait for it.
+
+        The script is written to a private temp file (removed afterwards) and run as
+        `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as
+        run_command. Returns exit_code, stdout, stderr.
+        """
+        if interpreter not in SCRIPT_INTERPRETERS:
+            raise ValueError(f"interpreter must be one of: {', '.join(SCRIPT_INTERPRETERS)}")
+        if len(script.encode()) > MAX_STDIN:
+            raise ValueError("script larger than 5 MB")
+        check_stdin(stdin)
+        argv_tail = [str(a) for a in (args or [])]
+        exe = shutil.which(interpreter)
+        if not exe:
+            raise FileNotFoundError(f"interpreter not found on this host: {interpreter}")
+        wd = resolve_cwd(cwd)
+        shown = f"{interpreter} <script> {' '.join(argv_tail)}".rstrip()
+        if (blocked := gate("script", shown, wd, confirm_code, stdin=stdin, script=script,
+                            extra=(interpreter, json.dumps(argv_tail)))):
+            if blocked.get("status") == "confirmation_required":
+                blocked["interpreter"] = interpreter
+            return blocked
+        tmpdir = tempfile.mkdtemp(prefix="shellgate-")  # 0700, unique per call
+        try:
+            path = os.path.join(tmpdir, "script.py" if interpreter == "python3" else "script.sh")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(script)
+            result = await run_process([exe, path, *argv_tail], wd, clamp_timeout(timeout), settings, sem, stdin)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return {"status": "ok", "interpreter": interpreter, **result}
 
     @mcp.tool()
     @audited
@@ -166,11 +255,34 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
                 "truncated": start + limit < len(lines), "content": body}
 
     def _backup(p: str) -> str | None:
-        if settings.backup_on_write and os.path.isfile(p):
-            bak = f"{p}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
-            shutil.copy2(p, bak)
-            return bak
-        return None
+        if not (settings.backup_on_write and os.path.isfile(p)):
+            return None
+        base = f"{p}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        for name in [base] + [f"{base}-{secrets.token_hex(2)}" for _ in range(5)]:
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            os.close(fd)
+            shutil.copyfile(p, name)
+            shutil.copystat(p, name)
+            return name
+        raise FileExistsError(f"could not create a unique backup for {p}")
+
+    def _atomic_write(p: str, text: str) -> None:
+        """Write via a unique temp file in the same directory, then rename over the target."""
+        d = os.path.dirname(p)
+        mode = os.stat(p).st_mode & 0o7777 if os.path.exists(p) else None
+        fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(p)}.", suffix=".sgtmp", dir=d)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(tmp, mode if mode is not None else 0o644)
+            os.replace(tmp, p)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
 
     @mcp.tool()
     @audited
@@ -181,8 +293,11 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
             raise ValueError("content larger than 10 MB")
         Path(p).parent.mkdir(parents=True, exist_ok=True)
         bak = None if append else _backup(p)
-        with open(p, "a" if append else "w", encoding="utf-8") as f:
-            f.write(content)
+        if append:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(content)
+        else:
+            _atomic_write(p, content)
         return {"status": "ok", "path": p, "bytes": len(content.encode()), "backup": bak}
 
     @mcp.tool()
@@ -197,8 +312,8 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
         if count > 1 and not replace_all:
             raise ValueError(f"old_string matches {count} times; add context or set replace_all")
         bak = _backup(p)
-        Path(p).write_text(text.replace(old_string, new_string) if replace_all
-                           else text.replace(old_string, new_string, 1), encoding="utf-8")
+        _atomic_write(p, text.replace(old_string, new_string) if replace_all
+                      else text.replace(old_string, new_string, 1))
         return {"status": "ok", "path": p, "replacements": count if replace_all else 1, "backup": bak}
 
     @mcp.tool()
@@ -389,7 +504,7 @@ def main() -> None:
         print(f"WARNING: listening on {settings.host}; prefer 127.0.0.1 behind a tunnel.")
     import uvicorn
     print(f"ShellGate {__version__} on http://{settings.host}:{settings.port}/mcp "
-          f"(mode={settings.mode}, audit={settings.audit_log})")
+          f"(mode={settings.mode}, redact={'on' if settings.redact else 'OFF'}, audit={settings.audit_log})")
     uvicorn.run(create_app(settings), host=settings.host, port=settings.port,
                 log_level="warning", proxy_headers=False)
 

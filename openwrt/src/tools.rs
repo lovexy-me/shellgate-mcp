@@ -12,13 +12,80 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::audit::Audit;
 use crate::exec::{self, Jobs};
-use crate::policy::{within, Policy};
+use crate::policy::{feeds_interpreter, random_hex, referenced_scripts, within, Policy};
+use crate::redact::{Counts, Redactor};
 
 pub struct App {
     pub policy: Policy,
     pub audit: Audit,
     pub jobs: Mutex<Jobs>,
     pub sem: Semaphore,
+    pub redactor: Redactor,
+}
+
+const SCRIPT_INTERPRETERS: &[&str] = &["sh", "bash", "python3", "ash"];
+const MAX_STDIN: usize = 4_000_000;
+
+/// Removes a private temp directory when dropped, whatever happened in between.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = std::env::temp_dir();
+        for _ in 0..10 {
+            let p = base.join(format!("shellgate-{}", random_hex(8)));
+            match fs::DirBuilder::new().mode(0o700).create(&p) {
+                Ok(()) => return Ok(Self(p)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("cannot create temp dir: {e}")),
+            }
+        }
+        Err("cannot create a unique temp dir".into())
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn which(name: &str) -> Option<String> {
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/sbin:/usr/bin:/sbin:/bin".into());
+    path.split(':').filter(|d| !d.is_empty()).map(|d| format!("{d}/{name}"))
+        .find(|p| fs::metadata(p).map(|m| m.is_file() && m.mode() & 0o111 != 0).unwrap_or(false))
+}
+
+fn digest(t: &str) -> String {
+    format!("{:016x}", Policy::fingerprint(&[t]))
+}
+
+/// Write via a unique temp file in the same directory, then rename over the target.
+fn atomic_write(p: &str, content: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = Path::new(p);
+    let dir = path.parent().ok_or("bad path")?;
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mode = fs::metadata(p).map(|m| m.mode() & 0o7777).unwrap_or(0o644);
+    for _ in 0..10 {
+        let tmp = dir.join(format!(".{name}.{}.sgtmp", random_hex(4)));
+        let mut f = match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let res = f.write_all(content).and_then(|_| f.sync_all())
+            .and_then(|_| fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)))
+            .and_then(|_| fs::rename(&tmp, p));
+        if let Err(e) = res {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+        return Ok(());
+    }
+    Err("cannot create a unique temp file".into())
 }
 
 fn obj(props: Value, required: &[&str]) -> Value {
@@ -31,8 +98,12 @@ pub fn definitions() -> Value {
     let b = |d: &str| json!({"type": "boolean", "description": d});
     let confirm = s("One-time code from a previous confirmation_required answer, only after the user agreed");
     json!([
-        {"name": "run_command", "description": "Run a shell command (/bin/sh -c) and wait for it. Returns exit_code, stdout, stderr. timeout in seconds (default 60, max 600); for longer work use start_job.",
-         "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory (default: home)"), "timeout": i("Seconds"), "confirm_code": confirm}), &["command"])},
+        {"name": "run_command", "description": "Run a shell command (/bin/sh -c) and wait for it. Returns exit_code, stdout, stderr. timeout in seconds (default 60, max 600); for longer work use start_job. stdin (optional) is written to the command's standard input, e.g. command=\"ssh host sh -s\" with the script body in stdin.",
+         "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory (default: home)"), "timeout": i("Seconds"), "stdin": s("Text written to the command's stdin"), "confirm_code": confirm.clone()}), &["command"])},
+        {"name": "run_script", "description": "Run a multi-line script with sh, bash, python3 or ash and wait for it. The script is written to a private temp file (removed afterwards) and run as `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as run_command. Returns exit_code, stdout, stderr.",
+         "inputSchema": obj(json!({"script": s("Script body"), "interpreter": {"type": "string", "enum": SCRIPT_INTERPRETERS, "default": "sh", "description": "sh, bash, python3 or ash"},
+                                   "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the script"},
+                                   "stdin": s("Text written to the script's stdin"), "timeout": i("Seconds"), "cwd": s("Working directory (default: home)"), "confirm_code": confirm.clone()}), &["script"])},
         {"name": "start_job", "description": "Start a long-running command in the background. Returns job_id; poll with job_output.",
          "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory"), "confirm_code": confirm}), &["command"])},
         {"name": "job_output", "description": "A background job's status and the last `tail` lines of output (max 2000).",
@@ -84,25 +155,41 @@ fn ok(mut v: Value) -> Value {
 
 impl App {
     /// Run a tool, audit it, and return (result json, is_error).
+    /// Inputs run unmodified; only what is returned (and logged) is redacted.
     pub async fn call(self: &Arc<Self>, ip: &str, name: &str, args: &Value) -> (Value, bool) {
         let start = Instant::now();
         let res = self.dispatch(name, args).await;
         let ms = start.elapsed().as_millis() as u64;
+        let mut logged_args = args.clone();
+        self.redactor.value(&mut logged_args, &mut Counts::default());
+        let mut counts = Counts::default();
         match res {
-            Ok(v) => {
+            Ok(mut v) => {
+                self.redactor.value(&mut v, &mut counts);
                 let status = v.get("status").and_then(Value::as_str).unwrap_or("ok").to_string();
                 let mut extra = Map::new();
                 if let Some(code) = v.get("exit_code") {
                     extra.insert("exit_code".into(), code.clone());
                 }
-                self.audit.write(ip, name, args, &status, ms, extra);
+                if !counts.is_empty() {
+                    if let Value::Object(m) = &mut v {
+                        m.insert("redacted".into(), json!(counts.footer()));
+                    }
+                    extra.insert("redacted".into(), json!(counts.footer()));
+                }
+                self.audit.write(ip, name, &logged_args, &status, ms, extra);
                 (v, false)
             }
             Err(e) => {
+                let e = self.redactor.text(&e, &mut counts);
                 let mut extra = Map::new();
                 extra.insert("error".into(), json!(e));
-                self.audit.write(ip, name, args, "error", ms, extra);
-                (json!({"status": "error", "error": e}), true)
+                self.audit.write(ip, name, &logged_args, "error", ms, extra);
+                let mut out = json!({"status": "error", "error": e});
+                if !counts.is_empty() {
+                    out["redacted"] = json!(counts.footer());
+                }
+                (out, true)
             }
         }
     }
@@ -116,33 +203,80 @@ impl App {
         Ok(p.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into())
     }
 
-    fn gate(&self, kind: &str, cmd: &str, cwd: &str, code: Option<&str>) -> Option<Value> {
-        let v = self.policy.allowlist_violations(cmd);
+    /// Refusal/confirmation answer, or None when the command may run. Scans the command, every
+    /// line of an inline script, local script files the command runs, and stdin when it feeds a
+    /// shell/python interpreter.
+    #[allow(clippy::too_many_arguments)]
+    fn gate(&self, kind: &str, cmd: &str, cwd: &str, code: Option<&str>, stdin: Option<&str>,
+            script: Option<&str>, extra: &[String]) -> Option<Value> {
+        let mut v = self.policy.allowlist_violations(cmd);
+        if let Some(sc) = script.filter(|_| self.policy.settings.mode_allowlist) {
+            for x in self.policy.allowlist_violations(sc) {
+                if !v.contains(&x) {
+                    v.push(x);
+                }
+            }
+        }
         if !v.is_empty() {
             return Some(json!({"status": "denied", "reasons": v}));
         }
-        let reasons = self.policy.danger_reasons(cmd);
+        let mut reasons = self.policy.text_danger_reasons(cmd);
+        let mut fp: Vec<String> = vec![kind.into(), cmd.into(), cwd.into()];
+        fp.extend(extra.iter().cloned());
+        if let Some(sc) = script {
+            reasons.extend(self.policy.text_danger_reasons(sc).into_iter().map(|w| format!("{w} (in script)")));
+            fp.push(digest(sc));
+        }
+        let code_text = format!("{cmd}\n{}", script.unwrap_or(""));
+        if let Some(inp) = stdin.filter(|t| !t.is_empty()) {
+            if feeds_interpreter(&code_text) {
+                reasons.extend(self.policy.text_danger_reasons(inp).into_iter().map(|w| format!("{w} (in stdin)")));
+            }
+        }
+        fp.push(digest(stdin.unwrap_or("")));
+        let mut files = referenced_scripts(cmd, cwd, 1_000_000);
+        if let (Some(sc), "script") = (script, kind) {
+            files.extend(referenced_scripts(sc, cwd, 1_000_000));
+        }
+        for (path, body) in files {
+            reasons.extend(self.policy.text_danger_reasons(&body).into_iter().map(|w| format!("{w} (in {path})")));
+            fp.push(path);
+            fp.push(digest(&body));
+        }
         if reasons.is_empty() {
             return None;
         }
-        let fp = Policy::fingerprint(&[kind, cmd, cwd]);
+        let mut uniq: Vec<String> = vec![];
+        for r in reasons {
+            if !uniq.contains(&r) {
+                uniq.push(r);
+            }
+        }
+        let fp = Policy::fingerprint(&fp);
         if self.policy.redeem(code, fp) {
             return None;
         }
         Some(json!({
-            "status": "confirmation_required", "reasons": reasons, "command": cmd, "cwd": cwd,
+            "status": "confirmation_required", "reasons": uniq, "command": cmd, "cwd": cwd,
             "confirm_code": self.policy.issue(fp), "expires_in_s": self.policy.settings.confirm_ttl,
-            "next": "Ask the user. Only if they explicitly agree, call again with the same command, cwd and this confirm_code.",
+            "next": "Ask the user. Only if they explicitly agree, call again with exactly the same arguments plus this confirm_code.",
         }))
     }
 
     fn backup(&self, p: &str) -> Option<String> {
+        use std::os::unix::fs::OpenOptionsExt;
         if !self.policy.settings.backup_on_write || !Path::new(p).is_file() {
             return None;
         }
         let ts = crate::audit::now_rfc3339().replace([':', '-'], "");
-        let bak = format!("{p}.bak-{ts}");
-        fs::copy(p, &bak).ok().map(|_| bak)
+        let base = format!("{p}.bak-{ts}");
+        for i in 0..6 {
+            let bak = if i == 0 { base.clone() } else { format!("{base}-{}", random_hex(2)) };
+            if fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&bak).is_ok() {
+                return fs::copy(p, &bak).ok().map(|_| bak);
+            }
+        }
+        None
     }
 
     async fn dispatch(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
@@ -151,16 +285,69 @@ impl App {
             "run_command" => {
                 let cmd = req_str(a, "command")?;
                 let cwd = self.resolve_cwd(arg_str(a, "cwd"))?;
-                if let Some(b) = self.gate("run", cmd, &cwd, arg_str(a, "confirm_code")) {
+                let stdin = arg_str(a, "stdin");
+                if stdin.is_some_and(|t| t.len() > MAX_STDIN) {
+                    return Err("stdin larger than 4 MB".into());
+                }
+                if let Some(b) = self.gate("run", cmd, &cwd, arg_str(a, "confirm_code"), stdin, None, &[]) {
                     return Ok(b);
                 }
                 let t = (arg_i64(a, "timeout", s.default_timeout as i64).max(1) as u64).min(s.max_timeout);
-                exec::run_once(s, &self.sem, cmd, &cwd, t).await.map(ok)
+                exec::run_once(s, &self.sem, cmd, &cwd, t, stdin).await.map(ok)
+            }
+            "run_script" => {
+                let script = req_str(a, "script")?;
+                let interp = arg_str(a, "interpreter").filter(|i| !i.is_empty()).unwrap_or("sh");
+                if !SCRIPT_INTERPRETERS.contains(&interp) {
+                    return Err(format!("interpreter must be one of: {}", SCRIPT_INTERPRETERS.join(", ")));
+                }
+                if script.len() > MAX_STDIN {
+                    return Err("script larger than 4 MB".into());
+                }
+                let stdin = arg_str(a, "stdin");
+                if stdin.is_some_and(|t| t.len() > MAX_STDIN) {
+                    return Err("stdin larger than 4 MB".into());
+                }
+                let args: Vec<String> = match a.get("args") {
+                    None | Some(Value::Null) => vec![],
+                    Some(Value::Array(v)) => v.iter().map(|x| match x {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }).collect(),
+                    Some(_) => return Err("args must be a list of strings".into()),
+                };
+                let exe = which(interp).ok_or_else(|| format!("interpreter not found on this host: {interp}"))?;
+                let cwd = self.resolve_cwd(arg_str(a, "cwd"))?;
+                let shown = format!("{interp} <script> {}", args.join(" ")).trim_end().to_string();
+                let extra = [interp.to_string(), serde_json::to_string(&args).unwrap_or_default()];
+                if let Some(mut b) = self.gate("script", &shown, &cwd, arg_str(a, "confirm_code"), stdin, Some(script), &extra) {
+                    if b["status"] == "confirmation_required" {
+                        b["interpreter"] = json!(interp);
+                    }
+                    return Ok(b);
+                }
+                let t = (arg_i64(a, "timeout", s.default_timeout as i64).max(1) as u64).min(s.max_timeout);
+                let dir = TempDir::new()?; // 0700, unique per call, removed on drop
+                let file = dir.0.join(if interp == "python3" { "script.py" } else { "script.sh" });
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file)
+                        .map_err(|e| format!("cannot write script: {e}"))?;
+                    f.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+                }
+                let mut argv = vec![file.to_string_lossy().to_string()];
+                argv.extend(args);
+                let res = exec::run_argv(s, &self.sem, &exe, &argv, &cwd, t, stdin).await;
+                drop(dir);
+                let mut v = res?;
+                v["interpreter"] = json!(interp);
+                Ok(ok(v))
             }
             "start_job" => {
                 let cmd = req_str(a, "command")?;
                 let cwd = self.resolve_cwd(arg_str(a, "cwd"))?;
-                if let Some(b) = self.gate("job", cmd, &cwd, arg_str(a, "confirm_code")) {
+                if let Some(b) = self.gate("job", cmd, &cwd, arg_str(a, "confirm_code"), None, None, &[]) {
                     return Ok(b);
                 }
                 let mut jobs = self.jobs.lock().await;
@@ -230,7 +417,7 @@ impl App {
                     let mut f = fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| e.to_string())?;
                     f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
                 } else {
-                    fs::write(&p, content).map_err(|e| e.to_string())?;
+                    atomic_write(&p, content.as_bytes())?;
                 }
                 Ok(json!({"status": "ok", "path": p, "bytes": content.len(), "backup": bak}))
             }
@@ -251,7 +438,7 @@ impl App {
                 }
                 let bak = self.backup(&p);
                 let out = if all { text.replace(old, new) } else { text.replacen(old, new, 1) };
-                fs::write(&p, out).map_err(|e| e.to_string())?;
+                atomic_write(&p, out.as_bytes())?;
                 Ok(json!({"status": "ok", "path": p, "replacements": if all { count } else { 1 }, "backup": bak}))
             }
             "list_dir" => {

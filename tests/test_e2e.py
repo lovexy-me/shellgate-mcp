@@ -38,7 +38,8 @@ def server(tmp_path_factory):
     env = dict(os.environ, SHELLGATE_TOKEN=TOKEN, SHELLGATE_PORT=str(port),
                SHELLGATE_ENV_FILE=str(tmp / "cfg" / "env"),
                SHELLGATE_STATE_DIR=str(tmp / "state"),
-               SHELLGATE_ALLOWED_DIRS=str(work))
+               SHELLGATE_ALLOWED_DIRS=str(work),
+               SHELLGATE_REDACT="1", SHELLGATE_REDACT_DOMAINS="example.org")
     cmd = [BIN] if BIN else [sys.executable, "-m", "shellgate"]
     proc = subprocess.Popen(cmd, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -143,3 +144,98 @@ async def test_system_info_and_audit(server):
     assert (await _call(url, "system_info"))["mem_mb"]["total"] > 0
     entries = (await _call(url, "audit_tail", n=50))["entries"]
     assert any(e["tool"] == "run_command" for e in entries)
+
+
+async def test_stdin(server):
+    url, work, _ = server
+    r = await _call(url, "run_command", command="cat; echo", stdin="line'with\"quotes\n")
+    assert r["exit_code"] == 0 and "line'with\"quotes" in r["stdout"]
+    r = await _call(url, "run_command", command="sh -s", stdin="echo from-stdin $((2+3))\n")
+    assert "from-stdin 5" in r["stdout"]
+
+
+async def test_stdin_script_is_scanned(server):
+    url, work, _ = server
+    (work / "keep").mkdir()
+    r = await _call(url, "run_command", command="sh -s", cwd=str(work), stdin="echo hi\nrm -rf keep\n")
+    assert r["status"] == "confirmation_required" and (work / "keep").exists()
+    assert any("stdin" in x for x in r["reasons"])
+
+
+async def test_run_script(server):
+    url, work, _ = server
+    r = await _call(url, "run_script", script="#!/bin/sh\necho \"args:$1,$2\"\nread x\necho got:$x\npwd\n",
+                    args=["a b", "c"], stdin="42\n", cwd=str(work))
+    assert r["status"] == "ok" and r["exit_code"] == 0
+    assert "args:a b,c" in r["stdout"] and "got:42" in r["stdout"] and str(work) in r["stdout"]
+    bad = await _call(url, "run_script", script="echo x", interpreter="perl")
+    assert bad["status"] == "error"
+
+
+async def test_run_script_timeout_cleans_up(server):
+    url, *_ = server
+    r = await _call(url, "run_script", script='echo "$0"\nsleep 5\n', timeout=1)
+    assert r["timed_out"] is True
+    path = r["stdout"].strip()
+    assert path and not os.path.exists(path) and not os.path.exists(os.path.dirname(path))
+
+
+async def test_run_script_dangerous_lines_need_confirmation(server):
+    url, work, _ = server
+    (work / "victim").mkdir()
+    script = "echo one\necho two\nrm -rf victim\n"
+    r = await _call(url, "run_script", script=script, cwd=str(work))
+    assert r["status"] == "confirmation_required" and (work / "victim").exists()
+    other = await _call(url, "run_script", script=script + "echo changed\n", cwd=str(work),
+                        confirm_code=r["confirm_code"])
+    assert other["status"] == "confirmation_required"   # code is bound to the exact script
+    r2 = await _call(url, "run_script", script=script, cwd=str(work))
+    ok = await _call(url, "run_script", script=script, cwd=str(work), confirm_code=r2["confirm_code"])
+    assert ok["status"] == "ok" and not (work / "victim").exists()
+
+
+async def test_script_file_referenced_by_command_is_scanned(server):
+    url, work, _ = server
+    (work / "danger.sh").write_text("echo hi\nreboot\n")
+    r = await _call(url, "run_command", command="sh danger.sh", cwd=str(work))
+    assert r["status"] == "confirmation_required"
+
+
+async def test_concurrent_scripts_isolated(server):
+    import asyncio
+    url, *_ = server
+    rs = await asyncio.gather(*[_call(url, "run_script", script=f"echo n{i}; echo $0") for i in range(6)])
+    paths = {r["stdout"].split()[1] for r in rs}
+    assert all(f"n{i}" in rs[i]["stdout"] for i in range(6)) and len(paths) == 6
+
+
+async def test_output_redacted_and_audit_stores_redacted(server):
+    url, work, tmp = server
+    cmd = "echo 'ip 203.0.113.9 lan 192.168.1.1 mac 02:42:ac:11:00:02 host a.example.org password=hunter2'"
+    r = await _call(url, "run_command", command=cmd)
+    out = r["stdout"]
+    assert "<ip>" in out and "192.168.1.1" in out and "<mac>" in out and "<domain>" in out
+    assert "password=<x>" in out and "203.0.113.9" not in out and "hunter2" not in out
+    assert r["redacted"] == "[redacted: ip=1 mac=1 secret=1 domain=1]"
+    f = work / "net.conf"
+    f.write_text("endpoint=203.0.113.4\n")
+    assert "<ip>" in (await _call(url, "read_file", path=str(f)))["content"]
+    assert "203.0.113.4" not in json.dumps(await _call(url, "search_files", pattern="endpoint", path=str(work)))
+    raw = (tmp / "state" / "audit.jsonl").read_text()
+    assert "hunter2" not in raw and "203.0.113.9" not in raw and "02:42:ac:11:00:02" not in raw
+    tail = await _call(url, "audit_tail", n=50)
+    assert "hunter2" not in json.dumps(tail)
+
+
+async def test_no_redaction_switch_in_tools(server):
+    url, *_ = server
+    async with streamablehttp_client(url + "/mcp", headers={"Authorization": f"Bearer {TOKEN}"}) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            tools = (await s.list_tools()).tools
+    for t in tools:
+        assert not any("redact" in p.lower() for p in (t.inputSchema.get("properties") or {}))
+    names = {t.name for t in tools}
+    assert "run_script" in names
+    rc = next(t for t in tools if t.name == "run_command")
+    assert "stdin" in rc.inputSchema["properties"]

@@ -32,24 +32,51 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def run_once(command: str, cwd: str, timeout: int, settings: Settings, sem: asyncio.Semaphore) -> dict:
+async def run_process(argv: list[str], cwd: str, timeout: int, settings: Settings, sem: asyncio.Semaphore,
+                      stdin: str | None = None) -> dict:
+    """Run argv in its own process group; stdin text (if any) is written then closed."""
     async with sem:
         start = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
-            settings.shell, "-lc", command,
+            *argv,
             cwd=cwd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,  # own process group so timeouts kill children too
         )
         timed_out = False
+
+        async def feed() -> None:
+            assert proc.stdin
+            try:
+                proc.stdin.write(stdin.encode())
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        writer = asyncio.create_task(feed()) if stdin is not None else None
+        # read in tasks so output produced before a timeout is kept
+        readers = [asyncio.create_task(proc.stdout.read()), asyncio.create_task(proc.stderr.read())]
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            await asyncio.wait_for(proc.wait(), timeout)
         except asyncio.TimeoutError:
             timed_out = True
             await _kill_group(proc)
-            out, err = await proc.communicate()
+            await proc.wait()
+        if writer:
+            writer.cancel()
+        try:
+            out, err = await asyncio.wait_for(asyncio.gather(*readers), 5)
+        except asyncio.TimeoutError:  # a grandchild escaped the group and holds the pipe open
+            for r in readers:
+                r.cancel()
+            out, err = b"", b""
         stdout, t1 = _clip(out or b"", settings.max_output_bytes)
         stderr, t2 = _clip(err or b"", settings.max_output_bytes)
         return {
@@ -60,6 +87,11 @@ async def run_once(command: str, cwd: str, timeout: int, settings: Settings, sem
             "truncated": t1 or t2,
             "duration_ms": int((time.monotonic() - start) * 1000),
         }
+
+
+async def run_once(command: str, cwd: str, timeout: int, settings: Settings, sem: asyncio.Semaphore,
+                   stdin: str | None = None) -> dict:
+    return await run_process([settings.shell, "-lc", command], cwd, timeout, settings, sem, stdin)
 
 
 @dataclass

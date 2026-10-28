@@ -36,6 +36,7 @@ DANGER_PATTERNS: list[tuple[str, str]] = [
     (r"\biptables\b.*-(F|X)\b", "flush firewall"),
     (r"\bufw\s+(disable|reset)\b", "disable firewall"),
     (r"\bcrontab\s+-r\b", "delete crontab"),
+    (r"\bshutil\.rmtree\b", "recursive delete (python)"),
 ]
 
 _COMPILED = [(re.compile(p, re.IGNORECASE), why) for p, why in DANGER_PATTERNS]
@@ -45,6 +46,58 @@ def danger_reasons(command: str, settings: Settings) -> list[str]:
     reasons = [why for rx, why in _COMPILED if rx.search(command)]
     reasons += [f"custom pattern: {rx.pattern}" for rx in settings.danger_regexes if rx.search(command)]
     return reasons
+
+
+INTERPRETERS = {"sh", "bash", "ash", "dash", "zsh", "python", "python3"}
+_WORDS_RE = re.compile(r"[\s;|&()]+")
+
+
+def text_danger_reasons(text: str, settings: Settings) -> list[str]:
+    """Scan a whole script/command: the text as one piece and every (continued) line on its own."""
+    joined = re.sub(r"\\\r?\n", " ", text)
+    seen: list[str] = []
+    for chunk in [joined, *joined.splitlines()]:
+        if not chunk.strip():
+            continue
+        for why in danger_reasons(chunk, settings):
+            if why not in seen:
+                seen.append(why)
+    return seen
+
+
+def feeds_interpreter(command: str) -> bool:
+    """True when the command runs a shell/python that will read code from stdin (e.g. ssh host bash -s)."""
+    return any(Path(w).name in INTERPRETERS for w in _WORDS_RE.split(command) if w)
+
+
+def referenced_scripts(command: str, cwd: str, max_bytes: int = 1_000_000) -> list[tuple[str, str]]:
+    """Local script files a command would execute: `sh x.sh`, `bash -x ./y`, `. ./env`, `./run.sh`."""
+    found: list[tuple[str, str]] = []
+    for part in _SPLIT_RE.split(command):
+        try:
+            tokens = shlex.split(part)
+        except ValueError:
+            continue
+        while tokens and (re.match(r"^\w+=", tokens[0]) or tokens[0] in {"sudo", "exec", "nohup", "env"}):
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        cands: list[str] = []
+        if "/" in tokens[0]:
+            cands.append(tokens[0])
+        if Path(tokens[0]).name in INTERPRETERS | {"source", "."}:
+            rest = [t for t in tokens[1:] if not t.startswith("-")]
+            if rest:
+                cands.append(rest[0])
+        for c in cands:
+            fp = Path(c).expanduser()
+            fp = fp if fp.is_absolute() else Path(cwd) / fp
+            try:
+                if fp.is_file() and fp.stat().st_size <= max_bytes:
+                    found.append((str(fp), fp.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                continue
+    return found
 
 
 _SPLIT_RE = re.compile(r"\|\||&&|;|\||\n|`|\$\(")

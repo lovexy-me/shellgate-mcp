@@ -38,7 +38,69 @@ const DANGER: &[(&str, &str)] = &[
     (r"\b(passwd|userdel)\b", "account change"),
     (r"\b(iptables|nft)\b.*\s-(F|X)\b|\bnft\s+flush\b", "flush firewall"),
     (r"\bcrontab\s+-r\b", "delete crontab"),
+    (r"\bshutil\.rmtree\b", "recursive delete (python)"),
 ];
+
+pub const INTERPRETERS: &[&str] = &["sh", "bash", "ash", "dash", "zsh", "python", "python3"];
+
+fn split_re() -> &'static Regex {
+    static SPLIT: OnceLock<Regex> = OnceLock::new();
+    SPLIT.get_or_init(|| Regex::new(r"\|\||&&|;|\||\n").unwrap())
+}
+
+fn assign_re() -> &'static Regex {
+    static ASSIGN: OnceLock<Regex> = OnceLock::new();
+    ASSIGN.get_or_init(|| Regex::new(r"^\w+=").unwrap())
+}
+
+fn base_name(p: &str) -> String {
+    Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// True when the command runs a shell/python that will read code from stdin (e.g. ssh host bash -s).
+pub fn feeds_interpreter(cmd: &str) -> bool {
+    cmd.split(|c: char| c.is_whitespace() || ";|&()".contains(c))
+        .filter(|w| !w.is_empty())
+        .any(|w| INTERPRETERS.contains(&base_name(w).as_str()))
+}
+
+/// Local script files a command would execute: `sh x.sh`, `bash -x ./y`, `. ./env`, `./run.sh`.
+pub fn referenced_scripts(cmd: &str, cwd: &str, max_bytes: u64) -> Vec<(String, String)> {
+    let mut found = vec![];
+    for part in split_re().split(cmd) {
+        let Some(mut tokens) = shlex::split(part) else { continue };
+        while !tokens.is_empty() && (assign_re().is_match(&tokens[0]) || ["sudo", "exec", "nohup", "env"].contains(&tokens[0].as_str())) {
+            tokens.remove(0);
+        }
+        if tokens.is_empty() {
+            continue;
+        }
+        let mut cands: Vec<String> = vec![];
+        if tokens[0].contains('/') {
+            cands.push(tokens[0].clone());
+        }
+        let first = base_name(&tokens[0]);
+        if INTERPRETERS.contains(&first.as_str()) || tokens[0] == "source" || tokens[0] == "." {
+            if let Some(t) = tokens[1..].iter().find(|t| !t.starts_with('-')) {
+                cands.push(t.clone());
+            }
+        }
+        for c in cands {
+            let c = if let Some(rest) = c.strip_prefix('~') {
+                format!("{}{}", std::env::var("HOME").unwrap_or_default(), rest)
+            } else { c };
+            let p = if c.starts_with('/') { PathBuf::from(&c) } else { Path::new(cwd).join(&c) };
+            if let Ok(m) = std::fs::metadata(&p) {
+                if m.is_file() && m.len() <= max_bytes {
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        found.push((p.to_string_lossy().to_string(), String::from_utf8_lossy(&bytes).into_owned()));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
 
 fn compiled() -> &'static Vec<(Regex, &'static str)> {
     static C: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
@@ -69,6 +131,24 @@ impl Policy {
         r
     }
 
+    /// Scan a whole script/command: the text as one piece and every (continued) line on its own.
+    pub fn text_danger_reasons(&self, text: &str) -> Vec<String> {
+        static CONT: OnceLock<Regex> = OnceLock::new();
+        let joined = CONT.get_or_init(|| Regex::new(r"\\\r?\n").unwrap()).replace_all(text, " ").to_string();
+        let mut seen: Vec<String> = vec![];
+        for chunk in std::iter::once(joined.as_str()).chain(joined.lines()) {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            for why in self.danger_reasons(chunk) {
+                if !seen.contains(&why) {
+                    seen.push(why);
+                }
+            }
+        }
+        seen
+    }
+
     pub fn allowlist_violations(&self, cmd: &str) -> Vec<String> {
         if !self.settings.mode_allowlist {
             return vec![];
@@ -76,10 +156,7 @@ impl Policy {
         if cmd.contains('`') || cmd.contains("$(") {
             return vec!["command substitution is not allowed in allowlist mode".into()];
         }
-        static SPLIT: OnceLock<Regex> = OnceLock::new();
-        let split = SPLIT.get_or_init(|| Regex::new(r"\|\||&&|;|\||\n").unwrap());
-        static ASSIGN: OnceLock<Regex> = OnceLock::new();
-        let assign = ASSIGN.get_or_init(|| Regex::new(r"^\w+=").unwrap());
+        let (split, assign) = (split_re(), assign_re());
         let mut bad: Vec<String> = vec![];
         for part in split.split(cmd) {
             let part = part.trim();
@@ -99,9 +176,11 @@ impl Policy {
         bad.into_iter().map(|p| format!("not in allowlist: {p}")).collect()
     }
 
-    pub fn fingerprint(parts: &[&str]) -> u64 {
+    pub fn fingerprint<S: AsRef<str>>(parts: &[S]) -> u64 {
         let mut h = DefaultHasher::new();
-        parts.hash(&mut h);
+        for p in parts {
+            p.as_ref().hash(&mut h);
+        }
         h.finish()
     }
 
@@ -214,6 +293,7 @@ mod tests {
             extra_danger_patterns: vec![r"opkg\s+remove".into()], audit_log: "/tmp/a".into(), audit_max_bytes: 1,
             default_timeout: 1, max_timeout: 1, max_output_bytes: 1, max_concurrent: 1, max_jobs: 1,
             confirm_ttl: 60, shell: "/bin/sh".into(), backup_on_write: true, env_file: String::new(),
+            redact: true, redact_domains: vec![],
         }
     }
 
@@ -236,6 +316,27 @@ mod tests {
         assert_eq!(p.allowlist_violations("uci show && wget x"), vec!["not in allowlist: wget"]);
         assert!(!p.allowlist_violations("echo $(id)").is_empty());
         assert!(Policy::new(s(false)).unwrap().allowlist_violations("anything").is_empty());
+    }
+
+    #[test]
+    fn script_scanning() {
+        let p = Policy::new(s(false)).unwrap();
+        assert!(p.text_danger_reasons("#!/bin/sh\necho start\nrm -rf build\necho done\n").contains(&"recursive delete".to_string()));
+        assert!(p.text_danger_reasons("echo a\nls -la\n").is_empty());
+        assert!(!p.text_danger_reasons("rm \\\n  -rf /x").is_empty());
+        assert!(!p.text_danger_reasons("import shutil\nshutil.rmtree('/srv')").is_empty());
+        assert!(feeds_interpreter("ssh router bash -s"));
+        assert!(feeds_interpreter("/usr/bin/python3 -"));
+        assert!(!feeds_interpreter("cat > /tmp/notes.txt"));
+        let d = format!("/tmp/sgt-ref-{}", random_hex(4));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(format!("{d}/x.sh"), "echo hi\nreboot\n").unwrap();
+        let f = referenced_scripts("sh x.sh", &d, 1_000_000);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].1.contains("reboot"));
+        assert!(!referenced_scripts("FOO=1 bash -e ./x.sh arg", &d, 1_000_000).is_empty());
+        assert!(referenced_scripts("echo x.sh", &d, 1_000_000).is_empty());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

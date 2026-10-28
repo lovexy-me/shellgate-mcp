@@ -65,3 +65,31 @@ def test_paths():
         check_path("relative.txt", s)
     with pytest.raises(PermissionError):
         check_path("/etc/hosts", S(mode="allowlist"))               # allowlist confines reads
+
+
+from shellgate.policy import feeds_interpreter, referenced_scripts, text_danger_reasons  # noqa: E402
+
+
+def test_script_lines_scanned():
+    script = "#!/bin/sh\necho start\ncd /tmp\nrm -rf build\necho done\n"
+    assert "recursive delete" in text_danger_reasons(script, S())
+    assert text_danger_reasons("echo a\nls -la\n", S()) == []
+    # line continuation joined before scanning
+    assert text_danger_reasons("rm \\\n  -rf /x", S())
+    assert text_danger_reasons("import shutil\nshutil.rmtree('/srv')", S())
+
+
+def test_feeds_interpreter():
+    assert feeds_interpreter("ssh router bash -s")
+    assert feeds_interpreter("/usr/bin/python3 -")
+    assert not feeds_interpreter("cat > /tmp/notes.txt")
+
+
+def test_referenced_scripts(tmp_path):
+    f = tmp_path / "x.sh"
+    f.write_text("echo hi\nreboot\n")
+    found = referenced_scripts("sh x.sh", str(tmp_path))
+    assert found and found[0][0] == str(f) and "reboot" in found[0][1]
+    assert referenced_scripts("FOO=1 bash -e ./x.sh arg", str(tmp_path))
+    assert referenced_scripts(f"{f}", "/")
+    assert referenced_scripts("echo x.sh", str(tmp_path)) == []

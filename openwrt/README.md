@@ -14,6 +14,8 @@
 | 审计日志 | `~/.local/state/shellgate` | `/var/log/shellgate`（内存，重启清空，保护闪存） |
 | 额外危险命令 | | `sysupgrade`、`firstboot`、`jffs2reset`、`mtd write/erase`、`fw_setenv`、重启 network/firewall/dropbear/cloudflared 等 |
 
+v0.2.0 起与 Python 版行为一致：默认输出脱敏（`SHELLGATE_REDACT`、`SHELLGATE_REDACT_DOMAINS`）、`run_command` 支持 `stdin`、新增 `run_script`（解释器 `sh` / `ash`，装了的话也可用 `bash` / `python3`），说明见[主 README](../README.md#输出脱敏--output-redactionv020)。
+
 MCP 传输：Streamable HTTP，无状态，JSON 响应（`POST /mcp`）。`/health` 免鉴权。
 
 ## 支持的 CPU

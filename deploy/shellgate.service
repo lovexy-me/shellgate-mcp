@@ -1,0 +1,14 @@
+[Unit]
+Description=ShellGate MCP server
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@APP_DIR@/venv/bin/shellgate --env-file @ENV_FILE@
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=false
+# Leave NoNewPrivileges off so commands that use sudo keep working.
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+# Add a hostname for ShellGate to your existing cloudflared config (~/.cloudflared/config.yml),
+# above the final catch-all rule, then: cloudflared tunnel route dns <tunnel> shell.example.com
+# and restart cloudflared. Do not put an interactive Cloudflare Access login in front of /mcp:
+# MCP clients can't complete it. The bearer token is the gate.
+ingress:
+  - hostname: shell.example.com
+    service: http://127.0.0.1:8790
+  # ...your existing rules...
+  - service: http_status:404

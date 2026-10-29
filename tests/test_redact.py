@@ -111,3 +111,15 @@ def test_version_strings_not_ip():
     assert r.text(v)[0] == v
     assert r.text("dns 8.8.4.4 conversion 8.8.8.8")[0] == "dns <ip> conversion <ip>"
     assert r.text("range 8.8.8.8-9")[0] == "range <ip>-9"
+
+
+def test_ipv6_with_port_and_fail_closed():
+    from shellgate.redact import Redactor
+    r = Redactor(True, [])
+    t = ("tcp 2001:db8:1101:694c:319a:4f87:3571:dc00:25932 x\ntcp 2409:8a00:111f:40d0::1:53 y\n"
+         "udp [2001:db8::5]:51820 z\nfd00::1:53 fe80::e2ef:2ff:fe56:df30:53")
+    o = r.text(t)[0]
+    assert "2001:db8" not in o and "2409:" not in o, o
+    assert "<ipv6>:25932" in o
+    assert "fd00::1:53" in o and "fe80::e2ef:2ff:fe56:df30:53" in o
+    assert r.text("time 12:34:56 mac-ish c9:6d:d9:2e")[0] == "time 12:34:56 mac-ish c9:6d:d9:2e"

@@ -43,6 +43,8 @@ struct Rx {
     ipv4: Regex,
     version_ctx: Regex,
     ipv6: Regex,
+    ipv6_port: Regex,
+    ipv6_looks_global: Regex,
     mac: Regex,
     run: Regex,
 }
@@ -62,7 +64,9 @@ fn rx() -> &'static Rx {
         uuid: Regex::new(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}").unwrap(),
         ipv4: Regex::new(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}").unwrap(),
         version_ctx: Regex::new(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$").unwrap(),
-        ipv6: Regex::new(r"[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:%[A-Za-z0-9_.-]+)?").unwrap(),
+        ipv6: Regex::new(r"[0-9A-Fa-f]{0,5}(?::[0-9A-Fa-f]{0,5}){2,8}(?:%[A-Za-z0-9_.-]+)?").unwrap(),
+        ipv6_port: Regex::new(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$").unwrap(),
+        ipv6_looks_global: Regex::new(r"(?:^|:)[23][0-9A-Fa-f]{3}(?::[0-9A-Fa-f]{0,5}){3,}").unwrap(),
         mac: Regex::new(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}").unwrap(),
         run: Regex::new(r"[A-Za-z0-9+/_-]+={0,2}").unwrap(),
     })
@@ -285,15 +289,27 @@ impl Redactor {
         t = sub(&r.ipv6, &t, |m, s| {
             let m0 = m.get(0).unwrap();
             let cand = m0.as_str();
-            if is_word(after(s, m0.end())) || is_in(after(s, m0.end()), ":.") {
+            if is_word(after(s, m0.end())) {
                 return None;
             }
-            let whole = ipv6_is_global(cand);
+            let mut core = cand;
+            let mut port = String::new();
+            let mut whole = ipv6_is_global(core);
+            if whole.is_none() {
+                if let Some(pm) = r.ipv6_port.captures(cand) {
+                    let a = pm.get(1).unwrap().as_str();
+                    if ipv6_is_global(a).is_some() {
+                        core = a;
+                        port = format!(":{}", pm.get(2).unwrap().as_str());
+                        whole = ipv6_is_global(core);
+                    }
+                }
+            }
             let b = before(s, m0.start());
             let boundary_ok = !(is_word(b) || is_in(b, ":."));
             if boundary_ok && whole == Some(true) {
                 c.hit("ipv6");
-                return Some("<ipv6>".into());
+                return Some(format!("<ipv6>{}", port));
             }
             if boundary_ok && whole.is_some() {
                 return None;
@@ -309,6 +325,10 @@ impl Redactor {
                     c.hit("ipv6");
                     return Some(format!("{}<ipv6>", &cand[..i + 1]));
                 }
+            }
+            if r.ipv6_looks_global.is_match(cand) {
+                c.hit("ipv6");
+                return Some("<ipv6>".into());
             }
             None
         });
@@ -391,6 +411,16 @@ mod tests {
         assert_eq!(red(v).0, v);
         assert_eq!(red("dns 8.8.4.4 conversion 8.8.8.8").0, "dns <ip> conversion <ip>");
         assert_eq!(red("range 8.8.8.8-9").0, "range <ip>-9");
+    }
+
+    #[test]
+    fn ipv6_with_port_and_fail_closed() {
+        let t = "tcp 2001:db8:1101:694c:319a:4f87:3571:dc00:25932 x\ntcp 2409:8a00:111f:40d0::1:53 y\nudp [2001:db8::5]:51820 z\nfd00::1:53 fe80::e2ef:2ff:fe56:df30:53";
+        let (o, _) = red(t);
+        assert!(!o.contains("2001:db8") && !o.contains("2409:"), "{o}");
+        assert!(o.contains("<ipv6>:25932"));
+        assert!(o.contains("fd00::1:53") && o.contains("fe80::e2ef:2ff:fe56:df30:53"));
+        assert_eq!(red("time 12:34:56 mac-ish c9:6d:d9:2e").0, "time 12:34:56 mac-ish c9:6d:d9:2e");
     }
 
     #[test]

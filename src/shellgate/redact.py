@@ -30,7 +30,10 @@ _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
 _UUID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 _IPV4 = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
 _VERSION_CTX = re.compile(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$")
-_IPV6 = re.compile(r"[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:%[A-Za-z0-9_.-]+)?")
+_IPV6 = re.compile(r"[0-9A-Fa-f]{0,5}(?::[0-9A-Fa-f]{0,5}){2,8}(?:%[A-Za-z0-9_.-]+)?")
+_IPV6_PORT = re.compile(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$")
+# fail closed: anything that still looks like a global unicast address (2000::/3) is masked
+_IPV6_LOOKS_GLOBAL = re.compile(r"(?:^|:)[23][0-9A-Fa-f]{3}(?::[0-9A-Fa-f]{0,5}){3,}")
 _MAC = re.compile(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}"
                   r"|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}")
 _RUN = re.compile(r"[A-Za-z0-9+/_-]+={0,2}")
@@ -184,12 +187,18 @@ class Redactor:
 
         def ip6(m: re.Match[str], t: str) -> str | None:
             cand, start = m.group(), m.start()
-            if _after(t, m.end()) in _WORD | {":", "."}:
+            if _after(t, m.end()) in _WORD:
                 return None
-            whole = ipv6_is_global(cand)
+            core, port = cand, ""
+            whole = ipv6_is_global(core)
+            if whole is None:
+                pm = _IPV6_PORT.match(cand)  # netstat style "2001:db8::1:443"
+                if pm and ipv6_is_global(pm.group(1)) is not None:
+                    core, port = pm.group(1), ":" + pm.group(2)
+                    whole = ipv6_is_global(core)
             boundary_ok = _before(t, start) not in _WORD | {":", "."}
             if boundary_ok and whole:
-                return hit("ipv6", "<ipv6>")
+                return hit("ipv6", "<ipv6>") + port
             if boundary_ok and whole is not None:
                 return None  # a complete non-global address such as fd12:3456::9
             # "label:2001:db8::1" - try the part after each single colon
@@ -199,6 +208,8 @@ class Redactor:
                 rest = cand[i + 1:]
                 if ("::" in rest or rest.count(":") == 7) and ipv6_is_global(rest):
                     return cand[:i + 1] + hit("ipv6", "<ipv6>")
+            if _IPV6_LOOKS_GLOBAL.search(cand):
+                return hit("ipv6", "<ipv6>")
             return None
         text = _sub(_IPV6, text, ip6)
 

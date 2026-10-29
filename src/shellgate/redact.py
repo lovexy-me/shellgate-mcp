@@ -181,7 +181,15 @@ class Redactor:
             if _before(t, m.start()) in _ALNUM | {".", "_"}:
                 return None
             a = _after(t, m.end())
-            if a in _ALNUM or (a == "." and _after(t, m.end() + 1) in "0123456789" and _after(t, m.end() + 1)):
+            if a == "." and _after(t, m.end() + 1) in "0123456789" and _after(t, m.end() + 1):
+                # tcpdump-style a.b.c.d.port: a 2-5 digit port (<= 65535), then a non-word, non-dot boundary
+                j = m.end() + 1
+                while j < len(t) and t[j].isdigit():
+                    j += 1
+                port = t[m.end() + 1:j]
+                if not 2 <= len(port) <= 5 or int(port) > 65535 or _after(t, j) in _ALNUM | {"."}:
+                    return None
+            elif a in _ALNUM:
                 return None
             # version strings: 5.15.153.1-microsoft, "version 1.2.3.4", "ver: 1.0.0.12"
             if a == "-" and _after(t, m.end() + 1).isascii() and _after(t, m.end() + 1).isalpha():

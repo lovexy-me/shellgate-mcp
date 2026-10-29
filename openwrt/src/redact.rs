@@ -290,7 +290,18 @@ impl Redactor {
                 return None;
             }
             let a = after(s, m0.end());
-            if is_alnum(a) || (a == Some('.') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_digit())) {
+            if a == Some('.') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_digit()) {
+                // tcpdump-style a.b.c.d.port: a 2-5 digit port (<= 65535), then a non-word, non-dot boundary
+                let bytes = s.as_bytes();
+                let mut j = m0.end() + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() { j += 1; }
+                let port = &s[m0.end() + 1..j];
+                let n = after(s, j);
+                if !(2..=5).contains(&port.len()) || port.parse::<u32>().map_or(true, |p| p > 65535)
+                    || is_alnum(n) || n == Some('.') {
+                    return None;
+                }
+            } else if is_alnum(a) {
                 return None;
             }
             // version strings: 5.15.153.1-microsoft, "version 1.2.3.4", "ver: 1.0.0.12"
@@ -521,6 +532,16 @@ mod tests {
         assert_eq!(red(v).0, v);
         assert_eq!(red("dns 8.8.4.4 conversion 8.8.8.8").0, "dns <ip> conversion <ip>");
         assert_eq!(red("range 8.8.8.8-9").0, "range <ip>-9");
+    }
+
+    #[test]
+    fn ipv4_tcpdump_port_suffix() {
+        let (o, f) = red("IP 198.51.100.7.58686 > 203.0.113.9.123: UDP, length 148\nIP 192.168.1.2.22 > 10.0.0.1.53: x\n  2 IP 203.0.113.9.58686");
+        assert_eq!(o, "IP <ip>.58686 > <ip>.123: UDP, length 148\nIP 192.168.1.2.22 > 10.0.0.1.53: x\n  2 IP <ip>.58686");
+        assert_eq!(f, "[redacted: ip=3]");
+        for keep in ["1.2.3.4.5", "8.8.8.8.123456", "8.8.8.8.99999", "8.8.8.8.53.1", "8.8.8.8.53a", "v9.9.9.9.80"] {
+            assert_eq!(red(keep).0, keep, "{keep}");
+        }
     }
 
     #[test]

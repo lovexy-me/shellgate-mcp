@@ -145,6 +145,14 @@ def test_ipv4_partial_prefixes_kept(keep):
     assert red(keep)[0] == keep
 
 
+def test_ipv4_tcpdump_port_suffix():
+    out, f = red("IP 198.51.100.7.58686 > 203.0.113.9.123: UDP, length 148\nIP 192.168.1.2.22 > 10.0.0.1.53: x\n  2 IP 203.0.113.9.58686")
+    assert out == "IP <ip>.58686 > <ip>.123: UDP, length 148\nIP 192.168.1.2.22 > 10.0.0.1.53: x\n  2 IP <ip>.58686"
+    assert f == "[redacted: ip=3]"
+    for keep in ["1.2.3.4.5", "8.8.8.8.123456", "8.8.8.8.99999", "8.8.8.8.53.1", "8.8.8.8.53a", "v9.9.9.9.80"]:
+        assert red(keep)[0] == keep, keep
+
+
 def test_mac_after_label_and_bridge_id():
     out, f = red("New Sta:02:42:ac:11:00:02 Del Sta:0a:1b:2c:3d:4e:5f\nbr-lan 7fff.0242ac110002 no eth0")
     assert out == "New Sta:<mac> Del Sta:<mac>\nbr-lan 7fff.<mac> no eth0"

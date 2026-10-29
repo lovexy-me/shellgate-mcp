@@ -40,6 +40,8 @@ _IPV6_PORT = re.compile(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$")
 _IPV6_LOOKS_GLOBAL = re.compile(r"(?:^|:)[23][0-9A-Fa-f]{3}(?::[0-9A-Fa-f]{0,5}){3,}")
 _MAC = re.compile(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}"
                   r"|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}")
+# Linux bridge id: 8000.0242ac110002 (priority.mac)
+_BRIDGE_ID = re.compile(r"[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{12}")
 _RUN = re.compile(r"[A-Za-z0-9+/_-]+={0,2}")
 _B64 = re.compile(r"[A-Za-z0-9+/]{43}=")
 
@@ -258,15 +260,33 @@ class Redactor:
             return None
         text = _sub(_IPV6, text, ip6)
 
+        def label_colon(t: str, i: int) -> bool:
+            """t[i-1] is ':'; True when it ends a label such as 'Sta:' rather than a hex chain."""
+            j = i - 1
+            while j > 0 and t[j - 1] in _ALNUM:
+                j -= 1
+            seg = t[j:i - 1]
+            return bool(seg) and not all(ch in "0123456789abcdefABCDEF" for ch in seg) and _before(t, j) != ":"
+
         def mac(m: re.Match[str], t: str) -> str | None:
             edge = _WORD | {":", "-", "."}
-            if _before(t, m.start()) in edge or _after(t, m.end()) in edge:
+            b = _before(t, m.start())
+            if (b in edge and not (b == ":" and label_colon(t, m.start()))) or _after(t, m.end()) in edge:
                 return None
             hexits = re.sub(r"[^0-9A-Fa-f]", "", m.group()).lower()
             if hexits in ("000000000000", "ffffffffffff"):
                 return None
             return hit("mac", "<mac>")
         text = _sub(_MAC, text, mac)
+
+        def bridge(m: re.Match[str], t: str) -> str | None:
+            edge = _WORD | {":", "-", "."}
+            if _before(t, m.start()) in edge or _after(t, m.end()) in edge:
+                return None
+            if m.group()[5:].lower() in ("000000000000", "ffffffffffff"):
+                return None
+            return m.group()[:5] + hit("mac", "<mac>")
+        text = _sub(_BRIDGE_ID, text, bridge)
 
         def run(m: re.Match[str], t: str) -> str | None:
             s = m.group()

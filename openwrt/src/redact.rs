@@ -48,6 +48,7 @@ struct Rx {
     ipv6_port: Regex,
     ipv6_looks_global: Regex,
     mac: Regex,
+    bridge_id: Regex,
     run: Regex,
 }
 
@@ -74,6 +75,8 @@ fn rx() -> &'static Rx {
         ipv6_port: Regex::new(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$").unwrap(),
         ipv6_looks_global: Regex::new(r"(?:^|:)[23][0-9A-Fa-f]{3}(?::[0-9A-Fa-f]{0,5}){3,}").unwrap(),
         mac: Regex::new(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}").unwrap(),
+        // Linux bridge id: 8000.0242ac110002 (priority.mac)
+        bridge_id: Regex::new(r"[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{12}").unwrap(),
         run: Regex::new(r"[A-Za-z0-9+/_-]+={0,2}").unwrap(),
     })
 }
@@ -113,6 +116,20 @@ fn sub<F: FnMut(&Captures, &str) -> Option<String>>(re: &Regex, text: &str, mut 
     }
     out.push_str(&text[last..]);
     out
+}
+
+/// s[i-1] is ':'; true when it ends a label such as "Sta:" rather than a hex chain.
+fn label_colon(s: &str, i: usize) -> bool {
+    let b = s.as_bytes();
+    if i == 0 || b[i - 1] != b':' {
+        return false;
+    }
+    let mut j = i - 1;
+    while j > 0 && b[j - 1].is_ascii_alphanumeric() {
+        j -= 1;
+    }
+    let seg = &b[j..i - 1];
+    !seg.is_empty() && !seg.iter().all(|c| c.is_ascii_hexdigit()) && (j == 0 || b[j - 1] != b':')
 }
 
 fn is_placeholder(v: &str) -> bool {
@@ -414,7 +431,8 @@ impl Redactor {
         t = sub(&r.mac, &t, |m, s| {
             let m0 = m.get(0).unwrap();
             let (b, a) = (before(s, m0.start()), after(s, m0.end()));
-            if is_word(b) || is_in(b, ":-.") || is_word(a) || is_in(a, ":-.") {
+            let label = b == Some(':') && label_colon(s, m0.start());
+            if (!label && (is_word(b) || is_in(b, ":-."))) || is_word(a) || is_in(a, ":-.") {
                 return None;
             }
             let hex: String = m0.as_str().chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_lowercase();
@@ -423,6 +441,19 @@ impl Redactor {
             }
             c.hit("mac");
             Some("<mac>".into())
+        });
+        t = sub(&r.bridge_id, &t, |m, s| {
+            let m0 = m.get(0).unwrap();
+            let (b, a) = (before(s, m0.start()), after(s, m0.end()));
+            if is_word(b) || is_in(b, ":-.") || is_word(a) || is_in(a, ":-.") {
+                return None;
+            }
+            let tail = m0.as_str()[5..].to_ascii_lowercase();
+            if tail == "000000000000" || tail == "ffffffffffff" {
+                return None;
+            }
+            c.hit("mac");
+            Some(format!("{}<mac>", &m0.as_str()[..5]))
         });
         t = sub(&r.run, &t, |m, _| {
             let s = m.get(0).unwrap().as_str();
@@ -490,6 +521,18 @@ mod tests {
         assert_eq!(red(v).0, v);
         assert_eq!(red("dns 8.8.4.4 conversion 8.8.8.8").0, "dns <ip> conversion <ip>");
         assert_eq!(red("range 8.8.8.8-9").0, "range <ip>-9");
+    }
+
+    #[test]
+    fn mac_after_label_and_bridge_id() {
+        let (o, f) = red("New Sta:02:42:ac:11:00:02 Del Sta:0a:1b:2c:3d:4e:5f\nbr-lan 7fff.0242ac110002 no eth0");
+        assert_eq!(o, "New Sta:<mac> Del Sta:<mac>\nbr-lan 7fff.<mac> no eth0");
+        assert_eq!(f, "[redacted: mac=3]");
+        for keep in ["key sha1!! c9:6d:d9:2e:73:f9:93:c3:c1:d9:8f:59:60:cc:7c:96:1d:36:59:a4 from x",
+                     "fe80::aa:bb:cc:dd:ee:ff", "x:aa:02:42:ac:11:00:02", "8000.000000000000",
+                     "sha 1234.0242ac110002abcd"] {
+            assert_eq!(red(keep).0, keep);
+        }
     }
 
     #[test]

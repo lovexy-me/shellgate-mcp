@@ -143,3 +143,17 @@ def test_ipv4_partial_prefixes_redacted(src, want):
 ])
 def test_ipv4_partial_prefixes_kept(keep):
     assert red(keep)[0] == keep
+
+
+def test_mac_after_label_and_bridge_id():
+    out, f = red("New Sta:02:42:ac:11:00:02 Del Sta:0a:1b:2c:3d:4e:5f\nbr-lan 7fff.0242ac110002 no eth0")
+    assert out == "New Sta:<mac> Del Sta:<mac>\nbr-lan 7fff.<mac> no eth0"
+    assert f == "[redacted: mac=3]"
+
+
+@pytest.mark.parametrize("keep", [
+    "key sha1!! c9:6d:d9:2e:73:f9:93:c3:c1:d9:8f:59:60:cc:7c:96:1d:36:59:a4 from x",
+    "fe80::aa:bb:cc:dd:ee:ff", "x:aa:02:42:ac:11:00:02", "8000.000000000000", "sha 1234.0242ac110002abcd",
+])
+def test_mac_label_kept(keep):
+    assert red(keep)[0] == keep

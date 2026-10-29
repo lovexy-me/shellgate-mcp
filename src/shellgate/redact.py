@@ -29,6 +29,10 @@ _BEARER = re.compile(r"(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/=-]{8,})")
 _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
 _UUID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 _IPV4 = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
+# partial prefixes: "198.51.100." "198.51.100.x" "198.51.100.*" "198.51.100/24" "198.51.*.*"
+_IPV4_PREFIX = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){1,2}(?:\.[*xX]){0,2}\.?(?:/[0-9]{1,2})?")
+# identifier form: Allow_198_51_100_Net, from_203_0_113_7
+_IPV4_UNDERSCORE = re.compile(r"[0-9]{1,3}(?:_[0-9]{1,3}){2,3}")
 _VERSION_CTX = re.compile(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$")
 _IPV6 = re.compile(r"[0-9A-Fa-f]{0,5}(?::[0-9A-Fa-f]{0,5}){2,8}(?:%[A-Za-z0-9_.-]+)?")
 _IPV6_PORT = re.compile(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$")
@@ -184,6 +188,47 @@ class Redactor:
                 return None
             return hit("ip", "<ip>") if ipv4_is_public(m.group()) else None
         text = _sub(_IPV4, text, ip4)
+
+        def ip4_prefix(m: re.Match[str], t: str) -> str | None:
+            s = m.group()
+            if _before(t, m.start()) in _ALNUM | {"."}:
+                return None
+            a = _after(t, m.end())
+            if a in _ALNUM or a in ("*", "/") or (a == "." and _after(t, m.end() + 1).isdigit()):
+                return None
+            core, _, cidr = s.partition("/")
+            trailing = core.endswith(".")
+            parts = core.rstrip(".").split(".")
+            nums = [p for p in parts if p.isdigit()]
+            wild = len(parts) - len(nums)
+            if parts[:len(nums)] != nums or len(parts) > 4 or any(int(p) > 255 for p in nums):
+                return None
+            if cidr and (int(cidr) > 32 or len(nums) != 3 or wild or trailing):
+                return None
+            n = len(nums)
+            if not ((n == 3 and (trailing or wild or cidr)) or (n == 2 and wild)):
+                return None
+            if _VERSION_CTX.search(t[max(0, m.start() - 24):m.start()]):
+                return None
+            if not ipv4_is_public(".".join(nums + ["0"] * (4 - n))):
+                return None
+            return hit("ip", "<ip>") + s[len(".".join(nums)):]
+        text = _sub(_IPV4_PREFIX, text, ip4_prefix)
+
+        def ip4_underscore(m: re.Match[str], t: str) -> str | None:
+            s = m.group()
+            b, a = _before(t, m.start()), _after(t, m.end())
+            if b in _ALNUM or a in _ALNUM:
+                return None
+            if (b == "_" and _before(t, m.start() - 1).isdigit()) or (a == "_" and _after(t, m.end() + 1).isdigit()):
+                return None
+            nums = s.split("_")
+            if any(int(p) > 255 for p in nums) or len(s) - len(nums) + 1 < 5:
+                return None
+            if not ipv4_is_public(".".join(nums + ["0"] * (4 - len(nums)))):
+                return None
+            return hit("ip", "<ip>")
+        text = _sub(_IPV4_UNDERSCORE, text, ip4_underscore)
 
         def ip6(m: re.Match[str], t: str) -> str | None:
             cand, start = m.group(), m.start()

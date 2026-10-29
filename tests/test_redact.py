@@ -123,3 +123,23 @@ def test_ipv6_with_port_and_fail_closed():
     assert "<ipv6>:25932" in o
     assert "fd00::1:53" in o and "fe80::e2ef:2ff:fe56:df30:53" in o
     assert r.text("time 12:34:56 mac-ish c9:6d:d9:2e")[0] == "time 12:34:56 mac-ish c9:6d:d9:2e"
+
+
+@pytest.mark.parametrize("src,want", [
+    ('WHITELIST="192.168.1. 198.51.100. 172.16. 203.0.113."', 'WHITELIST="192.168.1. <ip>. 172.16. <ip>."'),
+    ("allow 198.51.100.x and 203.0.113.* and 198.51.*.*", "allow <ip>.x and <ip>.* and <ip>.*.*"),
+    ("src 198.51.100/24 lan 192.168.1/24", "src <ip>/24 lan 192.168.1/24"),
+    ("option name 'Allow_198_51_100_Net_To_vlmcsd'", "option name 'Allow_<ip>_Net_To_vlmcsd'"),
+    ('--comment "!fw4: from_203_0_113_7"', '--comment "!fw4: from_<ip>"'),
+])
+def test_ipv4_partial_prefixes_redacted(src, want):
+    assert red(src)[0] == want
+
+
+@pytest.mark.parametrize("keep", [
+    "pkg 1.2.3.tar.gz", "openwrt-23.05.3", "version 22.03.5.", "v1.2.3.", "192.168.1.10 and 10.26.0.",
+    "backup_20261029", "rule_1_2_3", "a_1_2_3_4_5_6", "255.255.255.", "ratio 1.5 and 3.14.",
+    "100.64.1.", "file_v2_1_0", "1.2.3.4.5",
+])
+def test_ipv4_partial_prefixes_kept(keep):
+    assert red(keep)[0] == keep

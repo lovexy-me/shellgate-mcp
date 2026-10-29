@@ -102,7 +102,7 @@ claude mcp add --transport http shellgate https://shell.example.com/mcp \
 
 | 内容 | 替换为 | 说明 |
 |---|---|---|
-| 公网 IPv4 | `<ip>` | 逐个地址判断；保留 10/8、127/8、172.16/12、192.168/16、100.64/10、169.254/16、0.0.0.0/8、组播、广播和子网掩码；CIDR 后缀保留（`<ip>/24`） |
+| 公网 IPv4 | `<ip>` | 逐个地址判断；保留 10/8、127/8、172.16/12、192.168/16、100.64/10、169.254/16、0.0.0.0/8、组播、广播和子网掩码；CIDR 后缀保留（`<ip>/24`）；只写前几段的公网网段也会遮：`198.51.100.`、`198.51.100.x`、`198.51.*.*`、`198.51.100/24` 和规则名里的 `Allow_198_51_100_Net` |
 | 全局 IPv6（2000::/3） | `<ipv6>` | 保留 `::1`、`fe80::/10`、`fc00::/7`（ULA） |
 | MAC | `<mac>` | 全 0 与广播地址保留 |
 | WireGuard 密钥 / PEM 私钥 | `<key>` | 43 个 base64 字符 + `=` |
@@ -113,7 +113,7 @@ claude mcp add --transport http shellgate https://shell.example.com/mcp \
 
 有替换时，结果里会多一个字段 `"redacted": "[redacted: ip=3 mac=1]"`。占位符不是真实值，不要把它写回配置文件。
 
-**English**: Redaction is on by default (`SHELLGATE_REDACT=1`) and can only be turned off in the server environment, never per call. It applies to every string a tool returns (including errors and `audit_tail`); tool inputs are executed unmodified, and the audit log stores redacted arguments/results only (the raw client IP stays in the on-device log for forensics, but is masked in `audit_tail` output). Public IPv4 → `<ip>` (decided per address; private/CGNAT/link-local/loopback kept; CIDR suffix kept), global IPv6 → `<ipv6>`, MAC → `<mac>`, WireGuard/PEM keys → `<key>`, JWT and long base64 → `<token>`, UUID → `<uuid>`, secret `key=value` / `key: value` → `<x>`, domains under `SHELLGATE_REDACT_DOMAINS` → `<domain>`. A `"redacted"` field summarises the counts when anything was replaced.
+**English**: Redaction is on by default (`SHELLGATE_REDACT=1`) and can only be turned off in the server environment, never per call. It applies to every string a tool returns (including errors and `audit_tail`); tool inputs are executed unmodified, and the audit log stores redacted arguments/results only (the raw client IP stays in the on-device log for forensics, but is masked in `audit_tail` output). Public IPv4 → `<ip>` (decided per address; private/CGNAT/link-local/loopback kept; CIDR suffix kept; partial public prefixes such as `198.51.100.`, `198.51.100.x`, `198.51.*.*`, `198.51.100/24` and identifier forms like `Allow_198_51_100_Net` are masked too), global IPv6 → `<ipv6>`, MAC → `<mac>`, WireGuard/PEM keys → `<key>`, JWT and long base64 → `<token>`, UUID → `<uuid>`, secret `key=value` / `key: value` → `<x>`, domains under `SHELLGATE_REDACT_DOMAINS` → `<domain>`. A `"redacted"` field summarises the counts when anything was replaced.
 
 ### `run_script` 与 `stdin`
 

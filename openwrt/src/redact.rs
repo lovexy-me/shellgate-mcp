@@ -41,6 +41,8 @@ struct Rx {
     jwt: Regex,
     uuid: Regex,
     ipv4: Regex,
+    ipv4_prefix: Regex,
+    ipv4_underscore: Regex,
     version_ctx: Regex,
     ipv6: Regex,
     ipv6_port: Regex,
@@ -63,6 +65,10 @@ fn rx() -> &'static Rx {
         jwt: Regex::new(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*").unwrap(),
         uuid: Regex::new(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}").unwrap(),
         ipv4: Regex::new(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}").unwrap(),
+        // partial prefixes: "198.51.100." "198.51.100.x" "198.51.100.*" "198.51.100/24" "198.51.*.*"
+        ipv4_prefix: Regex::new(r"[0-9]{1,3}(?:\.[0-9]{1,3}){1,2}(?:\.[*xX]){0,2}\.?(?:/[0-9]{1,2})?").unwrap(),
+        // identifier form: Allow_198_51_100_Net, from_203_0_113_7
+        ipv4_underscore: Regex::new(r"[0-9]{1,3}(?:_[0-9]{1,3}){2,3}").unwrap(),
         version_ctx: Regex::new(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$").unwrap(),
         ipv6: Regex::new(r"[0-9A-Fa-f]{0,5}(?::[0-9A-Fa-f]{0,5}){2,8}(?:%[A-Za-z0-9_.-]+)?").unwrap(),
         ipv6_port: Regex::new(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$").unwrap(),
@@ -286,6 +292,79 @@ impl Redactor {
                 None
             }
         });
+        t = sub(&r.ipv4_prefix, &t, |m, s| {
+            let m0 = m.get(0).unwrap();
+            let whole = m0.as_str();
+            let b = before(s, m0.start());
+            if is_alnum(b) || is_in(b, ".") {
+                return None;
+            }
+            let a = after(s, m0.end());
+            if is_alnum(a) || is_in(a, "*/")
+                || (a == Some('.') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_digit())) {
+                return None;
+            }
+            let (core, cidr) = match whole.split_once('/') {
+                Some((x, y)) => (x, Some(y)),
+                None => (whole, None),
+            };
+            let trailing = core.ends_with('.');
+            let parts: Vec<&str> = core.trim_end_matches('.').split('.').collect();
+            let n = parts.iter().take_while(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).count();
+            let wild = parts.len() - n;
+            if parts[n..].iter().any(|p| p.bytes().any(|b| b.is_ascii_digit())) || parts.len() > 4 {
+                return None;
+            }
+            if parts[..n].iter().any(|p| p.parse::<u32>().map_or(true, |v| v > 255)) {
+                return None;
+            }
+            if let Some(cv) = cidr {
+                if cv.parse::<u32>().map_or(true, |v| v > 32) || n != 3 || wild > 0 || trailing {
+                    return None;
+                }
+            }
+            if !((n == 3 && (trailing || wild > 0 || cidr.is_some())) || (n == 2 && wild > 0)) {
+                return None;
+            }
+            let mut st = m0.start().saturating_sub(24);
+            while !s.is_char_boundary(st) { st += 1; }
+            if r.version_ctx.is_match(&s[st..m0.start()]) {
+                return None;
+            }
+            let mut full: Vec<&str> = parts[..n].to_vec();
+            while full.len() < 4 { full.push("0"); }
+            if ipv4_is_public(&full.join(".")) != Some(true) {
+                return None;
+            }
+            let num_len = parts[..n].join(".").len();
+            c.hit("ip");
+            Some(format!("<ip>{}", &whole[num_len..]))
+        });
+        t = sub(&r.ipv4_underscore, &t, |m, s| {
+            let m0 = m.get(0).unwrap();
+            let (b, a) = (before(s, m0.start()), after(s, m0.end()));
+            if is_alnum(b) || is_alnum(a) {
+                return None;
+            }
+            if (b == Some('_') && before(s, m0.start() - 1).is_some_and(|c| c.is_ascii_digit()))
+                || (a == Some('_') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_digit())) {
+                return None;
+            }
+            let nums: Vec<&str> = m0.as_str().split('_').collect();
+            if nums.iter().any(|p| p.parse::<u32>().map_or(true, |v| v > 255)) {
+                return None;
+            }
+            if m0.as_str().len() - (nums.len() - 1) < 5 {
+                return None;
+            }
+            let mut full = nums.clone();
+            while full.len() < 4 { full.push("0"); }
+            if ipv4_is_public(&full.join(".")) != Some(true) {
+                return None;
+            }
+            c.hit("ip");
+            Some("<ip>".into())
+        });
         t = sub(&r.ipv6, &t, |m, s| {
             let m0 = m.get(0).unwrap();
             let cand = m0.as_str();
@@ -411,6 +490,24 @@ mod tests {
         assert_eq!(red(v).0, v);
         assert_eq!(red("dns 8.8.4.4 conversion 8.8.8.8").0, "dns <ip> conversion <ip>");
         assert_eq!(red("range 8.8.8.8-9").0, "range <ip>-9");
+    }
+
+    #[test]
+    fn ipv4_partial_prefixes() {
+        for (src, want) in [
+            ("WHITELIST=\"192.168.1. 198.51.100. 172.16. 203.0.113.\"", "WHITELIST=\"192.168.1. <ip>. 172.16. <ip>.\""),
+            ("allow 198.51.100.x and 203.0.113.* and 198.51.*.*", "allow <ip>.x and <ip>.* and <ip>.*.*"),
+            ("src 198.51.100/24 lan 192.168.1/24", "src <ip>/24 lan 192.168.1/24"),
+            ("option name 'Allow_198_51_100_Net_To_vlmcsd'", "option name 'Allow_<ip>_Net_To_vlmcsd'"),
+            ("--comment \"!fw4: from_203_0_113_7\"", "--comment \"!fw4: from_<ip>\""),
+        ] {
+            assert_eq!(red(src).0, want);
+        }
+        for keep in ["pkg 1.2.3.tar.gz", "openwrt-23.05.3", "version 22.03.5.", "v1.2.3.", "192.168.1.10 and 10.26.0.",
+                     "backup_20261029", "rule_1_2_3", "a_1_2_3_4_5_6", "255.255.255.", "ratio 1.5 and 3.14.",
+                     "100.64.1.", "file_v2_1_0", "1.2.3.4.5"] {
+            assert_eq!(red(keep).0, keep);
+        }
     }
 
     #[test]

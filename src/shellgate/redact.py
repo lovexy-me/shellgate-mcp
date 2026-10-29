@@ -29,6 +29,7 @@ _BEARER = re.compile(r"(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/=-]{8,})")
 _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
 _UUID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 _IPV4 = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
+_VERSION_CTX = re.compile(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$")
 _IPV6 = re.compile(r"[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:%[A-Za-z0-9_.-]+)?")
 _MAC = re.compile(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}"
                   r"|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}")
@@ -172,6 +173,11 @@ class Redactor:
                 return None
             a = _after(t, m.end())
             if a in _ALNUM or (a == "." and _after(t, m.end() + 1) in "0123456789" and _after(t, m.end() + 1)):
+                return None
+            # version strings: 5.15.153.1-microsoft, "version 1.2.3.4", "ver: 1.0.0.12"
+            if a == "-" and _after(t, m.end() + 1).isascii() and _after(t, m.end() + 1).isalpha():
+                return None
+            if _VERSION_CTX.search(t[max(0, m.start() - 24):m.start()]):
                 return None
             return hit("ip", "<ip>") if ipv4_is_public(m.group()) else None
         text = _sub(_IPV4, text, ip4)

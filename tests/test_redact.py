@@ -102,3 +102,12 @@ def test_nested_values_and_disabled():
     assert footer(counts) == "[redacted: ip=1 mac=1]"
     off = Redactor(False, ["example.org"])
     assert off.text("203.0.113.1 a.example.org")[0] == "203.0.113.1 a.example.org"
+
+
+def test_version_strings_not_ip():
+    from shellgate.redact import Redactor
+    r = Redactor(True, [])
+    v = "Linux version 5.15.153.1-microsoft-standard-WSL2, Version: 8.8.4.4, fw 1.1.1.1, ver=9.9.9.9"
+    assert r.text(v)[0] == v
+    assert r.text("dns 8.8.4.4 conversion 8.8.8.8")[0] == "dns <ip> conversion <ip>"
+    assert r.text("range 8.8.8.8-9")[0] == "range <ip>-9"

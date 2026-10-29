@@ -41,6 +41,7 @@ struct Rx {
     jwt: Regex,
     uuid: Regex,
     ipv4: Regex,
+    version_ctx: Regex,
     ipv6: Regex,
     mac: Regex,
     run: Regex,
@@ -60,6 +61,7 @@ fn rx() -> &'static Rx {
         jwt: Regex::new(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*").unwrap(),
         uuid: Regex::new(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}").unwrap(),
         ipv4: Regex::new(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}").unwrap(),
+        version_ctx: Regex::new(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$").unwrap(),
         ipv6: Regex::new(r"[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:%[A-Za-z0-9_.-]+)?").unwrap(),
         mac: Regex::new(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}").unwrap(),
         run: Regex::new(r"[A-Za-z0-9+/_-]+={0,2}").unwrap(),
@@ -264,6 +266,15 @@ impl Redactor {
             if is_alnum(a) || (a == Some('.') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_digit())) {
                 return None;
             }
+            // version strings: 5.15.153.1-microsoft, "version 1.2.3.4", "ver: 1.0.0.12"
+            if a == Some('-') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+                return None;
+            }
+            let mut st = m0.start().saturating_sub(24);
+            while !s.is_char_boundary(st) { st += 1; }
+            if r.version_ctx.is_match(&s[st..m0.start()]) {
+                return None;
+            }
             if ipv4_is_public(m0.as_str()) == Some(true) {
                 c.hit("ip");
                 Some("<ip>".into())
@@ -376,6 +387,10 @@ mod tests {
         assert_eq!(red("172.32.0.1").0, "<ip>");
         assert_eq!(red("v1.2.3.4.5 and 999.1.1.1").1, "");
         assert_eq!(red("peer=203.0.113.9:51820,").0, "peer=<ip>:51820,");
+        let v = "Linux version 5.15.153.1-microsoft-standard-WSL2, Version: 8.8.4.4, fw 1.1.1.1, ver=9.9.9.9";
+        assert_eq!(red(v).0, v);
+        assert_eq!(red("dns 8.8.4.4 conversion 8.8.8.8").0, "dns <ip> conversion <ip>");
+        assert_eq!(red("range 8.8.8.8-9").0, "range <ip>-9");
     }
 
     #[test]

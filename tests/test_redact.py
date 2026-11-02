@@ -1,4 +1,6 @@
 """Redaction rules. Addresses use documentation ranges (RFC 5737 / RFC 3849) and example.* domains."""
+import re
+
 import pytest
 
 from shellgate.redact import Redactor, footer
@@ -8,7 +10,7 @@ R = Redactor(True, ["example.org", ".example.net"])
 
 def red(text):
     out, counts = R.text(text)
-    return out, footer(counts)
+    return re.sub(r"<mac:[0-9a-f]{6}>", "<mac>", out), footer(counts)
 
 
 def test_ipv4_per_token_private_and_public_same_line():
@@ -98,7 +100,7 @@ def test_idempotent_and_footer_only_when_needed():
 
 def test_nested_values_and_disabled():
     obj, counts = R.value({"stdout": "203.0.113.1", "list": ["02:42:ac:11:00:02"], "n": 3})
-    assert obj == {"stdout": "<ip>", "list": ["<mac>"], "n": 3}
+    assert obj["stdout"] == "<ip>" and re.fullmatch(r"<mac:[0-9a-f]{6}>", obj["list"][0]) and obj["n"] == 3
     assert footer(counts) == "[redacted: ip=1 mac=1]"
     off = Redactor(False, ["example.org"])
     assert off.text("203.0.113.1 a.example.org")[0] == "203.0.113.1 a.example.org"
@@ -165,3 +167,11 @@ def test_mac_after_label_and_bridge_id():
 ])
 def test_mac_label_kept(keep):
     assert red(keep)[0] == keep
+
+
+def test_mtk_psk_and_mac_tag():
+    assert red("WPAPSK1=abcdefgh123 WPAPSK=xy PSK_KEYS=zzzzzz11 wpa_passphrase=hello1")[0] == \
+        "WPAPSK1=<x> WPAPSK=<x> PSK_KEYS=<x> wpa_passphrase=<x>"
+    o, _ = R.text("a 02:11:22:33:44:55 b 02:11:22:33:44:55 c 02:11:22:33:44:56")
+    tags = re.findall(r"<mac:[0-9a-f]{6}>", o)
+    assert len(tags) == 3 and tags[0] == tags[1] != tags[2]

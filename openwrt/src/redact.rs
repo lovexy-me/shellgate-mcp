@@ -4,6 +4,8 @@
 //! look-around). Placeholders: <ip> <ipv6> <mac> <key> <token> <uuid> <x> <domain>.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::net::Ipv6Addr;
 use std::sync::OnceLock;
 
@@ -12,7 +14,7 @@ use serde_json::Value;
 
 pub const ORDER: &[&str] = &["ip", "ipv6", "mac", "key", "token", "uuid", "secret", "domain"];
 const SECRET_NAMES: &str = "password|passwd|passphrase|secret|token|api[_-]?key|apikey|private[_-]?key\
-|preshared[_-]?key|psk|authorization|bearer|key";
+|preshared[_-]?key|wpapsk[0-9]{0,2}|psk_keys|psk[0-9]{1,2}|psk|authorization|bearer|keys|key";
 const NEED_SEP: &[&str] = &["key", "token", "psk", "secret", "bearer"];
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -50,6 +52,16 @@ struct Rx {
     mac: Regex,
     bridge_id: Regex,
     run: Regex,
+}
+
+/// Stable per-process tag for a MAC: same device -> same tag within one server run, so
+/// clients can be told apart, but the keyed hash (random key per start) can't be reversed
+/// or linked across restarts.
+fn mac_tag(hex12: &str) -> String {
+    static K: OnceLock<RandomState> = OnceLock::new();
+    let mut h = K.get_or_init(RandomState::new).build_hasher();
+    h.write(hex12.to_ascii_lowercase().as_bytes());
+    format!("<mac:{:06x}>", h.finish() & 0xff_ffff)
 }
 
 fn rx() -> &'static Rx {
@@ -451,7 +463,7 @@ impl Redactor {
                 return None;
             }
             c.hit("mac");
-            Some("<mac>".into())
+            Some(mac_tag(&hex))
         });
         t = sub(&r.bridge_id, &t, |m, s| {
             let m0 = m.get(0).unwrap();
@@ -464,7 +476,7 @@ impl Redactor {
                 return None;
             }
             c.hit("mac");
-            Some(format!("{}<mac>", &m0.as_str()[..5]))
+            Some(format!("{}{}", &m0.as_str()[..5], mac_tag(&tail)))
         });
         t = sub(&r.run, &t, |m, _| {
             let s = m.get(0).unwrap().as_str();
@@ -513,6 +525,7 @@ mod tests {
         let r = Redactor::new(true, &["example.org".into(), ".example.net".into()]);
         let mut c = Counts::default();
         let out = r.text(t, &mut c);
+        let out = Regex::new(r"<mac:[0-9a-f]{6}>").unwrap().replace_all(&out, "<mac>").into_owned();
         (out, c.footer())
     }
 
@@ -653,9 +666,23 @@ mod tests {
         let mut v = serde_json::json!({"stdout": "203.0.113.1", "list": ["02:42:ac:11:00:02"], "n": 3});
         let mut c = Counts::default();
         r.value(&mut v, &mut c);
-        assert_eq!(v, serde_json::json!({"stdout": "<ip>", "list": ["<mac>"], "n": 3}));
+        assert_eq!(v["stdout"], "<ip>");
+        assert!(v["list"][0].as_str().unwrap().starts_with("<mac:"));
         assert_eq!(c.footer(), "[redacted: ip=1 mac=1]");
         let off = Redactor::new(false, &["example.org".into()]);
         assert_eq!(off.text("203.0.113.1 a.example.org", &mut Counts::default()), "203.0.113.1 a.example.org");
+    }
+
+    #[test]
+    fn mtk_psk_and_mac_tag() {
+        assert_eq!(red("WPAPSK1=abcdefgh123 WPAPSK=xy PSK_KEYS=zzzzzz11 wpa_passphrase=hello1").0,
+                   "WPAPSK1=<x> WPAPSK=<x> PSK_KEYS=<x> wpa_passphrase=<x>");
+        let r = Redactor::new(true, &[]);
+        let mut c = Counts::default();
+        let o = r.text("a 02:11:22:33:44:55 b 02:11:22:33:44:55 c 02:11:22:33:44:56", &mut c);
+        let tags: Vec<&str> = o.split(' ').filter(|w| w.starts_with("<mac:")).collect();
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0], tags[1]);
+        assert_ne!(tags[0], tags[2]);
     }
 }

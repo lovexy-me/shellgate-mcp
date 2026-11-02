@@ -7,7 +7,9 @@ Placeholders: <ip> <ipv6> <mac> <key> <token> <uuid> <x> (secret values) <domain
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import os
 import re
 from collections import Counter
 from typing import Any, Callable
@@ -15,7 +17,7 @@ from typing import Any, Callable
 ORDER = ("ip", "ipv6", "mac", "key", "token", "uuid", "secret", "domain")
 
 _SECRET_NAMES = (r"password|passwd|passphrase|secret|token|api[_-]?key|apikey|private[_-]?key"
-                 r"|preshared[_-]?key|psk|authorization|bearer|key")
+                 r"|preshared[_-]?key|wpapsk[0-9]{0,2}|psk_keys|psk[0-9]{1,2}|psk|authorization|bearer|keys|key")
 
 _NEED_SEP = {"key", "token", "psk", "secret", "bearer"}
 
@@ -47,6 +49,14 @@ _B64 = re.compile(r"[A-Za-z0-9+/]{43}=")
 
 _ALNUM = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 _WORD = _ALNUM | {"_"}
+
+
+_MAC_KEY = os.urandom(16)
+
+
+def _mac_tag(hex12: str) -> str:
+    """Stable per-process tag: same device -> same tag within one run; keyed, so not reversible."""
+    return "<mac:" + hashlib.blake2s(hex12.lower().encode(), key=_MAC_KEY, digest_size=3).hexdigest() + ">"
 
 
 def _before(text: str, i: int) -> str:
@@ -284,7 +294,7 @@ class Redactor:
             hexits = re.sub(r"[^0-9A-Fa-f]", "", m.group()).lower()
             if hexits in ("000000000000", "ffffffffffff"):
                 return None
-            return hit("mac", "<mac>")
+            return hit("mac", _mac_tag(hexits))
         text = _sub(_MAC, text, mac)
 
         def bridge(m: re.Match[str], t: str) -> str | None:
@@ -293,7 +303,7 @@ class Redactor:
                 return None
             if m.group()[5:].lower() in ("000000000000", "ffffffffffff"):
                 return None
-            return m.group()[:5] + hit("mac", "<mac>")
+            return m.group()[:5] + hit("mac", _mac_tag(m.group()[5:]))
         text = _sub(_BRIDGE_ID, text, bridge)
 
         def run(m: re.Match[str], t: str) -> str | None:

@@ -214,7 +214,7 @@ async def test_output_redacted_and_audit_stores_redacted(server):
     cmd = "echo 'ip 203.0.113.9 lan 192.168.1.1 mac 02:42:ac:11:00:02 host a.example.org password=hunter2'"
     r = await _call(url, "run_command", command=cmd)
     out = r["stdout"]
-    assert "<ip>" in out and "192.168.1.1" in out and "<mac>" in out and "<domain>" in out
+    assert "<ip>" in out and "192.168.1.1" in out and "<mac:" in out and "<domain>" in out
     assert "password=<x>" in out and "203.0.113.9" not in out and "hunter2" not in out
     assert r["redacted"] == "[redacted: ip=1 mac=1 secret=1 domain=1]"
     f = work / "net.conf"

@@ -29,6 +29,10 @@ _UCI = re.compile(
     r"(?i)\b(option|list)([ \t]+)(" + _SECRET_NAMES + r")([ \t]+)('[^'\n]*'|\"[^\"\n]*\"|[^\s'\"]+)")
 _BEARER = re.compile(r"(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/=-]{8,})")
 _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
+# vendor-prefixed keys that appear bare (no key= label)
+_VENDOR = re.compile(r"(?:sk-(?:proj-|ant-|or-)?|gsk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[abposr]-|ibp_|cfat_|cfut_|glpat-|hf_|xai-|AIza)[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}")
+# inline CLI passwords: mysql -pSECRET, sshpass -p SECRET
+_CLI_PW = re.compile(r"\b(mysql|mysqldump|mysqladmin|mariadb|mariadb-dump|sshpass)\b([^\n|;&]*?[ \t]-p)([ \t]*)([^\s'\"]+|'[^'\n]*'|\"[^\"\n]*\")")
 _UUID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 _IPV4 = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
 # partial prefixes: "198.51.100." "198.51.100.x" "198.51.100.*" "198.51.100/24" "198.51.*.*"
@@ -170,6 +174,14 @@ class Redactor:
                 return None
             return hit("token", "<token>")
         text = _sub(_JWT, text, jwt)
+
+        def vendor(m: re.Match[str], t: str) -> str | None:
+            if _before(t, m.start()) in _WORD | {"-"}:
+                return None
+            return hit("token", "<token>")
+        text = _sub(_VENDOR, text, vendor)
+        text = _sub(_CLI_PW, text, lambda m, t: None if _is_placeholder(m.group(4))
+                    else hit("secret", m.group(1) + m.group(2) + m.group(3) + "<x>"))
 
         if self._domain is not None:
             def dom(m: re.Match[str], t: str) -> str | None:

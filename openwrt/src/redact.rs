@@ -41,6 +41,8 @@ struct Rx {
     uci: Regex,
     bearer: Regex,
     jwt: Regex,
+    vendor: Regex,
+    cli_pw: Regex,
     uuid: Regex,
     ipv4: Regex,
     ipv4_prefix: Regex,
@@ -76,6 +78,8 @@ fn rx() -> &'static Rx {
         )).unwrap(),
         bearer: Regex::new(r"(?i)\b(bearer)([ \t]+)([A-Za-z0-9._~+/=-]{8,})").unwrap(),
         jwt: Regex::new(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*").unwrap(),
+        vendor: Regex::new(r"(?:sk-(?:proj-|ant-|or-)?|gsk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[abposr]-|ibp_|cfat_|cfut_|glpat-|hf_|xai-|AIza)[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}").unwrap(),
+        cli_pw: Regex::new(r#"\b(mysql|mysqldump|mysqladmin|mariadb|mariadb-dump|sshpass)\b([^\n|;&]*?[ \t]-p)([ \t]*)([^\s'"]+|'[^'\n]*'|"[^"\n]*")"#).unwrap(),
         uuid: Regex::new(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}").unwrap(),
         ipv4: Regex::new(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}").unwrap(),
         // partial prefixes: "198.51.100." "198.51.100.x" "198.51.100.*" "198.51.100/24" "198.51.*.*"
@@ -271,6 +275,21 @@ impl Redactor {
             }
             c.hit("token");
             Some("<token>".into())
+        });
+        t = sub(&r.vendor, &t, |m, s| {
+            let b = before(s, m.get(0).unwrap().start());
+            if is_word(b) || is_in(b, "-") {
+                return None;
+            }
+            c.hit("token");
+            Some("<token>".into())
+        });
+        t = sub(&r.cli_pw, &t, |m, _s| {
+            if is_placeholder(&m[4]) {
+                return None;
+            }
+            c.hit("secret");
+            Some(format!("{}{}{}<x>", &m[1], &m[2], &m[3]))
         });
         if let Some(d) = &self.domain {
             t = sub(d, &t, |m, s| {
@@ -684,5 +703,15 @@ mod tests {
         assert_eq!(tags.len(), 3);
         assert_eq!(tags[0], tags[1]);
         assert_ne!(tags[0], tags[2]);
+    }
+
+    #[test]
+    fn vendor_keys_and_cli_passwords() {
+        let (o, _) = red("a gsk_AbCdEf1234567890XYZabc b ghp_AbCdEf1234567890XYZabcdefghij c sk-abcdefghijklmnop1234 d AKIAABCDEFGHIJKLMNOP f ibp_ruNAxxxxxxxxxxxxxxxx g mysql -uroot -pS3cretPw world h sshpass -p 'pw here' ssh x i mysql -p");
+        for leak in ["gsk_Ab", "ghp_Ab", "sk-abc", "AKIAAB", "ibp_ru", "S3cretPw", "pw here"] {
+            assert!(!o.contains(leak), "{leak} leaked: {o}");
+        }
+        assert!(o.contains("mysql -uroot -p<x> world"), "{o}");
+        assert!(o.ends_with("i mysql -p"), "{o}");
     }
 }

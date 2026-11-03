@@ -175,3 +175,16 @@ def test_mtk_psk_and_mac_tag():
     o, _ = R.text("a 02:11:22:33:44:55 b 02:11:22:33:44:55 c 02:11:22:33:44:56")
     tags = re.findall(r"<mac:[0-9a-f]{6}>", o)
     assert len(tags) == 3 and tags[0] == tags[1] != tags[2]
+
+
+def test_vendor_keys_and_cli_passwords():
+    from shellgate.redact import Redactor
+    r = Redactor(enabled=True, domains=[])
+    s = ("a gsk_AbCdEf1234567890XYZabc b ghp_AbCdEf1234567890XYZabcdefghij c sk-abcdefghijklmnop1234 "
+         "d AKIAABCDEFGHIJKLMNOP e xoxb-1234-5678-abcdefghijkl f ibp_ruNAxxxxxxxxxxxxxxxx "
+         "g mysql -uroot -pS3cretPw world h sshpass -p 'pw here' ssh x i mysql -p")
+    out = r.text(s)[0] if isinstance(r.text(s), tuple) else r.text(s)
+    for leak in ("gsk_Ab", "ghp_Ab", "sk-abc", "AKIAAB", "xoxb-12", "ibp_ru", "S3cretPw", "pw here"):
+        assert leak not in out, (leak, out)
+    assert "mysql -uroot -p<x> world" in out
+    assert out.endswith("i mysql -p")

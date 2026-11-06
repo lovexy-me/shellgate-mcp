@@ -11,6 +11,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Semaphore;
 
 use crate::config::Settings;
+use crate::platform;
 use crate::policy::random_hex;
 
 /// Keeps the first and last `limit/2` bytes of a stream.
@@ -62,38 +63,31 @@ async fn collect<R: AsyncRead + Unpin>(mut r: R, limit: usize) -> HeadTail {
     ht
 }
 
-fn kill_group(pid: Option<u32>, sig: i32) {
-    if let Some(pid) = pid {
-        unsafe { libc::kill(-(pid as i32), sig) };
-    }
-}
-
-async fn terminate(child: &mut Child) {
-    let pid = child.id();
-    kill_group(pid, libc::SIGTERM);
-    if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
-        kill_group(pid, libc::SIGKILL);
-        let _ = child.wait().await;
-    }
-}
-
 fn command(s: &Settings, cmd: &str, cwd: &str) -> Command {
-    let mut c = Command::new(&s.shell);
-    c.arg("-c").arg(cmd).current_dir(cwd).process_group(0).kill_on_drop(true);
+    let mut c = platform::shell_command(&s.shell, cmd);
+    c.current_dir(cwd);
     c
 }
 
 pub async fn run_once(s: &Settings, sem: &Semaphore, cmd: &str, cwd: &str, timeout: u64, stdin: Option<&str>) -> Result<Value, String> {
-    run_argv(s, sem, &s.shell, &["-c".to_string(), cmd.to_string()], cwd, timeout, stdin).await
+    run_cmd(s, sem, command(s, cmd, cwd), timeout, stdin).await
 }
 
-/// Run a program in its own process group; stdin text (if any) is written then closed.
+#[cfg_attr(windows, allow(dead_code))]
+/// Run a program (no shell) in its own process group; stdin text (if any) is written then closed.
 pub async fn run_argv(s: &Settings, sem: &Semaphore, prog: &str, args: &[String], cwd: &str, timeout: u64,
                       stdin: Option<&str>) -> Result<Value, String> {
+    let mut c = platform::new_command(prog);
+    c.args(args).current_dir(cwd);
+    run_cmd(s, sem, c, timeout, stdin).await
+}
+
+/// Run a prepared command (its process tree is killed on timeout).
+pub async fn run_cmd(s: &Settings, sem: &Semaphore, mut cmd: Command, timeout: u64,
+                     stdin: Option<&str>) -> Result<Value, String> {
     let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
     let start = Instant::now();
-    let mut child = Command::new(prog)
-        .args(args).current_dir(cwd).process_group(0).kill_on_drop(true)
+    let mut child = cmd
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("spawn failed: {e}"))?;
@@ -114,7 +108,7 @@ pub async fn run_argv(s: &Settings, sem: &Semaphore, prog: &str, args: &[String]
         Ok(st) => st.ok(),
         Err(_) => {
             timed_out = true;
-            terminate(&mut child).await;
+            platform::terminate(&mut child).await;
             child.wait().await.ok()
         }
     };
@@ -248,7 +242,7 @@ pub async fn write_stdin(job: &mut Job, data: &str, newline: bool) -> Result<(),
 
 pub async fn cancel(job: &mut Job) {
     if job.running() {
-        terminate(&mut job.child).await;
+        platform::terminate(&mut job.child).await;
         job.poll();
     }
 }

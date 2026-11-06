@@ -1,13 +1,14 @@
 //! Append-only JSON Lines audit log with one-step size rotation (keeps flash/tmpfs small).
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
+
+use crate::platform;
 
 pub struct Audit {
     path: PathBuf,
@@ -53,7 +54,7 @@ impl Audit {
         let path = PathBuf::from(path);
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            platform::make_dir_private(dir);
         }
         Self { path, max_bytes, lock: Mutex::new(()) }
     }
@@ -72,7 +73,7 @@ impl Audit {
         if fs::metadata(&self.path).map(|m| m.len() >= self.max_bytes).unwrap_or(false) {
             let _ = fs::rename(&self.path, self.path.with_extension("jsonl.1"));
         }
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).mode(0o600).open(&self.path) {
+        if let Ok(mut f) = platform::private_opts().create(true).append(true).open(&self.path) {
             let _ = writeln!(f, "{entry}");
         }
     }

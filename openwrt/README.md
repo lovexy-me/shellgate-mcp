@@ -1,5 +1,7 @@
 # ShellGate for OpenWrt (Rust)
 
+> v0.3.0 起同一份代码也能编译成 **Windows .exe** 和 **x86_64 Linux 静态版**，用于随身 Ventoy 救援盘（局域网/隧道模式、Ventoy 镜像管理），见 [README-ventoy.md](README-ventoy.md)。
+
 与主项目相同的 MCP 接口和鉴权，用 Rust 重写成**单个静态二进制**（aarch64 约 1.4 MB，空闲内存约 1–2 MB），适合 360 T7 这类小闪存路由器。不依赖 Python、bash 或 systemd。
 
 ## 与 Python 版的区别

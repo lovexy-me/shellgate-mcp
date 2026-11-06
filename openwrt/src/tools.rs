@@ -2,8 +2,8 @@
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,9 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::audit::Audit;
 use crate::exec::{self, Jobs};
+use crate::platform;
 use crate::policy::{feeds_interpreter, random_hex, referenced_scripts, within, Policy};
+use crate::ventoy;
 use crate::redact::{Counts, Redactor};
 
 pub struct App {
@@ -21,9 +23,18 @@ pub struct App {
     pub jobs: Mutex<Jobs>,
     pub sem: Semaphore,
     pub redactor: Redactor,
+    pub downloads: std::sync::Mutex<HashMap<String, Arc<ventoy::Download>>>,
 }
 
+#[cfg(unix)]
 const SCRIPT_INTERPRETERS: &[&str] = &["sh", "bash", "python3", "ash"];
+#[cfg(windows)]
+const SCRIPT_INTERPRETERS: &[&str] = &["powershell", "pwsh", "cmd", "python"];
+#[cfg(unix)]
+const DEFAULT_INTERPRETER: &str = "sh";
+#[cfg(windows)]
+const DEFAULT_INTERPRETER: &str = "powershell";
+const MAX_DOWNLOADS: usize = 2;
 const MAX_STDIN: usize = 4_000_000;
 
 /// Removes a private temp directory when dropped, whatever happened in between.
@@ -31,11 +42,10 @@ struct TempDir(std::path::PathBuf);
 
 impl TempDir {
     fn new() -> Result<Self, String> {
-        use std::os::unix::fs::DirBuilderExt;
         let base = std::env::temp_dir();
         for _ in 0..10 {
             let p = base.join(format!("shellgate-{}", random_hex(8)));
-            match fs::DirBuilder::new().mode(0o700).create(&p) {
+            match platform::create_private_dir(&p) {
                 Ok(()) => return Ok(Self(p)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(format!("cannot create temp dir: {e}")),
@@ -52,9 +62,7 @@ impl Drop for TempDir {
 }
 
 fn which(name: &str) -> Option<String> {
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/sbin:/usr/bin:/sbin:/bin".into());
-    path.split(':').filter(|d| !d.is_empty()).map(|d| format!("{d}/{name}"))
-        .find(|p| fs::metadata(p).map(|m| m.is_file() && m.mode() & 0o111 != 0).unwrap_or(false))
+    platform::which(name)
 }
 
 fn digest(t: &str) -> String {
@@ -64,20 +72,18 @@ fn digest(t: &str) -> String {
 /// Write via a unique temp file in the same directory, then rename over the target.
 fn atomic_write(p: &str, content: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = Path::new(p);
     let dir = path.parent().ok_or("bad path")?;
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let mode = fs::metadata(p).map(|m| m.mode() & 0o7777).unwrap_or(0o644);
     for _ in 0..10 {
         let tmp = dir.join(format!(".{name}.{}.sgtmp", random_hex(4)));
-        let mut f = match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
+        let mut f = match platform::private_opts().write(true).create_new(true).open(&tmp) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.to_string()),
         };
         let res = f.write_all(content).and_then(|_| f.sync_all())
-            .and_then(|_| fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)))
+            .and_then(|_| { drop(f); platform::copy_mode(p, &tmp) })
             .and_then(|_| fs::rename(&tmp, p));
         if let Err(e) = res {
             let _ = fs::remove_file(&tmp);
@@ -86,6 +92,53 @@ fn atomic_write(p: &str, content: &[u8]) -> Result<(), String> {
         return Ok(());
     }
     Err("cannot create a unique temp file".into())
+}
+
+fn script_file_name(interp: &str) -> &'static str {
+    match interp {
+        "python3" | "python" => "script.py",
+        "powershell" | "pwsh" => "script.ps1",
+        "cmd" => "script.cmd",
+        _ => "script.sh",
+    }
+}
+
+/// Script bytes as the interpreter wants them: cmd needs CRLF line ends, Windows PowerShell 5.1
+/// needs a UTF-8 BOM to read non-ASCII text correctly.
+fn script_bytes(interp: &str, script: &str) -> Vec<u8> {
+    match interp {
+        "cmd" => script.replace("\r\n", "\n").replace('\n', "\r\n").into_bytes(),
+        "powershell" | "pwsh" => {
+            let mut v = vec![0xEF, 0xBB, 0xBF];
+            v.extend_from_slice(script.as_bytes());
+            v
+        }
+        _ => script.as_bytes().to_vec(),
+    }
+}
+
+/// The command that runs a script file with its arguments, no shell in between where possible.
+fn script_command(interp: &str, exe: &str, file: &str, args: &[String], cwd: &str) -> tokio::process::Command {
+    let mut c = platform::new_command(exe);
+    c.current_dir(cwd);
+    match interp {
+        "powershell" | "pwsh" => {
+            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", file]).args(args);
+        }
+        #[cfg(windows)]
+        "cmd" => {
+            // cmd /S /C ""<file>" "arg" ..." : outer quotes stripped, the rest taken literally
+            let mut line = format!("\"{file}\"");
+            for a in args {
+                line.push_str(&format!(" \"{}\"", a.replace('"', "")));
+            }
+            c.raw_arg(format!("/D /S /C \"{line}\""));
+        }
+        _ => {
+            c.arg(file).args(args);
+        }
+    }
+    c
 }
 
 fn obj(props: Value, required: &[&str]) -> Value {
@@ -98,10 +151,10 @@ pub fn definitions() -> Value {
     let b = |d: &str| json!({"type": "boolean", "description": d});
     let confirm = s("One-time code from a previous confirmation_required answer, only after the user agreed");
     json!([
-        {"name": "run_command", "description": "Run a shell command (/bin/sh -c) and wait for it. Returns exit_code, stdout, stderr. timeout in seconds (default 60, max 600); for longer work use start_job. stdin (optional) is written to the command's standard input, e.g. command=\"ssh host sh -s\" with the script body in stdin.",
+        {"name": "run_command", "description": "Run a shell command (Linux: /bin/sh -c; Windows: cmd /C, or PowerShell when SHELLGATE_SHELL=powershell) and wait for it. Returns exit_code, stdout, stderr. timeout in seconds (default 60, max 600); for longer work use start_job. stdin (optional) is written to the command's standard input, e.g. command=\"ssh host sh -s\" with the script body in stdin.",
          "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory (default: home)"), "timeout": i("Seconds"), "stdin": s("Text written to the command's stdin"), "confirm_code": confirm.clone()}), &["command"])},
-        {"name": "run_script", "description": "Run a multi-line script with sh, bash, python3 or ash and wait for it. The script is written to a private temp file (removed afterwards) and run as `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as run_command. Returns exit_code, stdout, stderr.",
-         "inputSchema": obj(json!({"script": s("Script body"), "interpreter": {"type": "string", "enum": SCRIPT_INTERPRETERS, "default": "sh", "description": "sh, bash, python3 or ash"},
+        {"name": "run_script", "description": "Run a multi-line script and wait for it (Linux: sh, bash, python3, ash; Windows: powershell, pwsh, cmd, python). The script is written to a private temp file (removed afterwards) and run as `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as run_command. Returns exit_code, stdout, stderr.",
+         "inputSchema": obj(json!({"script": s("Script body"), "interpreter": {"type": "string", "enum": SCRIPT_INTERPRETERS, "default": DEFAULT_INTERPRETER, "description": SCRIPT_INTERPRETERS.join(", ")},
                                    "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the script"},
                                    "stdin": s("Text written to the script's stdin"), "timeout": i("Seconds"), "cwd": s("Working directory (default: home)"), "confirm_code": confirm.clone()}), &["script"])},
         {"name": "start_job", "description": "Start a long-running command in the background. Returns job_id; poll with job_output.",
@@ -126,6 +179,21 @@ pub fn definitions() -> Value {
         {"name": "system_info", "description": "Host overview: OS/OpenWrt release, board, kernel, uptime, load, memory, storage.", "inputSchema": obj(json!({}), &[])},
         {"name": "audit_tail", "description": "Show the last n audit log entries (what was run through ShellGate).",
          "inputSchema": obj(json!({"n": i("Entries, default 20")}), &[])},
+        {"name": "ventoy_info", "description": "Find the Ventoy data partition (volume labelled Ventoy, or ventoy_root in the config): path, filesystem, capacity, free space, Ventoy version if readable, whether ventoy/ventoy.json exists. Linux: mount=true mounts an unmounted Ventoy partition at /mnt/ventoy.",
+         "inputSchema": obj(json!({"mount": b("Linux only: mount the Ventoy partition at /mnt/ventoy if it is not mounted")}), &[])},
+        {"name": "ventoy_list", "description": "List boot images on the Ventoy partition (.iso .wim .img .vhd .vhdx .efi .vtoy) with size and modified time; paths are relative to the partition.",
+         "inputSchema": obj(json!({}), &[])},
+        {"name": "ventoy_add", "description": "Download an image from an http(s) URL onto the Ventoy partition as a background task (returns task_id; poll with ventoy_add_status). Optional sha256 is verified; on mismatch or any failure the partial file is deleted. Never overwrites an existing file.",
+         "inputSchema": obj(json!({"url": s("http(s) URL of the image"), "filename": s("File name to save as (default: last URL segment); must end in an image extension"),
+                                   "subdir": s("Folder inside the Ventoy partition, e.g. iso/linux (created if missing)"), "sha256": s("Expected SHA-256 (64 hex chars)")}), &["url"])},
+        {"name": "ventoy_add_status", "description": "Progress of ventoy_add downloads (all, or one task_id). cancel=true stops a running download and deletes its partial file.",
+         "inputSchema": obj(json!({"task_id": s("Task id (omit for all)"), "cancel": b("Cancel this download")}), &[])},
+        {"name": "ventoy_remove", "description": "Delete an image from the Ventoy partition. Always answers confirmation_required first; call again with the confirm_code only after the user agrees.",
+         "inputSchema": obj(json!({"path": s("Image path relative to the Ventoy partition, as shown by ventoy_list"), "confirm_code": s("One-time code from the confirmation_required answer, only after the user agreed")}), &["path"])},
+        {"name": "ventoy_config_get", "description": "Read ventoy/ventoy.json from the Ventoy partition (raw text plus parsed JSON and validity).",
+         "inputSchema": obj(json!({}), &[])},
+        {"name": "ventoy_config_set", "description": "Replace ventoy/ventoy.json. The content must be a valid JSON object (checked before writing); the old file is kept as ventoy.json.bak-<timestamp>. Write placeholders like <ip> back only if they are really meant literally: output is redacted.",
+         "inputSchema": obj(json!({"content": s("Complete new ventoy.json text")}), &["content"])},
     ])
 }
 
@@ -143,7 +211,7 @@ fn arg_bool(a: &Value, k: &str, d: bool) -> bool {
 }
 
 fn home() -> String {
-    std::env::var("HOME").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "/root".into())
+    platform::home()
 }
 
 fn ok(mut v: Value) -> Value {
@@ -264,7 +332,6 @@ impl App {
     }
 
     fn backup(&self, p: &str) -> Option<String> {
-        use std::os::unix::fs::OpenOptionsExt;
         if !self.policy.settings.backup_on_write || !Path::new(p).is_file() {
             return None;
         }
@@ -272,11 +339,90 @@ impl App {
         let base = format!("{p}.bak-{ts}");
         for i in 0..6 {
             let bak = if i == 0 { base.clone() } else { format!("{base}-{}", random_hex(2)) };
-            if fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&bak).is_ok() {
+            if platform::private_opts().write(true).create_new(true).open(&bak).is_ok() {
                 return fs::copy(p, &bak).ok().map(|_| bak);
             }
         }
         None
+    }
+
+    fn ventoy_root(&self) -> Result<ventoy::Root, String> {
+        ventoy::find_root(&self.policy.settings.ventoy_root)
+    }
+
+    async fn ventoy_info(&self, mount: bool) -> Result<Value, String> {
+        #[cfg(windows)]
+        let _ = mount; // drives are mounted by Windows itself
+        match self.ventoy_root() {
+            Ok(r) => Ok(ventoy::info(&r)),
+            #[cfg(unix)]
+            Err(e) if mount => {
+                let Some((dev, rest)) = ventoy::mount_args() else { return Err(e) };
+                let target = rest[0].clone();
+                fs::create_dir_all(&target).map_err(|e| format!("cannot create {target}: {e}"))?;
+                let s = &self.policy.settings;
+                let r = exec::run_argv(s, &self.sem, "mount", &[dev.clone(), target.clone()], "/", 60, None).await?;
+                if r["exit_code"] != json!(0) {
+                    return Err(format!("mount {dev} {target} failed: {}", r["stderr"].as_str().unwrap_or("").trim()));
+                }
+                let mut v = ventoy::info(&self.ventoy_root()?);
+                v["mounted_now"] = json!(target);
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn ventoy_add(&self, a: &Value) -> Result<Value, String> {
+        let root = self.ventoy_root()?;
+        let url = req_str(a, "url")?.trim();
+        let low = url.to_lowercase();
+        if !(low.starts_with("https://") || low.starts_with("http://")) {
+            return Err("url must start with http:// or https://".into());
+        }
+        let sha = arg_str(a, "sha256").map(|x| x.trim().to_lowercase()).filter(|x| !x.is_empty());
+        if let Some(x) = &sha {
+            if !ventoy::valid_sha256(x) {
+                return Err("sha256 must be 64 hex characters".into());
+            }
+        }
+        let name = ventoy::download_name(url, arg_str(a, "filename"))?;
+        let sub = ventoy::safe_rel(arg_str(a, "subdir").unwrap_or(""))?;
+        let dir = Path::new(&root.path).join(&sub);
+        let dest = dir.join(&name);
+        let dest_s = platform::clean_display(&dest);
+        self.policy.check_protected(&dest_s)?;
+        if dest.exists() {
+            return Err(format!("{} already exists; remove it first with ventoy_remove", sub.join(&name).display()));
+        }
+        let mut map = self.downloads.lock().unwrap();
+        if map.values().any(|d| d.running() && d.dest == dest) {
+            return Err("this file is already being downloaded".into());
+        }
+        let running = map.values().filter(|d| d.running()).count();
+        if running >= MAX_DOWNLOADS {
+            return Err(format!("{running} downloads already running; wait or cancel one"));
+        }
+        // forget old finished tasks
+        if map.len() > 20 {
+            let mut done: Vec<(String, u64)> = map.iter().filter(|(_, d)| !d.running()).map(|(k, d)| (k.clone(), d.started_unix)).collect();
+            done.sort_by_key(|x| x.1);
+            for (k, _) in done.into_iter().take(map.len() - 20) {
+                map.remove(&k);
+            }
+        }
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let id = random_hex(4);
+        let d = ventoy::new_download(id.clone(), url.to_string(), dest);
+        map.insert(id, d.clone());
+        drop(map);
+        let free = platform::disk_space(&root.path).map(|x| x.1).unwrap_or(0);
+        let fs_type = root.fs_type.clone();
+        let shown = d.clone();
+        tokio::task::spawn_blocking(move || ventoy::run_download(&d, sha, &fs_type, free));
+        let mut v = shown.summary(&root.path);
+        v["next"] = json!("Poll ventoy_add_status with this task_id until status is done or failed.");
+        Ok(ok(v))
     }
 
     async fn dispatch(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
@@ -297,7 +443,7 @@ impl App {
             }
             "run_script" => {
                 let script = req_str(a, "script")?;
-                let interp = arg_str(a, "interpreter").filter(|i| !i.is_empty()).unwrap_or("sh");
+                let interp = arg_str(a, "interpreter").filter(|i| !i.is_empty()).unwrap_or(DEFAULT_INTERPRETER);
                 if !SCRIPT_INTERPRETERS.contains(&interp) {
                     return Err(format!("interpreter must be one of: {}", SCRIPT_INTERPRETERS.join(", ")));
                 }
@@ -328,17 +474,15 @@ impl App {
                 }
                 let t = (arg_i64(a, "timeout", s.default_timeout as i64).max(1) as u64).min(s.max_timeout);
                 let dir = TempDir::new()?; // 0700, unique per call, removed on drop
-                let file = dir.0.join(if interp == "python3" { "script.py" } else { "script.sh" });
+                let file = dir.0.join(script_file_name(interp));
                 {
                     use std::io::Write;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file)
+                    let mut f = platform::private_opts().write(true).create_new(true).open(&file)
                         .map_err(|e| format!("cannot write script: {e}"))?;
-                    f.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+                    f.write_all(&script_bytes(interp, script)).map_err(|e| e.to_string())?;
                 }
-                let mut argv = vec![file.to_string_lossy().to_string()];
-                argv.extend(args);
-                let res = exec::run_argv(s, &self.sem, &exe, &argv, &cwd, t, stdin).await;
+                let cmd = script_command(interp, &exe, &file.to_string_lossy(), &args, &cwd);
+                let res = exec::run_cmd(s, &self.sem, cmd, t, stdin).await;
                 drop(dir);
                 let mut v = res?;
                 v["interpreter"] = json!(interp);
@@ -454,7 +598,7 @@ impl App {
                     }
                     let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
                     let kind = if m.file_type().is_symlink() { "link" } else if m.is_dir() { "dir" } else { "file" };
-                    entries.push(json!({"name": name, "type": kind, "size": m.len(), "modified_unix": m.mtime()}));
+                    entries.push(json!({"name": name, "type": kind, "size": m.len(), "modified_unix": m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)}));
                 }
                 Ok(json!({"status": "ok", "path": p, "entries": entries}))
             }
@@ -473,6 +617,65 @@ impl App {
             "audit_tail" => {
                 let n = arg_i64(a, "n", 20).clamp(1, 200) as usize;
                 Ok(json!({"status": "ok", "entries": self.audit.tail(n)}))
+            }
+            "ventoy_info" => self.ventoy_info(arg_bool(a, "mount", false)).await,
+            "ventoy_list" => {
+                let root = self.ventoy_root()?;
+                let pol = &self.policy;
+                Ok(ventoy::list(&root, &|p| pol.check_protected(p).is_err()))
+            }
+            "ventoy_add" => self.ventoy_add(a),
+            "ventoy_add_status" => {
+                let root = self.ventoy_root().map(|r| r.path).unwrap_or_default();
+                let map = self.downloads.lock().unwrap();
+                if let Some(id) = arg_str(a, "task_id").filter(|i| !i.is_empty()) {
+                    let d = map.get(id).ok_or_else(|| format!("unknown task_id: {id}"))?;
+                    if arg_bool(a, "cancel", false) && d.running() {
+                        d.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let mut v = d.summary(&root);
+                    if arg_bool(a, "cancel", false) {
+                        v["cancel_requested"] = json!(true);
+                    }
+                    return Ok(ok(v));
+                }
+                let mut list: Vec<Value> = map.values().map(|d| d.summary(&root)).collect();
+                list.sort_by_key(|v| v["started_unix"].as_u64().unwrap_or(0));
+                Ok(json!({"status": "ok", "tasks": list}))
+            }
+            "ventoy_remove" => {
+                let root = self.ventoy_root()?;
+                let rel = req_str(a, "path")?;
+                let p = ventoy::image_path(&root, rel)?;
+                let ps = platform::clean_display(&p);
+                self.policy.check_protected(&ps)?;
+                let m = fs::metadata(&p).map_err(|e| e.to_string())?;
+                let mt = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                let fp = Policy::fingerprint(&["ventoy_remove".to_string(), ps.clone(), m.len().to_string(), mt.to_string()]);
+                if !self.policy.redeem(arg_str(a, "confirm_code"), fp) {
+                    return Ok(json!({
+                        "status": "confirmation_required", "reasons": ["delete a boot image from the Ventoy stick"],
+                        "path": rel, "size_bytes": m.len(),
+                        "confirm_code": self.policy.issue(fp), "expires_in_s": self.policy.settings.confirm_ttl,
+                        "next": "Ask the user. Only if they explicitly agree, call again with the same path plus this confirm_code.",
+                    }));
+                }
+                fs::remove_file(&p).map_err(|e| format!("delete failed: {e}"))?;
+                Ok(json!({"status": "ok", "deleted": rel, "size_bytes": m.len()}))
+            }
+            "ventoy_config_get" => {
+                let root = self.ventoy_root()?;
+                self.policy.check_protected(&platform::clean_display(&ventoy::config_path(&root)))?;
+                ventoy::config_get(&root)
+            }
+            "ventoy_config_set" => {
+                let root = self.ventoy_root()?;
+                let content = req_str(a, "content")?;
+                if content.len() > 1_000_000 {
+                    return Err("ventoy.json larger than 1 MB".into());
+                }
+                self.policy.check_protected(&platform::clean_display(&ventoy::config_path(&root)))?;
+                ventoy::config_set(&root, content)
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -561,24 +764,22 @@ fn search(root: &str, rx: &regex::Regex, glob: Option<&str>, max: usize, protect
     (out, truncated)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn read_trim(p: &str) -> Option<String> {
     fs::read_to_string(p).ok().map(|s| s.trim().to_string())
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn kv(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|l| l.strip_prefix(&format!("{key}=")).map(|v| v.trim_matches(['"', '\'']).to_string()))
 }
 
-fn statvfs(path: &str) -> Option<Value> {
-    let c = std::ffi::CString::new(path).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    let f = st.f_frsize as f64;
-    Some(json!({"total_mb": (st.f_blocks as f64 * f / 1048576.0).round(), "free_mb": (st.f_bavail as f64 * f / 1048576.0).round()}))
+fn space(path: &str) -> Option<Value> {
+    let (total, free) = platform::disk_space(path)?;
+    Some(json!({"total_mb": (total as f64 / 1048576.0).round(), "free_mb": (free as f64 / 1048576.0).round()}))
 }
 
+#[cfg(unix)]
 fn system_info() -> Value {
     let kernel = read_trim("/proc/sys/kernel/osrelease").unwrap_or_default();
     let os = read_trim("/etc/openwrt_release").and_then(|t| kv(&t, "DISTRIB_DESCRIPTION"))
@@ -597,7 +798,7 @@ fn system_info() -> Value {
     let mut storage = Map::new();
     for m in ["/", "/overlay", "/tmp"] {
         if Path::new(m).exists() {
-            if let Some(v) = statvfs(m) {
+            if let Some(v) = space(m) {
                 storage.insert(m.into(), v);
             }
         }
@@ -606,13 +807,37 @@ fn system_info() -> Value {
         "status": "ok",
         "hostname": read_trim("/proc/sys/kernel/hostname").unwrap_or_default(),
         "os": os,
-        "board": read_trim("/tmp/sysinfo/model").unwrap_or_default(),
+        "board": read_trim("/tmp/sysinfo/model").or_else(|| read_trim("/sys/class/dmi/id/product_name")).unwrap_or_default(),
         "kernel": kernel,
         "arch": std::env::consts::ARCH,
         "wsl": kernel.to_lowercase().contains("microsoft"),
         "uptime_h": (uptime / 360.0).round() / 10.0,
         "load": load,
         "mem_mb": mem,
+        "storage": storage,
+        "time_unix": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    })
+}
+
+#[cfg(windows)]
+fn system_info() -> Value {
+    let (total, avail, up, host) = platform::win_sysinfo();
+    let mut storage = Map::new();
+    for v in platform::volumes() {
+        if let Some(mut s) = space(&v.root) {
+            s["label"] = json!(v.label);
+            s["fs"] = json!(v.fs_type);
+            storage.insert(v.root.clone(), s);
+        }
+    }
+    json!({
+        "status": "ok",
+        "hostname": host,
+        "os": "Windows",
+        "arch": std::env::consts::ARCH,
+        "wsl": false,
+        "uptime_h": ((up as f64) / 360.0).round() / 10.0,
+        "mem_mb": {"total": total, "available": avail},
         "storage": storage,
         "time_unix": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     })

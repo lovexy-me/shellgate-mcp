@@ -24,4 +24,14 @@ jobs:
       - working-directory: openwrt
         run: cargo test --release && cargo build --release
       - run: pip install -e ".[dev]"
-      - run: SHELLGATE_BIN=$PWD/openwrt/target/release/shellgate pytest -q tests/test_e2e.py
+      - run: SHELLGATE_BIN=$PWD/openwrt/target/release/shellgate pytest -q tests/test_e2e.py tests/test_ventoy_e2e.py
+  rust-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - run: pip install ziglang cargo-zigbuild
+      - working-directory: openwrt
+        run: cargo zigbuild --release --target x86_64-pc-windows-gnu

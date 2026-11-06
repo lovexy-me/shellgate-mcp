@@ -8,3 +8,6 @@ env
 *.bak-*
 openwrt/target/
 *.sgtmp
+
+# rescue-stick configs hold the access token; only the .example is tracked
+shellgate.env

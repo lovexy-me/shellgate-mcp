@@ -3,7 +3,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -39,9 +38,31 @@ const DANGER: &[(&str, &str)] = &[
     (r"\b(iptables|nft)\b.*\s-(F|X)\b|\bnft\s+flush\b", "flush firewall"),
     (r"\bcrontab\s+-r\b", "delete crontab"),
     (r"\bshutil\.rmtree\b", "recursive delete (python)"),
+    // ---- Windows (cmd / PowerShell); harmless to check on Linux too
+    (r"\bformat(\.com)?\s+[a-z]:", "format drive (Windows)"),
+    (r"\bdiskpart\b", "disk partitioning (diskpart)"),
+    (r"(?m)^\s*clean(\s+all)?\s*$", "diskpart clean (wipes disk)"),
+    (r"\b(del|erase)\b[^|&\n]*\s/s\b", "recursive delete (del /s)"),
+    (r"\b(rd|rmdir)\b[^|&\n]*\s/s\b", "recursive delete (rd /s)"),
+    (r"\b(Remove-Item|ri|rm|rmdir|rd|del|erase)\b[^|;\n]*\s-r(e(c(u(r(se?)?)?)?)?)?\b", "recursive delete (PowerShell -Recurse)"),
+    (r"\bbcdedit(\.exe)?\s+/(set|delete|deletevalue|create|copy|import|default|bootsequence|displayorder|timeout|store|toolsdisplayorder|bootems|ems|debug)\b", "boot configuration change (bcdedit)"),
+    (r"\b(bcdboot|bootsect)(\.exe)?\b", "boot sector / boot files change"),
+    (r"\b(Format-Volume|Clear-Disk|Initialize-Disk|Remove-Partition|Set-Disk)\b", "disk/volume wipe (PowerShell)"),
+    (r"\b(Stop-Computer|Restart-Computer)\b", "power state change"),
+    (r"\breg(\.exe)?\s+(delete|import|restore|load|unload)\b", "registry change (reg)"),
+    (r"\bRemove-ItemProperty\b|\bRemove-Item\b[^|;\n]*\bHK(LM|CU|CR|U|CC)[:\\]", "registry change (PowerShell)"),
+    (r"\bcipher(\.exe)?\s+/w\b", "wipe free space (cipher /w)"),
+    (r"\bvssadmin(\.exe)?\s+(delete|resize)\b|\bwmic\b.*\bshadowcopy\b.*\bdelete\b", "delete shadow copies"),
+    (r"\bmanage-bde(\.exe)?\s+-(off|on|lock|forcerecovery|protectors\s+-delete)\b", "BitLocker change"),
+    (r"\b(net\s+stop|sc(\.exe)?\s+(stop|delete|config)|Stop-Service|Set-Service)\b", "stop/change Windows service"),
+    (r"\btaskkill\b.*\b(csrss|wininit|winlogon|lsass|smss|services|cloudflared|shellgate)\b", "kill critical / remote-access process"),
+    (r"\bDisable-NetAdapter\b|\bnetsh\b.*\b(disable|reset)\b", "network change that may cut remote access"),
+    (r"\bwsl(\.exe)?\s+--(shutdown|unregister)\b", "WSL shutdown/unregister"),
+    (r"\\\\\.\\(PhysicalDrive|Harddisk)", "raw disk access"),
+    (r"\b(takeown)(\.exe)?\b[^|&\n]*\s/r\b", "recursive ownership change"),
 ];
 
-pub const INTERPRETERS: &[&str] = &["sh", "bash", "ash", "dash", "zsh", "python", "python3"];
+pub const INTERPRETERS: &[&str] = &["sh", "bash", "ash", "dash", "zsh", "python", "python3", "powershell", "pwsh", "cmd", "diskpart"];
 
 fn split_re() -> &'static Regex {
     static SPLIT: OnceLock<Regex> = OnceLock::new();
@@ -54,7 +75,9 @@ fn assign_re() -> &'static Regex {
 }
 
 fn base_name(p: &str) -> String {
-    Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    // accept both separators so Windows-style paths work on every host
+    let last = p.rsplit(['/', '\\']).next().unwrap_or(p).to_lowercase();
+    last.strip_suffix(".exe").map(str::to_string).unwrap_or(last)
 }
 
 /// True when the command runs a shell/python that will read code from stdin (e.g. ssh host bash -s).
@@ -212,15 +235,11 @@ impl Policy {
         if path.is_empty() {
             return Err("path is required".into());
         }
-        if !path.starts_with('/') {
+        if !is_absolute(path) {
             return Err("path must be absolute".into());
         }
         let resolved = resolve(path).ok_or("could not resolve path")?;
-        for prot in &self.settings.protected_paths {
-            if within(&resolved, prot) {
-                return Err(format!("protected path: {prot}"));
-            }
-        }
+        self.check_protected(&resolved)?;
         if write || self.settings.mode_allowlist {
             let roots = &self.settings.allowed_dirs;
             if !roots.is_empty() && !roots.iter().any(|r| within(&resolved, r)) {
@@ -232,20 +251,64 @@ impl Policy {
         }
         Ok(resolved)
     }
+
+    /// Refuse protected paths: the configured list plus any Windows registry hive directory
+    /// (`.../Windows/System32/config`, which holds SAM, SYSTEM, SECURITY, SOFTWARE), also when a
+    /// Windows disk is mounted under Linux.
+    pub fn check_protected(&self, resolved: &str) -> Result<(), String> {
+        for prot in &self.settings.protected_paths {
+            if within(resolved, prot) {
+                return Err(format!("protected path: {prot}"));
+            }
+        }
+        if is_registry_hive_path(resolved) {
+            return Err("protected path: Windows registry hives (Windows/System32/config)".into());
+        }
+        Ok(())
+    }
+}
+
+/// True for anything inside a `Windows/System32/config` directory (registry hives) on any host.
+pub fn is_registry_hive_path(p: &str) -> bool {
+    let k = format!("{}/", p.replace('\\', "/").to_lowercase().trim_end_matches('/'));
+    k.contains("/windows/system32/config/")
+}
+
+/// Absolute on this platform (`/x` on Unix, `C:\x` or `\\server\share` on Windows).
+pub fn is_absolute(p: &str) -> bool {
+    Path::new(p).is_absolute()
 }
 
 pub fn within(path: &str, root: &str) -> bool {
-    root == "/" || path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
+    #[cfg(unix)]
+    {
+        root == "/" || path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
+    }
+    #[cfg(windows)]
+    {
+        let (p, r) = (crate::platform::path_key(path), crate::platform::path_key(root));
+        let r = r.trim_end_matches('\\');
+        p == r || p.starts_with(&format!("{r}\\"))
+    }
 }
 
 /// Lexically normalise, then canonicalise the deepest existing ancestor (follows symlinks).
 pub fn resolve(path: &str) -> Option<String> {
-    let mut norm = PathBuf::from("/");
+    let mut norm = PathBuf::new();
+    #[cfg(unix)]
+    norm.push("/");
     for c in Path::new(path).components() {
         match c {
-            Component::ParentDir => { norm.pop(); }
+            Component::Prefix(p) => norm.push(p.as_os_str()),
+            Component::RootDir => norm.push(std::path::MAIN_SEPARATOR_STR),
+            Component::ParentDir => {
+                // never climb above the root / drive
+                if norm.parent().is_some() {
+                    norm.pop();
+                }
+            }
             Component::Normal(s) => norm.push(s),
-            _ => {}
+            Component::CurDir => {}
         }
     }
     let mut existing = norm.clone();
@@ -256,7 +319,7 @@ pub fn resolve(path: &str) -> Option<String> {
             for r in rest.iter().rev() {
                 out.push(r);
             }
-            return Some(out.to_string_lossy().to_string());
+            return Some(crate::platform::clean_display(&out));
         }
         rest.push(existing.file_name()?.to_os_string());
         if !existing.pop() {
@@ -267,8 +330,9 @@ pub fn resolve(path: &str) -> Option<String> {
 
 pub fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
+    if getrandom::getrandom(&mut buf).is_err() {
+        // no OS randomness: refuse to hand out predictable codes/tokens
+        panic!("no OS random source available");
     }
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -286,15 +350,13 @@ mod tests {
     use super::*;
 
     fn s(allow: bool) -> Settings {
-        Settings {
-            token: "x".repeat(40), host: "127.0.0.1".into(), port: 1, mode_allowlist: allow,
-            allowed_commands: vec!["ls".into(), "grep".into(), "uci".into()],
-            allowed_dirs: vec!["/tmp/sgt".into()], protected_paths: vec!["/tmp/sgt/secret".into()],
-            extra_danger_patterns: vec![r"opkg\s+remove".into()], audit_log: "/tmp/a".into(), audit_max_bytes: 1,
-            default_timeout: 1, max_timeout: 1, max_output_bytes: 1, max_concurrent: 1, max_jobs: 1,
-            confirm_ttl: 60, shell: "/bin/sh".into(), backup_on_write: true, env_file: String::new(),
-            redact: true, redact_domains: vec![],
-        }
+        let mut st = Settings::for_tests();
+        st.mode_allowlist = allow;
+        st.allowed_commands = vec!["ls".into(), "grep".into(), "uci".into()];
+        st.allowed_dirs = vec!["/tmp/sgt".into()];
+        st.protected_paths = vec!["/tmp/sgt/secret".into()];
+        st.extra_danger_patterns = vec![r"opkg\s+remove".into()];
+        st
     }
 
     #[test]
@@ -307,6 +369,41 @@ mod tests {
         for c in ["uci show network", "ls -la", "rm a.txt", "/etc/init.d/network status", "logread | tail"] {
             assert!(p.danger_reasons(c).is_empty(), "{c}");
         }
+    }
+
+    #[test]
+    fn windows_danger() {
+        let p = Policy::new(s(false)).unwrap();
+        for c in ["format D: /q /y", "FORMAT.COM e: /FS:NTFS", "diskpart /s wipe.txt", "del /f /s /q C:\\Users\\x",
+                  "erase /s *.tmp", "rd /s /q C:\\data", "rmdir /S C:\\x", "bcdedit /set {default} safeboot minimal",
+                  "bcdedit /delete {current}", "bcdboot C:\\Windows", "Remove-Item C:\\x -Recurse -Force",
+                  "ri .\\build -r", "rm -Recurse -Force C:\\tmp", "Format-Volume -DriveLetter D", "Clear-Disk -Number 1 -RemoveData",
+                  "shutdown /r /t 0", "Stop-Computer -Force", "Restart-Computer", "reg delete HKLM\\Software\\X /f",
+                  "reg.exe import x.reg", "Remove-ItemProperty -Path HKCU:\\X -Name Y", "cipher /w:C:",
+                  "vssadmin delete shadows /all", "net stop cloudflared", "sc.exe delete shellgate", "Stop-Service sshd",
+                  "taskkill /f /im cloudflared.exe", "Disable-NetAdapter -Name Ethernet", "wsl --shutdown",
+                  "dd if=x of=\\\\.\\PhysicalDrive1", "manage-bde -off C:", "takeown /f C:\\x /r"] {
+            assert!(!p.danger_reasons(c).is_empty(), "{c}");
+        }
+        // a lone `clean` line in a diskpart script fed through stdin
+        assert!(!p.text_danger_reasons("select disk 1\nclean\ncreate partition primary\n").is_empty());
+        for c in ["dir /s C:\\", "bcdedit /enum", "Get-Disk", "Get-ChildItem -Recurse", "Format-List", "reg query HKLM\\Software",
+                  "del a.txt", "sc query", "ipconfig /all", "Get-Volume", "Get-Service", "tasklist", "make clean"] {
+            assert!(p.danger_reasons(c).is_empty(), "{c}");
+        }
+        assert!(feeds_interpreter("powershell.exe -Command -"));
+        assert!(feeds_interpreter("diskpart"));
+    }
+
+    #[test]
+    fn registry_hives_protected() {
+        assert!(is_registry_hive_path("C:\\Windows\\System32\\config\\SAM"));
+        assert!(is_registry_hive_path("/mnt/win/Windows/System32/config/SYSTEM"));
+        assert!(is_registry_hive_path("/mnt/win/WINDOWS/system32/CONFIG"));
+        assert!(!is_registry_hive_path("/mnt/win/Windows/System32/drivers/etc/hosts"));
+        std::fs::create_dir_all("/tmp/sgt").unwrap();
+        let p = Policy::new(s(false)).unwrap();
+        assert!(p.check_path("/tmp/sgt/Windows/System32/config/SAM", false).is_err());
     }
 
     #[test]

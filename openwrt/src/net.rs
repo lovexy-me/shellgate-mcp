@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use crate::config::Settings;
+use crate::config::{NetMode, Settings};
 use crate::platform;
 
 // ---------------------------------------------------------------- cloudflared
@@ -65,6 +65,77 @@ pub async fn supervise_cloudflared(s: Settings) {
     }
 }
 
+// ---------------------------------------------------------------- WinPE network
+
+/// What to do about the network in WinPE: (start networking, turn the firewall off).
+/// Only for net=lan|tunnel with `pe_network` on: networking when there is no usable IPv4 yet,
+/// the firewall only in lan mode (a tunnel needs no inbound connections).
+pub fn pe_net_plan(is_pe: bool, net: NetMode, enabled: bool, has_ip: bool) -> (bool, bool) {
+    if !is_pe || !enabled || net == NetMode::Local {
+        return (false, false);
+    }
+    (!has_ip, net == NetMode::Lan)
+}
+
+/// One line to stderr and to `<state_dir>/pe-network.log`.
+fn pe_log(state_dir: &str, msg: &str) {
+    eprintln!("winpe: {msg}");
+    if state_dir.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(state_dir);
+    if let Ok(mut f) = platform::private_opts().create(true).append(true).open(Path::new(state_dir).join("pe-network.log")) {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = writeln!(f, "{ts} {msg}");
+    }
+}
+
+#[cfg_attr(unix, allow(dead_code))]
+async fn wpeutil(arg: &str) -> String {
+    let Some(exe) = platform::which("wpeutil") else { return "wpeutil not found".into() };
+    let mut c = platform::new_command(&exe);
+    c.arg(arg).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    match tokio::time::timeout(Duration::from_secs(120), c.output()).await {
+        Ok(Ok(o)) => {
+            let text = platform::decode_output(&[o.stdout, o.stderr].concat());
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("exit {:?}{}{}", o.status.code(), if text.is_empty() { "" } else { ": " }, text.chars().take(200).collect::<String>())
+        }
+        Ok(Err(e)) => format!("cannot run: {e}"),
+        Err(_) => "timed out after 120 s".into(),
+    }
+}
+
+/// WinPE without wpeinit (official WinPE / Windows Setup started some other way, or a PE whose
+/// shell skipped it) has no network: bring it up, and in lan mode open the firewall.
+pub async fn winpe_network(s: Settings) {
+    let has_ip = primary_ipv4().is_some();
+    let (init, fw_off) = pe_net_plan(platform::is_winpe(), s.net, s.pe_network, has_ip);
+    if !init && !fw_off {
+        return;
+    }
+    if init {
+        pe_log(&s.state_dir, "no IPv4 address: running wpeutil InitializeNetwork");
+        let r = wpeutil("InitializeNetwork").await;
+        pe_log(&s.state_dir, &format!("wpeutil InitializeNetwork -> {r}"));
+        let t0 = std::time::Instant::now();
+        while primary_ipv4().is_none() && t0.elapsed() < Duration::from_secs(90) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        match primary_ipv4() {
+            Some(ip) => pe_log(&s.state_dir, &format!("IPv4 address {ip} after {} s", t0.elapsed().as_secs())),
+            None => pe_log(&s.state_dir, "still no IPv4 address after 90 s (no driver for the network card, or no DHCP?)"),
+        }
+    } else if s.pe_network {
+        pe_log(&s.state_dir, "IPv4 address present; not initialising the network");
+    }
+    if fw_off {
+        let r = wpeutil("DisableFirewall").await;
+        pe_log(&s.state_dir, &format!("lan mode: wpeutil DisableFirewall -> {r}"));
+    }
+}
+
 // ---------------------------------------------------------------- mDNS
 
 const MDNS_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
@@ -76,7 +147,7 @@ pub fn primary_ipv4() -> Option<Ipv4Addr> {
         if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
             if s.connect(target).is_ok() {
                 if let Ok(SocketAddr::V4(a)) = s.local_addr() {
-                    if !a.ip().is_unspecified() && !a.ip().is_loopback() {
+                    if usable_lan_ip(a.ip()) {
                         return Some(*a.ip());
                     }
                 }
@@ -84,6 +155,12 @@ pub fn primary_ipv4() -> Option<Ipv4Addr> {
         }
     }
     None
+}
+
+/// An address other machines can reach: not 0.0.0.0, loopback, or link-local (169.254/16,
+/// which Windows assigns while DHCP has not answered).
+pub fn usable_lan_ip(ip: &Ipv4Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local()
 }
 
 fn encode_name(name: &str, out: &mut Vec<u8>) {
@@ -184,37 +261,79 @@ fn mdns_socket() -> std::io::Result<UdpSocket> {
 }
 
 /// Answer `<name>.local` A queries on the LAN (runs on its own thread; best effort).
+/// Waits until the machine has a LAN address (WinPE brings the network up late), retries the
+/// socket when it cannot be opened yet, and re-announces when the address changes.
 pub fn spawn_mdns(name: String) {
     let fqdn = format!("{}.local", name.to_lowercase());
     std::thread::spawn(move || {
-        let sock = match mdns_socket() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("mDNS: cannot listen on udp/5353 ({e}); {fqdn} will not resolve, use the IP address");
-                return;
+        let mut waited = false;
+        while primary_ipv4().is_none() {
+            if !waited {
+                eprintln!("mDNS: waiting for a LAN address before answering {fqdn}");
+                waited = true;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let mut delay = 2u64;
+        let mut tries = 0u32;
+        let sock = loop {
+            match mdns_socket() {
+                Ok(s) => break s,
+                Err(e) => {
+                    tries += 1;
+                    if tries == 1 || tries % 10 == 0 {
+                        eprintln!("mDNS: cannot listen on udp/5353 ({e}); retrying (attempt {tries}); meanwhile use the IP address");
+                    }
+                    std::thread::sleep(Duration::from_secs(delay));
+                    delay = (delay * 2).min(30);
+                }
             }
         };
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
         let group = SocketAddr::V4(SocketAddrV4::new(MDNS_ADDR, MDNS_PORT));
-        // announce twice so caches pick us up
-        for _ in 0..2 {
-            if let Some(ip) = primary_ipv4() {
+        let announce = |ip: Ipv4Addr| {
+            // twice so caches pick us up
+            for _ in 0..2 {
                 let _ = sock.send_to(&build_answer(0, &fqdn, ip, false), group);
+                std::thread::sleep(Duration::from_millis(500));
             }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        match primary_ipv4() {
-            Some(ip) => eprintln!("mDNS: answering {fqdn} -> {ip}"),
-            None => eprintln!("mDNS: answering {fqdn} (no LAN address yet)"),
+        };
+        let mut last = primary_ipv4();
+        if let Some(ip) = last {
+            announce(ip);
+            eprintln!("mDNS: answering {fqdn} -> {ip}");
         }
         let mut buf = [0u8; 1500];
+        let mut checked = std::time::Instant::now();
+        let mut now = last;
         loop {
-            let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+            let got = sock.recv_from(&mut buf);
+            if checked.elapsed() >= Duration::from_secs(5) {
+                now = primary_ipv4();
+                checked = std::time::Instant::now();
+            }
+            if now != last {
+                if let Some(ip) = now {
+                    eprintln!("mDNS: address changed, answering {fqdn} -> {ip}");
+                    announce(ip);
+                }
+                last = now;
+            }
+            let (n, from) = match got {
+                Ok(v) => v,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                Err(_) => {
+                    // e.g. WSAECONNRESET after an ICMP unreachable, or the adapter went away
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            };
             let Some((id, qs)) = parse_query(&buf[..n]) else { continue };
             for (qname, qtype, unicast) in qs {
                 if qname != fqdn || !(qtype == 1 || qtype == 255) {
                     continue;
                 }
-                let Some(ip) = primary_ipv4() else { continue };
+                let Some(ip) = now else { continue };
                 if from.port() != MDNS_PORT {
                     // legacy one-shot resolver: unicast reply with the query id and question
                     let _ = sock.send_to(&build_answer(id, &fqdn, ip, true), from);
@@ -256,6 +375,28 @@ mod tests {
         m.extend_from_slice(&[0xC0, 12, 0, 28, 0, 1]);
         let (_, qs) = parse_query(&m).unwrap();
         assert_eq!(qs[1], ("ventoy-rescue.local".to_string(), 28, false));
+    }
+
+    #[test]
+    fn lan_ip_filter() {
+        assert!(usable_lan_ip(&Ipv4Addr::new(192, 168, 1, 20)));
+        assert!(!usable_lan_ip(&Ipv4Addr::new(169, 254, 3, 4)));
+        assert!(!usable_lan_ip(&Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!usable_lan_ip(&Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn winpe_network_plan() {
+        // not WinPE, switched off, or local mode: leave the network alone
+        assert_eq!(pe_net_plan(false, NetMode::Lan, true, false), (false, false));
+        assert_eq!(pe_net_plan(true, NetMode::Lan, false, false), (false, false));
+        assert_eq!(pe_net_plan(true, NetMode::Local, true, false), (false, false));
+        // lan: init only without an address, firewall off either way
+        assert_eq!(pe_net_plan(true, NetMode::Lan, true, false), (true, true));
+        assert_eq!(pe_net_plan(true, NetMode::Lan, true, true), (false, true));
+        // tunnel: outbound only, firewall untouched
+        assert_eq!(pe_net_plan(true, NetMode::Tunnel, true, false), (true, false));
+        assert_eq!(pe_net_plan(true, NetMode::Tunnel, true, true), (false, false));
     }
 
     #[test]

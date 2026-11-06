@@ -103,11 +103,57 @@ fn script_file_name(interp: &str) -> &'static str {
     }
 }
 
-/// Script bytes as the interpreter wants them: cmd needs CRLF line ends, Windows PowerShell 5.1
-/// needs a UTF-8 BOM to read non-ASCII text correctly.
+/// Pick the interpreter for run_script. `requested` is the caller's choice (None/empty = default).
+/// Returns (interpreter, note for the result). With no explicit choice and no working PowerShell
+/// (most WinPE builds) the default falls back to cmd; an explicit `powershell` that cannot run is an
+/// error that says so, instead of a confusing "not found" or a hang.
+fn pick_interpreter(requested: Option<&str>, ps_usable: impl Fn() -> bool) -> Result<(&'static str, Option<String>), String> {
+    let explicit = requested.filter(|i| !i.trim().is_empty());
+    let want = explicit.unwrap_or(DEFAULT_INTERPRETER);
+    let Some(interp) = SCRIPT_INTERPRETERS.iter().copied().find(|i| *i == want) else {
+        return Err(format!("interpreter must be one of: {}", SCRIPT_INTERPRETERS.join(", ")));
+    };
+    if interp != "powershell" || ps_usable() {
+        return Ok((interp, None));
+    }
+    if explicit.is_some() {
+        return Err("PowerShell is not available on this host (WinPE images often ship without it, or it cannot \
+start); use interpreter=cmd, or python if installed".into());
+    }
+    Ok(("cmd", Some("PowerShell is not available on this host (e.g. WinPE); the script ran with cmd instead. \
+Write cmd syntax, or pass interpreter explicitly.".into())))
+}
+
+/// cmd reads a .cmd file in the console (OEM) code page. Encode it there when every character
+/// fits; otherwise switch the console to UTF-8 first (`chcp 65001`) and write UTF-8.
+#[cfg_attr(unix, allow(dead_code))]
+fn cmd_script_bytes(script: &str, oem: impl Fn(&str) -> Option<Vec<u8>>) -> Vec<u8> {
+    let crlf = script.replace("\r\n", "\n").replace('\n', "\r\n");
+    match oem(&crlf) {
+        Some(b) => b,
+        None => {
+            let mut v = b"@chcp 65001 >nul\r\n".to_vec();
+            v.extend_from_slice(crlf.as_bytes());
+            v
+        }
+    }
+}
+
+#[cfg(windows)]
+fn oem_encoder(s: &str) -> Option<Vec<u8>> {
+    platform::encode_oem(s)
+}
+
+#[cfg(unix)]
+fn oem_encoder(s: &str) -> Option<Vec<u8>> {
+    Some(s.as_bytes().to_vec())
+}
+
+/// Script bytes as the interpreter wants them: cmd needs CRLF line ends and the OEM code page,
+/// Windows PowerShell 5.1 needs a UTF-8 BOM to read non-ASCII text correctly.
 fn script_bytes(interp: &str, script: &str) -> Vec<u8> {
     match interp {
-        "cmd" => script.replace("\r\n", "\n").replace('\n', "\r\n").into_bytes(),
+        "cmd" => cmd_script_bytes(script, oem_encoder),
         "powershell" | "pwsh" => {
             let mut v = vec![0xEF, 0xBB, 0xBF];
             v.extend_from_slice(script.as_bytes());
@@ -153,7 +199,7 @@ pub fn definitions() -> Value {
     json!([
         {"name": "run_command", "description": "Run a shell command (Linux: /bin/sh -c; Windows: cmd /C, or PowerShell when SHELLGATE_SHELL=powershell) and wait for it. Returns exit_code, stdout, stderr. timeout in seconds (default 60, max 600); for longer work use start_job. stdin (optional) is written to the command's standard input, e.g. command=\"ssh host sh -s\" with the script body in stdin.",
          "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory (default: home)"), "timeout": i("Seconds"), "stdin": s("Text written to the command's stdin"), "confirm_code": confirm.clone()}), &["command"])},
-        {"name": "run_script", "description": "Run a multi-line script and wait for it (Linux: sh, bash, python3, ash; Windows: powershell, pwsh, cmd, python). The script is written to a private temp file (removed afterwards) and run as `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as run_command. Returns exit_code, stdout, stderr.",
+        {"name": "run_script", "description": "Run a multi-line script and wait for it (Linux: sh, bash, python3, ash; Windows: powershell, pwsh, cmd, python; with no interpreter given and no working PowerShell, as in most WinPE, cmd is used and the result carries a note). The script is written to a private temp file (removed afterwards) and run as `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as run_command. Returns exit_code, stdout, stderr.",
          "inputSchema": obj(json!({"script": s("Script body"), "interpreter": {"type": "string", "enum": SCRIPT_INTERPRETERS, "default": DEFAULT_INTERPRETER, "description": SCRIPT_INTERPRETERS.join(", ")},
                                    "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the script"},
                                    "stdin": s("Text written to the script's stdin"), "timeout": i("Seconds"), "cwd": s("Working directory (default: home)"), "confirm_code": confirm.clone()}), &["script"])},
@@ -443,10 +489,7 @@ impl App {
             }
             "run_script" => {
                 let script = req_str(a, "script")?;
-                let interp = arg_str(a, "interpreter").filter(|i| !i.is_empty()).unwrap_or(DEFAULT_INTERPRETER);
-                if !SCRIPT_INTERPRETERS.contains(&interp) {
-                    return Err(format!("interpreter must be one of: {}", SCRIPT_INTERPRETERS.join(", ")));
-                }
+                let (interp, note) = pick_interpreter(arg_str(a, "interpreter"), platform::powershell_usable)?;
                 if script.len() > MAX_STDIN {
                     return Err("script larger than 4 MB".into());
                 }
@@ -469,6 +512,9 @@ impl App {
                 if let Some(mut b) = self.gate("script", &shown, &cwd, arg_str(a, "confirm_code"), stdin, Some(script), &extra) {
                     if b["status"] == "confirmation_required" {
                         b["interpreter"] = json!(interp);
+                        if let Some(n) = &note {
+                            b["note"] = json!(n);
+                        }
                     }
                     return Ok(b);
                 }
@@ -486,6 +532,9 @@ impl App {
                 drop(dir);
                 let mut v = res?;
                 v["interpreter"] = json!(interp);
+                if let Some(n) = note {
+                    v["note"] = json!(n);
+                }
                 Ok(ok(v))
             }
             "start_job" => {
@@ -811,6 +860,7 @@ fn system_info() -> Value {
         "kernel": kernel,
         "arch": std::env::consts::ARCH,
         "wsl": kernel.to_lowercase().contains("microsoft"),
+        "winpe": false,
         "uptime_h": (uptime / 360.0).round() / 10.0,
         "load": load,
         "mem_mb": mem,
@@ -834,6 +884,9 @@ fn system_info() -> Value {
         "status": "ok",
         "hostname": host,
         "os": "Windows",
+        "os_version": platform::windows_version(),
+        "winpe": platform::is_winpe(),
+        "powershell": platform::powershell_usable(),
         "arch": std::env::consts::ARCH,
         "wsl": false,
         "uptime_h": ((up as f64) / 360.0).round() / 10.0,
@@ -851,5 +904,47 @@ mod tests {
         assert!(super::glob_match("net*", "network"));
         assert!(!super::glob_match("*.conf", "a.txt"));
         assert!(super::glob_match("a?c", "abc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpreter_default_and_unknown() {
+        assert_eq!(super::pick_interpreter(None, || false).unwrap(), ("sh", None));
+        assert_eq!(super::pick_interpreter(Some(""), || false).unwrap().0, "sh");
+        assert_eq!(super::pick_interpreter(Some("bash"), || false).unwrap().0, "bash");
+        assert!(super::pick_interpreter(Some("perl"), || true).unwrap_err().contains("must be one of"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interpreter_powershell_fallback() {
+        let (i, n) = super::pick_interpreter(None, || false).unwrap();
+        assert_eq!(i, "cmd");
+        assert!(n.unwrap().contains("ran with cmd"));
+        assert_eq!(super::pick_interpreter(None, || true).unwrap(), ("powershell", None));
+        assert!(super::pick_interpreter(Some("powershell"), || false).unwrap_err().contains("not available"));
+        assert_eq!(super::pick_interpreter(Some("cmd"), || false).unwrap(), ("cmd", None));
+    }
+
+    #[test]
+    fn cmd_script_encoding() {
+        // fake OEM code page that only has ASCII and the GBK bytes for "中"
+        let oem = |s: &str| -> Option<Vec<u8>> {
+            let mut v = vec![];
+            for c in s.chars() {
+                match c {
+                    '中' => v.extend_from_slice(&[0xD6, 0xD0]),
+                    c if c.is_ascii() => v.push(c as u8),
+                    _ => return None,
+                }
+            }
+            Some(v)
+        };
+        assert_eq!(super::cmd_script_bytes("@echo off\necho 中", oem), b"@echo off\r\necho \xD6\xD0".to_vec());
+        // a character outside the code page: chcp 65001 first, then UTF-8
+        let out = super::cmd_script_bytes("echo 中✓\r\n", oem);
+        assert!(out.starts_with(b"@chcp 65001 >nul\r\n"));
+        assert!(out.ends_with("echo 中✓\r\n".as_bytes()));
+        assert!(!String::from_utf8(out).unwrap().contains("\r\r"));
     }
 }

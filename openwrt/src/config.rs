@@ -75,6 +75,9 @@ pub struct Settings {
     pub mdns_name: String,
     pub ventoy_root: String,
     pub state_dir: String,
+    /// WinPE only, net=lan|tunnel: start networking (wpeutil InitializeNetwork) when there is no IPv4
+    /// address, and in lan mode turn the WinPE firewall off (wpeutil DisableFirewall). Default on.
+    pub pe_network: bool,
 }
 
 impl Settings {
@@ -89,7 +92,7 @@ impl Settings {
             confirm_ttl: 60, shell: platform::default_shell(), backup_on_write: true, env_file: String::new(),
             redact: true, redact_domains: vec![], net: NetMode::Local, tunnel_token: String::new(),
             cloudflared: String::new(), mdns: false, mdns_name: "ventoy-rescue".into(), ventoy_root: String::new(),
-            state_dir: String::new(),
+            state_dir: String::new(), pe_network: true,
         }
     }
 }
@@ -281,7 +284,11 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
     #[cfg(unix)]
     let default_dirs = format!("/tmp,{h},/etc/config");
     #[cfg(windows)]
-    let default_dirs = format!("{},{h}", env::temp_dir().display());
+    let default_dirs = {
+        let mut d = vec![env::temp_dir().display().to_string(), h.clone()];
+        d.extend(winpe_extra_dirs(platform::is_winpe(), platform::temp_dirs()));
+        dedup_dirs(d).join(",")
+    };
     Ok(Settings {
         token,
         host: get("SHELLGATE_HOST", default_host),
@@ -311,7 +318,37 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
         mdns_name: get("SHELLGATE_MDNS_NAME", "ventoy-rescue").trim_end_matches(".local").to_string(),
         ventoy_root,
         state_dir: expand(&state_dir),
+        pe_network: truthy(&get("SHELLGATE_PE_NETWORK", "1")),
     })
+}
+
+/// Extra default allowed directories inside WinPE: the RAM drive X:\ (everything there is
+/// throw-away) and the temp directories (%TEMP%/%TMP%), which WinPE points at X:\Windows\TEMP.
+#[cfg_attr(unix, allow(dead_code))]
+fn winpe_extra_dirs(is_pe: bool, temps: Vec<String>) -> Vec<String> {
+    if !is_pe {
+        return vec![];
+    }
+    let mut v = vec!["X:\\".to_string()];
+    v.extend(temps);
+    v
+}
+
+/// Drop empty and repeated entries (case-insensitive, trailing separators ignored), keep order.
+#[cfg_attr(unix, allow(dead_code))]
+fn dedup_dirs(dirs: Vec<String>) -> Vec<String> {
+    let key = |d: &str| {
+        let t = d.replace('/', "\\").to_lowercase();
+        let t = t.trim_end_matches('\\').to_string();
+        t
+    };
+    let mut out: Vec<String> = vec![];
+    for d in dirs {
+        if !d.trim().is_empty() && !out.iter().any(|o| key(o) == key(&d)) {
+            out.push(d);
+        }
+    }
+    out
 }
 
 /// Text of a fresh config file: only the token is filled in; everything else is commented out.
@@ -335,6 +372,10 @@ token={token}
 
 #port=8790
 #state_dir=
+
+# WinPE, net=lan|tunnel: bring the network up (wpeutil InitializeNetwork) and, for lan, turn the
+# WinPE firewall off (wpeutil DisableFirewall). Set pe_network=0 to leave both alone.
+#pe_network=1
 ")
 }
 
@@ -363,5 +404,13 @@ mod tests {
         let t = template("TESTTOKEN");
         assert!(t.contains("token=TESTTOKEN"));
         assert!(t.contains("#tunnel_token=\n"));
+    }
+
+    #[test]
+    fn winpe_dirs() {
+        assert!(winpe_extra_dirs(false, vec!["X:\\Windows\\TEMP".into()]).is_empty());
+        assert_eq!(winpe_extra_dirs(true, vec!["X:\\Windows\\TEMP".into()]), vec!["X:\\", "X:\\Windows\\TEMP"]);
+        let d = dedup_dirs(vec!["X:\\Windows\\TEMP".into(), "x:\\windows\\temp\\".into(), "".into(), "X:\\".into()]);
+        assert_eq!(d, vec!["X:\\Windows\\TEMP", "X:\\"]);
     }
 }

@@ -251,6 +251,10 @@ async fn serve(settings: config::Settings) {
     };
     eprintln!("ShellGate {VERSION} (rust) on http://{addr}/mcp (net={}, mode={mode}, redact={redact_state}, config={env_file}, audit={audit_path})",
               net.as_str());
+    if platform::is_winpe() {
+        eprintln!("running in Windows PE (pe_network={})", if net_settings.pe_network { "on" } else { "off" });
+        tokio::spawn(net::winpe_network(net_settings.clone()));
+    }
     match net {
         config::NetMode::Lan => {
             let port = net_settings.port;

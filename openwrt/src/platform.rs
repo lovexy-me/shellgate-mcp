@@ -16,9 +16,151 @@ pub fn home() -> String {
     }
     #[cfg(windows)]
     {
-        std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty())
-            .or_else(|| std::env::var("HOME").ok().filter(|h| !h.is_empty()))
-            .unwrap_or_else(|| "C:\\".into())
+        let prof = std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty())
+            .or_else(|| std::env::var("HOME").ok().filter(|h| !h.is_empty()));
+        match prof {
+            // WinPE and services run as SYSTEM, whose profile lives under the (protected)
+            // System32\config directory: use the public profile or the temp dir instead.
+            Some(h) if !is_system_profile(&h) => h,
+            _ => {
+                let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+                let public = format!("{drive}\\Users\\Public");
+                if Path::new(&public).is_dir() {
+                    public
+                } else {
+                    temp_dirs().into_iter().next().unwrap_or_else(|| format!("{drive}\\"))
+                }
+            }
+        }
+    }
+}
+
+/// `true` for the LocalSystem profile (`...\System32\config\systemprofile`).
+pub fn is_system_profile(p: &str) -> bool {
+    p.replace('/', "\\").to_lowercase().contains("\\system32\\config\\systemprofile")
+}
+
+#[cfg_attr(unix, allow(dead_code))]
+/// Temp directories worth allowing: %TEMP%, %TMP% and the process temp dir, existing ones only.
+pub fn temp_dirs() -> Vec<String> {
+    let mut v: Vec<String> = vec![];
+    let cands = [std::env::var("TEMP").ok(), std::env::var("TMP").ok(), Some(std::env::temp_dir().to_string_lossy().to_string())];
+    for c in cands.into_iter().flatten() {
+        let c = c.trim_end_matches(['\\', '/']).to_string();
+        if !c.is_empty() && Path::new(&c).is_dir() && !v.iter().any(|x| path_key(x) == path_key(&c)) && !is_system_profile(&c) {
+            v.push(c);
+        }
+    }
+    v
+}
+
+// ---------------------------------------------------------------- WinPE
+
+/// Running inside Windows PE (official WinPE, Windows Setup, FirPE, HotPE, WePE, ...):
+/// every WinPE has `HKLM\SYSTEM\CurrentControlSet\Control\MiniNT`.
+pub fn is_winpe() -> bool {
+    #[cfg(windows)]
+    {
+        static PE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PE.get_or_init(|| reg_key_exists("SYSTEM\\CurrentControlSet\\Control\\MiniNT"))
+    }
+    #[cfg(unix)]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn reg_key_exists(sub: &str) -> bool {
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+    let w = wide(sub);
+    let mut h: HKEY = std::ptr::null_mut();
+    let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, w.as_ptr(), 0, KEY_READ, &mut h) };
+    if rc == 0 {
+        unsafe { RegCloseKey(h) };
+        true
+    } else {
+        false
+    }
+}
+
+/// A REG_SZ value under HKLM, e.g. ProductName / CurrentBuild of the running Windows.
+#[cfg(windows)]
+pub fn reg_sz(sub: &str, name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let (ws, wn) = (wide(sub), wide(name));
+    let mut buf = vec![0u16; 512];
+    let mut len = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, ws.as_ptr(), wn.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(),
+                     buf.as_mut_ptr() as *mut _, &mut len)
+    };
+    if rc != 0 {
+        return None;
+    }
+    let n = (len as usize / 2).min(buf.len());
+    let s = String::from_utf16_lossy(&buf[..n]);
+    Some(s.trim_end_matches('\0').to_string())
+}
+
+/// "Windows 10 Pro 22H2 (build 19045)" from the CurrentVersion registry values (null on Linux).
+#[cfg_attr(unix, allow(dead_code))]
+pub fn windows_version() -> Option<String> {
+    #[cfg(windows)]
+    {
+        const K: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        Some(format_windows_version(reg_sz(K, "ProductName"), reg_sz(K, "DisplayVersion").or_else(|| reg_sz(K, "ReleaseId")),
+                                    reg_sz(K, "CurrentBuild").or_else(|| reg_sz(K, "CurrentBuildNumber"))))
+    }
+    #[cfg(unix)]
+    {
+        None
+    }
+}
+
+#[cfg_attr(unix, allow(dead_code))]
+fn format_windows_version(product: Option<String>, display: Option<String>, build: Option<String>) -> String {
+    let mut s = product.filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "Windows".into());
+    if let Some(d) = display.filter(|d| !d.trim().is_empty()) {
+        s.push(' ');
+        s.push_str(d.trim());
+    }
+    if let Some(b) = build.filter(|b| !b.trim().is_empty()) {
+        s.push_str(&format!(" (build {})", b.trim()));
+    }
+    s
+}
+
+/// Whether Windows PowerShell can actually run here. Many WinPE builds have no PowerShell, and
+/// some ship a powershell.exe that cannot start (missing .NET). Probed once with `exit 7`.
+pub fn powershell_usable() -> bool {
+    #[cfg(windows)]
+    {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            use std::os::windows::process::CommandExt;
+            let Some(exe) = which("powershell") else { return false };
+            let mut c = std::process::Command::new(exe);
+            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 7"])
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW);
+            let Ok(mut child) = c.spawn() else { return false };
+            let t0 = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => return st.code() == Some(7),
+                    Ok(None) if t0.elapsed() < std::time::Duration::from_secs(20) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                    _ => {
+                        let _ = child.kill();
+                        return false;
+                    }
+                }
+            }
+        })
+    }
+    #[cfg(unix)]
+    {
+        false
     }
 }
 
@@ -453,6 +595,40 @@ pub fn pause_if_double_clicked() {
     }
 }
 
+/// Encode text in the console (OEM) code page, as cmd.exe reads .cmd files. `None` when some
+/// character has no exact representation there (the caller then falls back to UTF-8 + chcp 65001).
+#[cfg(windows)]
+pub fn encode_oem(s: &str) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Globalization::{GetOEMCP, WideCharToMultiByte, WC_NO_BEST_FIT_CHARS};
+    if s.is_ascii() {
+        return Some(s.as_bytes().to_vec());
+    }
+    let w: Vec<u16> = s.encode_utf16().collect();
+    if w.len() >= i32::MAX as usize / 4 {
+        return None;
+    }
+    unsafe {
+        let cp = GetOEMCP();
+        if cp == 65001 {
+            return Some(s.as_bytes().to_vec());
+        }
+        let mut used = 0i32;
+        let n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, w.as_ptr(), w.len() as i32, std::ptr::null_mut(), 0,
+                                    std::ptr::null(), &mut used);
+        if n <= 0 || used != 0 {
+            return None;
+        }
+        let mut out = vec![0u8; n as usize];
+        let m = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, w.as_ptr(), w.len() as i32, out.as_mut_ptr(), n,
+                                    std::ptr::null(), &mut used);
+        if m <= 0 || used != 0 {
+            return None;
+        }
+        out.truncate(m as usize);
+        Some(out)
+    }
+}
+
 /// Marker `exec` puts between the kept head and tail of over-long output.
 pub const TRUNC_MARKER: &[u8] = b"\n...[output truncated]...\n";
 
@@ -515,17 +691,40 @@ pub fn decode_output(b: &[u8]) -> String {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
-        if !b.is_empty() && b.len() < i32::MAX as usize {
-            unsafe {
-                let cp = GetOEMCP();
-                let n = MultiByteToWideChar(cp, 0, b.as_ptr(), b.len() as i32, std::ptr::null_mut(), 0);
-                if n > 0 {
-                    let mut w = vec![0u16; n as usize];
-                    let m = MultiByteToWideChar(cp, 0, b.as_ptr(), b.len() as i32, w.as_mut_ptr(), n);
-                    if m > 0 {
-                        return String::from_utf16_lossy(&w[..m as usize]);
-                    }
+        decode_mixed(b, oem_decode)
+    }
+    #[cfg(not(windows))]
+    {
+        String::from_utf8_lossy(b).into_owned()
+    }
+}
+
+/// Mixed output (e.g. `ipconfig` in GBK followed by a tool that writes UTF-8, or a UTF-8 script
+/// echoed by cmd): decode line by line, UTF-8 where a line is valid UTF-8, else the OEM code page.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decode_mixed(b: &[u8], oem: impl Fn(&[u8]) -> String) -> String {
+    let mut out = String::with_capacity(b.len() + b.len() / 2);
+    for line in b.split_inclusive(|&c| c == b'\n') {
+        match std::str::from_utf8(line) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push_str(&oem(line)),
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn oem_decode(b: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+    if !b.is_empty() && b.len() < i32::MAX as usize {
+        unsafe {
+            let cp = GetOEMCP();
+            let n = MultiByteToWideChar(cp, 0, b.as_ptr(), b.len() as i32, std::ptr::null_mut(), 0);
+            if n > 0 {
+                let mut w = vec![0u16; n as usize];
+                let m = MultiByteToWideChar(cp, 0, b.as_ptr(), b.len() as i32, w.as_mut_ptr(), n);
+                if m > 0 {
+                    return String::from_utf16_lossy(&w[..m as usize]);
                 }
             }
         }
@@ -585,6 +784,32 @@ mod tests {
         assert!(utf8_pieces(&[0x87, b'a']).is_none());
         #[cfg(not(windows))]
         assert_eq!(decode_output(&gbk), String::from_utf8_lossy(&gbk));
+    }
+
+    #[test]
+    fn decode_mixed_lines() {
+        // GBK line from ipconfig, then a UTF-8 line from another tool: each line keeps its own encoding
+        let fake_oem = |l: &[u8]| format!("<oem:{}>", l.len());
+        let mut b = vec![0xD6, 0xD0, 0xCE, 0xC4, b'\r', b'\n'];
+        b.extend_from_slice("找不到命令\r\n".as_bytes());
+        b.extend_from_slice(b"ok");
+        assert_eq!(decode_mixed(&b, fake_oem), "<oem:6>找不到命令\r\nok");
+        assert_eq!(decode_mixed(b"", fake_oem), "");
+    }
+
+    #[test]
+    fn windows_version_text() {
+        assert_eq!(format_windows_version(Some("Windows 10 Pro".into()), Some("22H2".into()), Some("19045".into())),
+                   "Windows 10 Pro 22H2 (build 19045)");
+        assert_eq!(format_windows_version(None, None, Some("26100".into())), "Windows (build 26100)");
+        assert_eq!(format_windows_version(Some(" ".into()), Some("".into()), None), "Windows");
+    }
+
+    #[test]
+    fn system_profile_detected() {
+        assert!(is_system_profile("X:\\Windows\\System32\\config\\systemprofile"));
+        assert!(is_system_profile("C:\\WINDOWS\\system32\\config\\systemprofile\\"));
+        assert!(!is_system_profile("C:\\Users\\Bob"));
     }
 
     #[test]

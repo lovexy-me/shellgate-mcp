@@ -78,6 +78,31 @@ tunnel_token=在 Cloudflare 后台为这个 U 盘单独建的隧道的 token
 - **Linux 救援系统**：运行 `shellgate`；Ventoy 分区已挂载时自动找到配置。没挂载时先 `mount /dev/disk/by-label/Ventoy /mnt/ventoy`，或在已启动的服务里调用 `ventoy_info` 加 `mount=true`（挂到 `/mnt/ventoy`）。也可以用 `ventoy_root=/某路径` 或环境变量 `VENTOY_ROOT` 指定。
 - 在别人电脑上运行前，请先征得机主同意。
 
+## 在各种 PE 里自动启动
+
+模板都在 `openwrt/pe-autostart/`，**都不含令牌**：令牌只在 U 盘的 `shellgate/shellgate.env` 里。按你要用的 PE 选一种或几种（互不冲突，重复启动时第二个会因端口占用直接退出）：
+
+| PE | 放什么 | 原理 |
+|---|---|---|
+| 官方 WinPE / Windows 安装盘（原版 ISO） | `ventoy/shellgate-inject.7z`（用 `pe-autostart/make-inject.sh shellgate.exe` 打包）+ `ventoy.json` 里 `"injection": [{"parent": "/ISO", "archive": "/ventoy/shellgate-inject.7z"}]` | Ventoy 注入插件把 `VentoyAutoRun.bat` 和 `X:\shellgate\shellgate.exe` 放进内存盘，在 winpeshl 之前执行 |
+| FirPE | `FirPE/Hooks/onBootFinished.cmd` + `shellgate/pe-start.cmd` | FirPE 生命周期钩子，所有服务启动完后执行（钩子文件按 GBK 读，模板只用 ASCII） |
+| HotPE | `HotPE/HotPE.INI` + `shellgate/pe-start.cmd` | HotPE 启动时加载任意盘 `\HotPE\HotPE.INI`（PECMD 脚本） |
+| 微PE（WePE） | `WEPE/WEPE.INI` + `shellgate/pe-start.cmd` | 微PE 启动时 `PECMD LOAD \WEPE\WEPE.INI` |
+| 其他 PE / 手动 | `shellgate/pe-start.cmd` | 双击或在命令行运行；它在所有盘符里找 `\shellgate\shellgate.exe` + `shellgate.env` |
+
+`pe-start.cmd` 与钩子模板都要求 U 盘上有 `shellgate/shellgate.exe` 和 `shellgate/shellgate.env`。
+
+**WinPE 里程序会自动做的事（v0.3.x）**
+
+- 识别 WinPE（注册表 `MiniNT`），`system_info` 返回 `winpe`、`powershell`、`os_version`。
+- `net=lan|tunnel` 时：没有 IPv4 地址就执行 `wpeutil InitializeNetwork` 并等最多 90 秒；`lan` 模式再执行 `wpeutil DisableFirewall`（PE 防火墙默认挡入站）。结果写到 `<state_dir>/pe-network.log` 和控制台。不想要就写 `pe_network=0`。
+- 允许写入的目录自动加上 `X:\`（内存盘，重启即丢）和 `%TEMP%`；`X:\Windows\System32\config` 仍受保护。
+- 以 SYSTEM 身份运行时，工作目录不再落在受保护的 `systemprofile`，改用 `X:\Users\Public` 或临时目录。
+- `run_script` 没指定解释器而 PowerShell 不可用（多数 PE 没装）时自动改用 cmd，并在结果里给 `note`；明确指定 `powershell` 但不可用则直接报错说明。
+- cmd 脚本按系统 OEM 代码页（中文系统是 GBK）写入，中文 `echo` 正常；有代码页表示不了的字符（如 emoji）时，脚本自动先 `chcp 65001` 再按 UTF-8 写入。
+- 输出逐行判断编码：UTF-8 行按 UTF-8，其余按 OEM 代码页，混合输出（如 GBK 的 `ipconfig` + UTF-8 程序）不再乱码。
+- mDNS 等拿到局域网地址后才开始应答，5353 端口暂时打不开会自动重试，地址变化会重新广播。
+
 ## 新增工具
 
 | 工具 | 作用 |
@@ -113,6 +138,7 @@ ventoy_root=          # 找不到卷标 Ventoy 时手动指定
 port=8790
 host=                 # 一般不用填：lan → 0.0.0.0，其他 → 127.0.0.1
 state_dir=            # 审计日志目录（Linux 默认 /var/log/shellgate，Windows 默认配置旁的 logs\）
+pe_network=1|0        # WinPE + lan/tunnel：自动 wpeutil InitializeNetwork；lan 再关 PE 防火墙（默认 1）
 ```
 
 短名字（`token`）和完整名字（`SHELLGATE_TOKEN`）等价，原有的 `SHELLGATE_*` 配置项全部照旧可用。
@@ -133,7 +159,12 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 ## 已知限制
 
 - Windows 版需要 **Windows 10 / Server 2016 及以上**（含 Win10 PE）；Win7/8.1 不支持。
-- Windows 版目前只做了交叉编译和代码层面的检查，**尚未在真机上跑过**；mDNS 在 Windows 上同样未验证。
+- Windows 版已在 Win11 真机，以及 FirPE、HotPE、官方 Windows 安装环境 PE（QEMU 虚拟机）里测试；微PE 只做了启动方式验证；mDNS 在 Windows 上未验证。
+- **FirPE、HotPE 用自己的 PECMD 外壳，不执行 Ventoy 的 `VentoyAutoRun.bat`**：注入包对它们无效，要用上表的钩子 / INI。
+- **官方 WinPE 只有执行过 `wpeinit` 才有网络和即插即用**。Ventoy 注入的 `VentoyAutoRun.bat` 在 wpeinit 之前运行，所以 lan/tunnel 模式下程序会自己 `wpeutil InitializeNetwork`；`local` 模式不动网络。Windows 安装程序界面出来后它自己也会初始化网络。
+- 多数 PE 没有 PowerShell、`where`、`whoami`；脚本请用 cmd 写。
+- PE 跑在内存里：`X:\` 上写的东西重启就没了，要留的写到 U 盘或硬盘。
+- 局域网模式在 PE 里会关掉 PE 的防火墙（只影响这次 PE 会话，不影响硬盘上的系统）。
 - Linux 下按卷标找分区依赖 `/dev/disk/by-label`（udev）；极简系统没有 udev 时请用 `ventoy_root=` 指定。
 - Ventoy 版本号只能在 VTOYEFI 分区可读（已挂载/有盘符）时读到，否则返回 `null`。
 - ShellGate 被强杀（kill -9 / 任务管理器结束）时，cloudflared 子进程可能残留，需要手动结束。

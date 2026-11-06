@@ -268,7 +268,7 @@ impl App {
         if !p.is_dir() {
             return Err(format!("cwd does not exist: {c}"));
         }
-        Ok(p.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into())
+        Ok(crate::platform::clean_display(&p.canonicalize().map_err(|e| e.to_string())?))
     }
 
     /// Refusal/confirmation answer, or None when the command may run. Scans the command, every

@@ -44,10 +44,10 @@ impl HeadTail {
         let truncated = self.total > self.head.len() + self.tail.len();
         let mut out = self.head;
         if truncated {
-            out.extend_from_slice(b"\n...[output truncated]...\n");
+            out.extend_from_slice(platform::TRUNC_MARKER);
         }
         out.extend(self.tail);
-        (String::from_utf8_lossy(&out).into_owned(), truncated)
+        (platform::decode_output(&out), truncated)
     }
 }
 
@@ -183,8 +183,22 @@ pub struct Jobs {
 
 fn pump<R: AsyncRead + Unpin + Send + 'static>(r: R, lines: Arc<Mutex<VecDeque<String>>>) {
     tokio::spawn(async move {
-        let mut reader = BufReader::new(r).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
+        // read raw lines: next_line() errors on non-UTF-8 (OEM code page) output and would stop the pump
+        let mut reader = BufReader::new(r);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+            let line = platform::decode_output(&buf);
             let mut l = lines.lock().unwrap();
             l.push_back(line);
             if l.len() > 2000 {

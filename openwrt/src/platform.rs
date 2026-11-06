@@ -452,3 +452,146 @@ pub fn pause_if_double_clicked() {
         }
     }
 }
+
+/// Marker `exec` puts between the kept head and tail of over-long output.
+pub const TRUNC_MARKER: &[u8] = b"\n...[output truncated]...\n";
+
+/// Validate `seg` as UTF-8, tolerating a multi-byte character cut off at its edges: up to 3
+/// stray continuation bytes at the start (only when `ragged_start`) and an unfinished
+/// sequence at the end. The cut-off bytes become U+FFFD. `None` when the bytes are not UTF-8.
+fn utf8_ragged(seg: &[u8], ragged_start: bool) -> Option<String> {
+    let mut out = String::with_capacity(seg.len());
+    let mut b = seg;
+    if ragged_start {
+        let lead = b.iter().take(3).take_while(|&&c| c & 0xC0 == 0x80).count();
+        if lead > 0 {
+            out.push('\u{FFFD}');
+            b = &b[lead..];
+        }
+    }
+    match std::str::from_utf8(b) {
+        Ok(s) => out.push_str(s),
+        // error_len() == None: the only problem is an unfinished sequence at the very end
+        Err(e) if e.error_len().is_none() => {
+            out.push_str(std::str::from_utf8(&b[..e.valid_up_to()]).ok()?);
+            out.push('\u{FFFD}');
+        }
+        Err(_) => return None,
+    }
+    Some(out)
+}
+
+/// UTF-8 decode of (possibly truncated) output: each piece between truncation markers may
+/// have a character cut at its edges, but must otherwise be valid UTF-8.
+fn utf8_pieces(b: &[u8]) -> Option<String> {
+    let mut out = String::with_capacity(b.len());
+    let mut rest = b;
+    let mut first = true;
+    loop {
+        let at = rest.windows(TRUNC_MARKER.len()).position(|w| w == TRUNC_MARKER);
+        let piece = &rest[..at.unwrap_or(rest.len())];
+        out.push_str(&utf8_ragged(piece, !first)?);
+        match at {
+            Some(i) => {
+                out.push_str(std::str::from_utf8(TRUNC_MARKER).unwrap());
+                rest = &rest[i + TRUNC_MARKER.len()..];
+                first = false;
+            }
+            None => return Some(out),
+        }
+    }
+}
+
+/// Decode child-process output. Windows console tools (cmd, ping, PowerShell 5.1) write in the
+/// OEM code page (936/GBK on Chinese systems), not UTF-8. UTF-8 is tried first (a character cut
+/// by head/tail truncation or a killed process does not count against it); only bytes that are
+/// really not UTF-8 are decoded with the OEM code page.
+pub fn decode_output(b: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(b) {
+        return s.to_string();
+    }
+    if let Some(s) = utf8_pieces(b) {
+        return s;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+        if !b.is_empty() && b.len() < i32::MAX as usize {
+            unsafe {
+                let cp = GetOEMCP();
+                let n = MultiByteToWideChar(cp, 0, b.as_ptr(), b.len() as i32, std::ptr::null_mut(), 0);
+                if n > 0 {
+                    let mut w = vec![0u16; n as usize];
+                    let m = MultiByteToWideChar(cp, 0, b.as_ptr(), b.len() as i32, w.as_mut_ptr(), n);
+                    if m > 0 {
+                        return String::from_utf16_lossy(&w[..m as usize]);
+                    }
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(b).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_plain_utf8() {
+        assert_eq!(decode_output("ping 正常 ok\n".as_bytes()), "ping 正常 ok\n");
+        assert_eq!(decode_output(b""), "");
+    }
+
+    #[test]
+    fn decode_truncated_utf8_cut_chars_stays_utf8() {
+        // "中" = E4 B8 AD, "文" = E6 96 87; head ends mid-"中", tail starts mid-"文"
+        let mut b = b"abc".to_vec();
+        b.extend_from_slice(&"中".as_bytes()[..2]); // E4 B8: unfinished
+        b.extend_from_slice(TRUNC_MARKER);
+        b.extend_from_slice(&"文字".as_bytes()[2..]); // 87 + "字"
+        let s = decode_output(&b);
+        assert!(s.starts_with("abc\u{FFFD}"), "{s:?}");
+        assert!(s.ends_with("...[output truncated]...\n\u{FFFD}字"), "{s:?}");
+        assert_eq!(s.matches('\u{FFFD}').count(), 2, "{s:?}");
+    }
+
+    #[test]
+    fn decode_head_cut_before_marker() {
+        let mut b = "日志：".as_bytes().to_vec();
+        b.extend_from_slice(&"错误".as_bytes()[..1]);
+        b.extend_from_slice(TRUNC_MARKER);
+        b.extend_from_slice("完成\r\n".as_bytes());
+        assert_eq!(decode_output(&b), "日志：\u{FFFD}\n...[output truncated]...\n完成\r\n");
+    }
+
+    #[test]
+    fn decode_killed_mid_char_at_end() {
+        let mut b = "进度 50%".as_bytes().to_vec();
+        b.extend_from_slice(&"完".as_bytes()[..2]);
+        assert_eq!(decode_output(&b), "进度 50%\u{FFFD}");
+    }
+
+    #[test]
+    fn decode_invalid_in_middle_is_not_utf8() {
+        // GBK "中文" = D6 D0 CE C4: not UTF-8 anywhere, so the ragged-edge path must refuse it
+        let gbk = [b'o', b'k', b' ', 0xD6, 0xD0, 0xCE, 0xC4, b'\r', b'\n'];
+        assert!(utf8_pieces(&gbk).is_none());
+        let mut b = "head".as_bytes().to_vec();
+        b.extend_from_slice(TRUNC_MARKER);
+        b.extend_from_slice(&gbk);
+        assert!(utf8_pieces(&b).is_none());
+        // the first piece may not start with stray continuation bytes
+        assert!(utf8_pieces(&[0x87, b'a']).is_none());
+        #[cfg(not(windows))]
+        assert_eq!(decode_output(&gbk), String::from_utf8_lossy(&gbk));
+    }
+
+    #[test]
+    fn decode_more_than_three_stray_bytes_rejected() {
+        let mut b = b"a".to_vec();
+        b.extend_from_slice(TRUNC_MARKER);
+        b.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, b'x']);
+        assert!(utf8_pieces(&b).is_none());
+    }
+}

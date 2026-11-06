@@ -233,3 +233,20 @@ def test_init_config_and_gen_token(tmp_path):
     assert len(tok) == 48 and tok in r.stdout
     assert oct(p.stat().st_mode & 0o777) == "0o600"
     assert subprocess.run([BIN, "--init-config", str(p)], capture_output=True, text=True).returncode == 2
+
+
+async def test_truncated_utf8_output_stays_utf8(lan_server):
+    url, *_ = lan_server
+    # 'a' + 40000 x "中" (120001 bytes): the default 100000-byte head/tail cut lands mid-character twice
+    r = await _call(url, "run_command", command="printf a; yes 中 | tr -d '\\n' | head -c 120000")
+    out = r["stdout"]
+    assert r["exit_code"] == 0 and "[output truncated]" in out
+    assert out.startswith("a中中") and out.endswith("中中") and out.count("\ufffd") == 2
+
+
+async def test_job_survives_non_utf8_line(lan_server):
+    url, *_ = lan_server
+    j = await _call(url, "start_job", command="printf 'x\\377y\\n'; echo after")
+    time.sleep(1)
+    out = await _call(url, "job_output", job_id=j["job_id"])
+    assert "after" in out["output"] and "x\ufffdy" in out["output"]

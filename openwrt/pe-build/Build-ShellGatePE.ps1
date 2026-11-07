@@ -47,6 +47,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version 1   # tools.json entries have optional keys
 $script:Started = Get-Date
+$script:SevenZip = $null
 
 function Say($m, $c = 'Cyan') { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) -ForegroundColor $c }
 function Die($m) { Write-Host "[FAIL] $m" -ForegroundColor Red; exit 1 }

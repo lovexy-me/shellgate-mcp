@@ -338,7 +338,8 @@ pub fn run_actions(actions: &[Action], map: &dyn Fn(f64, f64) -> (i32, i32)) -> 
                 }
                 Action::Key { keys, text } => {
                     press_combo(keys)?;
-                    Ok(json!({"key": text}))
+                    // spelled with spaces so the output redactor leaves it alone
+                    Ok(json!({"keys": text.split('+').collect::<Vec<_>>().join(" + ")}))
                 }
                 Action::Text { text } => {
                     type_text(text)?;
@@ -601,6 +602,8 @@ pub fn element_action(r: usize, action: String, text: Option<String>) -> Result<
                     }),
                     "value" => Some(e.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
                         .and_then(|p| p.CurrentValue()).map(|v| json!({"value": v.to_string(), "via": "ValuePattern"}))
+                        .or_else(|_| e.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+                            .and_then(|p| p.CurrentToggleState()).map(|t| json!({"value": match t.0 { 0 => "off", 1 => "on", _ => "indeterminate" }, "via": "TogglePattern"})))
                         .or_else(|_| e.CurrentName().map(|n| json!({"value": n.to_string(), "via": "Name"})))),
                     "focus" => Some(e.SetFocus().map(|_| json!({"via": "SetFocus"}))),
                     "toggle" => e.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId).ok().map(|p| p.Toggle().map(|_| json!({"via": "TogglePattern"}))),

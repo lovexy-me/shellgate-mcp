@@ -45,7 +45,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-Set-StrictMode -Version Latest
+Set-StrictMode -Version 1   # tools.json entries have optional keys
 $script:Started = Get-Date
 
 function Say($m, $c = 'Cyan') { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) -ForegroundColor $c }
@@ -60,7 +60,7 @@ function Need-Admin {
 # ---------------------------------------------------------------- download helpers
 
 function Get-File($Url, $Dest, $Sha256) {
-    if ((Test-Path $Dest) -and $Sha256) {
+    if ((Test-Path $Dest) -and $Sha256 -and $Sha256 -ne 'microsoft-signed') {
         if ((Get-FileHash $Dest -Algorithm SHA256).Hash -eq $Sha256.ToUpper()) { Say "cached  $(Split-Path $Dest -Leaf)" Gray; return }
     }
     Say "下载    $Url"
@@ -70,7 +70,14 @@ function Get-File($Url, $Dest, $Sha256) {
             -Headers @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
     } catch { Remove-Item $tmp -EA SilentlyContinue; throw "download failed: $Url -> $_" }
     $h = (Get-FileHash $tmp -Algorithm SHA256).Hash
-    if ($Sha256) {
+    if ($Sha256 -eq 'microsoft-signed') {
+        # ADK bootstrappers change with every servicing release: verify the Authenticode signature instead
+        $sig = Get-AuthenticodeSignature $tmp
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            Remove-Item $tmp -Force; throw "$Url is not validly signed by Microsoft ($($sig.Status) $($sig.SignerCertificate.Subject))"
+        }
+        Say "  Microsoft 签名有效，sha256 $h" Gray
+    } elseif ($Sha256) {
         if ($h -ne $Sha256.ToUpper()) { Remove-Item $tmp -Force; throw "sha256 mismatch for $Url`n  expected $Sha256`n  got      $h" }
     } else {
         Say "  未固定 sha256: $h" Yellow
@@ -121,8 +128,8 @@ function Install-Adk {
     $l = $AdkLinks[$AdkVersion]
     Say "安装 $($l.name)（静默）"
     $a = Join-Path $Work 'adksetup.exe'; $b = Join-Path $Work 'adkwinpesetup.exe'
-    Get-File $l.adk $a $null
-    Get-File $l.pe  $b $null
+    Get-File $l.adk $a 'microsoft-signed'
+    Get-File $l.pe  $b 'microsoft-signed'
     # Deployment tools give copype/dism/oscdimg; the add-on gives the WinPE source
     & $a /quiet /norestart /features OptionId.DeploymentTools | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "adksetup exit $LASTEXITCODE" }
@@ -136,9 +143,12 @@ function Find-AdkPaths {
     foreach ($r in $roots) {
         $copype = Join-Path $r 'Windows Preinstallation Environment\copype.cmd'
         if (Test-Path $copype) {
-            $oscdimg = Get-ChildItem "$r\Deployment Tools" -Recurse -Filter oscdimg.exe -EA SilentlyContinue |
-                       Where-Object { $_.FullName -match "\\$(if($Arch -eq 'x86'){'x86'}else{'amd64'})\\" } | Select-Object -First 1
-            return @{ Root = $r; Copype = $copype; Oscdimg = $oscdimg.FullName
+            # host tools are amd64 whatever PE architecture is being built
+            $oscdimg = Join-Path $r 'Deployment Tools\amd64\Oscdimg\oscdimg.exe'
+            $dism = Join-Path $r 'Deployment Tools\amd64\DISM\dism.exe'
+            if (-not (Test-Path $dism)) { $dism = "$env:SystemRoot\System32\dism.exe" }
+            return @{ Root = $r; Copype = $copype; Oscdimg = $oscdimg; Dism = $dism
+                      SetEnv = Join-Path $r 'Deployment Tools\DandISetEnv.bat'
                       PeRoot = Join-Path $r "Windows Preinstallation Environment\$Arch" }
         }
     }
@@ -161,17 +171,24 @@ $NoLangPack = @('WinPE-FontSupport-ZH-CN', 'WinPE-PlatformId', 'WinPE-FMAPI', 'W
 
 function Add-Components($Mount, $OcRoot) {
     $added = @(); $missing = @()
+    # the zh-cn base language pack first, or the component language packs have nothing to attach to
+    $lp = Join-Path $OcRoot 'zh-cn\lp.cab'
+    if (Test-Path $lp) {
+        Say "  语言包 zh-cn lp.cab"
+        & $Dism /Image:$Mount /Add-Package /PackagePath:"$lp" /Quiet | Out-Null
+        if ($LASTEXITCODE -eq 0) { $added += 'zh-cn lp.cab' } else { $missing += "zh-cn lp.cab(dism $LASTEXITCODE)" }
+    } else { $missing += 'zh-cn lp.cab' }
     foreach ($c in $Components) {
         $cab = Join-Path $OcRoot "$c.cab"
         if (-not (Test-Path $cab)) { $missing += $c; continue }
         Say "  组件 $c"
-        & dism.exe /Image:$Mount /Add-Package /PackagePath:"$cab" /Quiet | Out-Null
-        if ($LASTEXITCODE -ne 0) { $missing += "$c(dism $LASTEXITCODE)"; continue }
+        & $Dism /Image:$Mount /Add-Package /PackagePath:"$cab" /Quiet | Out-Null
+        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { $missing += "$c(dism $LASTEXITCODE)"; continue }
         $added += $c
         if ($NoLangPack -contains $c) { continue }
         $lp = Join-Path $OcRoot "zh-cn\${c}_zh-cn.cab"
         if (Test-Path $lp) {
-            & dism.exe /Image:$Mount /Add-Package /PackagePath:"$lp" /Quiet | Out-Null
+            & $Dism /Image:$Mount /Add-Package /PackagePath:"$lp" /Quiet | Out-Null
         }
     }
     return @{ Added = $added; Missing = $missing }
@@ -254,12 +271,14 @@ if (-not $SkipAdkInstall -and -not (Find-AdkPaths)) { Install-Adk }
 $adk = Find-AdkPaths
 if (-not $adk) { Die "ADK not found after install; install it manually or pass -SkipAdkInstall with it present" }
 Say "ADK: $($adk.Root)"
+$Dism = $adk.Dism
 
 # --- base image
-if (Test-Path $Mount) { & dism.exe /Unmount-Image /MountDir:$Mount /Discard 2>&1 | Out-Null; Remove-Item $Mount -Recurse -Force -EA SilentlyContinue }
+if (Test-Path $Mount) { & $Dism /Unmount-Image /MountDir:$Mount /Discard 2>&1 | Out-Null; Remove-Item $Mount -Recurse -Force -EA SilentlyContinue }
 Remove-Item $Media -Recurse -Force -EA SilentlyContinue
 Say "copype $Arch -> $Media"
-& cmd.exe /c "`"$($adk.Copype)`" $Arch `"$Media`"" | Out-Null
+# copype needs the ADK environment (WinPERoot, OSCDImgRoot) from DandISetEnv.bat
+& cmd.exe /c "call `"$($adk.SetEnv)`" >nul && call `"$($adk.Copype)`" $Arch `"$Media`"" | Out-Null
 if (-not (Test-Path "$Media\media\sources\boot.wim")) { Die "copype did not produce boot.wim" }
 
 if ($Base -eq 'winre') {
@@ -275,7 +294,7 @@ if ($Base -eq 'winre') {
 
 New-Item -ItemType Directory -Force -Path $Mount | Out-Null
 Say "挂载 boot.wim"
-& dism.exe /Mount-Image /ImageFile:"$Media\media\sources\boot.wim" /Index:1 /MountDir:$Mount | Out-Null
+& $Dism /Mount-Image /ImageFile:"$Media\media\sources\boot.wim" /Index:1 /MountDir:$Mount | Out-Null
 if ($LASTEXITCODE -ne 0) { Die "dism /Mount-Image failed" }
 
 try {
@@ -286,8 +305,8 @@ try {
 
     # --- locale: Chinese UI, zh-CN input, CST, UTF-8-friendly console
     Say "中文化"
-    & dism.exe /Image:$Mount /Set-AllIntl:zh-cn | Out-Null
-    & dism.exe /Image:$Mount /Set-TimeZone:"China Standard Time" | Out-Null
+    & $Dism /Image:$Mount /Set-AllIntl:zh-cn | Out-Null
+    & $Dism /Image:$Mount /Set-TimeZone:"China Standard Time" | Out-Null
 
     # --- tools
     Say "工具"
@@ -310,12 +329,12 @@ try {
     foreach ($d in $drvDirs) {
         if (-not (Get-ChildItem $d -Recurse -Filter *.inf -EA SilentlyContinue)) { continue }
         Say "注入驱动 $d"
-        & dism.exe /Image:$Mount /Add-Driver /Driver:"$d" /Recurse /ForceUnsigned | Out-Null
+        & $Dism /Image:$Mount /Add-Driver /Driver:"$d" /Recurse /ForceUnsigned | Out-Null
         if ($LASTEXITCODE -ne 0) { Say "  部分驱动未装入 (dism $LASTEXITCODE)" Yellow }
     }
 
     # --- scratch space, startup scripts
-    & dism.exe /Image:$Mount /Set-ScratchSpace:$ScratchMB | Out-Null
+    & $Dism /Image:$Mount /Set-ScratchSpace:$ScratchMB | Out-Null
     Say "scratch space = ${ScratchMB}MB"
     foreach ($f in 'startnet.cmd', 'shellgate-pe.cmd', 'menu.cmd') {
         Copy-Item (Join-Path $PSScriptRoot "files\$f") (Join-Path $Mount "Windows\System32\$f") -Force
@@ -340,8 +359,8 @@ try {
     $info | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Out "build-report-$Arch.json") -Encoding UTF8
 } finally {
     Say "卸载并提交 boot.wim"
-    & dism.exe /Unmount-Image /MountDir:$Mount /Commit | Out-Null
-    if ($LASTEXITCODE -ne 0) { Say "unmount /Commit failed ($LASTEXITCODE); trying /Discard" Yellow; & dism.exe /Unmount-Image /MountDir:$Mount /Discard | Out-Null }
+    & $Dism /Unmount-Image /MountDir:$Mount /Commit | Out-Null
+    if ($LASTEXITCODE -ne 0) { Say "unmount /Commit failed ($LASTEXITCODE); trying /Discard" Yellow; & $Dism /Unmount-Image /MountDir:$Mount /Discard | Out-Null }
 }
 
 $wim = Join-Path $Out "ShellGatePE-$Arch.wim"

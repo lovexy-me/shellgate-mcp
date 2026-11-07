@@ -78,6 +78,8 @@ pub struct Settings {
     /// WinPE only, net=lan|tunnel: start networking (wpeutil InitializeNetwork) when there is no IPv4
     /// address, and in lan mode turn the WinPE firewall off (wpeutil DisableFirewall). Default on.
     pub pe_network: bool,
+    /// Windows desktop tools (screenshot, UI Automation, mouse/keyboard). Off unless desktop=on.
+    pub desktop: bool,
 }
 
 impl Settings {
@@ -92,7 +94,7 @@ impl Settings {
             confirm_ttl: 60, shell: platform::default_shell(), backup_on_write: true, env_file: String::new(),
             redact: true, redact_domains: vec![], net: NetMode::Local, tunnel_token: String::new(),
             cloudflared: String::new(), mdns: false, mdns_name: "ventoy-rescue".into(), ventoy_root: String::new(),
-            state_dir: String::new(), pe_network: true,
+            state_dir: String::new(), pe_network: true, desktop: false,
         }
     }
 }
@@ -319,6 +321,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
         ventoy_root,
         state_dir: expand(&state_dir),
         pe_network: truthy(&get("SHELLGATE_PE_NETWORK", "1")),
+        desktop: truthy(&get("SHELLGATE_DESKTOP", "0")),
     })
 }
 
@@ -376,6 +379,10 @@ token={token}
 # WinPE, net=lan|tunnel: bring the network up (wpeutil InitializeNetwork) and, for lan, turn the
 # WinPE firewall off (wpeutil DisableFirewall). Set pe_network=0 to leave both alone.
 #pe_network=1
+
+# Windows only: desktop tools (screenshots, UI Automation control tree, mouse and keyboard).
+# Off by default; every action is written to the audit log; risky key combos need a confirm code.
+#desktop=on
 ")
 }
 

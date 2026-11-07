@@ -5,6 +5,9 @@
 
 mod audit;
 mod config;
+mod desktop;
+#[cfg(windows)]
+mod desktop_win;
 mod exec;
 mod net;
 mod platform;
@@ -99,18 +102,20 @@ async fn handle_message(ctx: &Ctx, ip: &str, msg: &Value) -> Option<Value> {
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({"tools": tools::definitions()}),
+        "tools/list" => json!({"tools": ctx.app.tool_list()}),
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Some(rpc_error(id, -32602, "missing tool name"));
             };
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let (value, is_error) = ctx.app.call(ip, name, &args).await;
-            json!({
-                "content": [{"type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default()}],
-                "structuredContent": value,
-                "isError": is_error,
-            })
+            let (mut value, is_error) = ctx.app.call(ip, name, &args).await;
+            // a screenshot travels as MCP image content, not inside the JSON text
+            let image = value.as_object_mut().and_then(|m| m.remove("_image"));
+            let mut content = vec![json!({"type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default()})];
+            if let Some(img) = image {
+                content.push(json!({"type": "image", "data": img["data"], "mimeType": img["mimeType"]}));
+            }
+            json!({"content": content, "structuredContent": value, "isError": is_error})
         }
         "resources/list" => json!({"resources": []}),
         "prompts/list" => json!({"prompts": []}),
@@ -156,10 +161,11 @@ async fn mcp_other(State(ctx): State<Arc<Ctx>>, headers: HeaderMap) -> Response 
 
 fn usage() -> ! {
     println!("shellgate {VERSION}\n\
-usage: shellgate [--env-file PATH] [--version] [--gen-token] [--init-config PATH]\n\
+usage: shellgate [--env-file PATH] [--version] [--gen-token] [--init-config PATH] [--display WxH|max|list]\n\
   --env-file PATH     config file (also SHELLGATE_ENV_FILE)\n\
   --gen-token         print a new random 48-character token and exit\n\
   --init-config PATH  write a new config with a fresh random token (refuses to overwrite) and exit\n\
+  --display SPEC      Windows: set the screen resolution (1920x1080, max, list) and exit\n\
 config search order: --env-file, SHELLGATE_ENV_FILE, {} next to the executable, {}, <Ventoy partition>/{}/{}",
              config::STICK_ENV_NAME, config::DEFAULT_ENV_FILE, config::STICK_DIR, config::STICK_ENV_NAME);
     std::process::exit(0)
@@ -193,6 +199,17 @@ fn main() {
             "--env-file" | "--config" => env_file = args.next(),
             "--version" | "-V" => { println!("{VERSION}"); return; }
             "--gen-token" => { println!("{}", new_token()); return; }
+            // WinPE helper: set the screen resolution (WIDTHxHEIGHT | max | list) and exit
+            "--display" => {
+                let spec = args.next().unwrap_or_else(|| "list".into());
+                #[cfg(windows)]
+                match desktop_win::set_display(&spec) {
+                    Ok(m) => { println!("{m}"); return; }
+                    Err(e) => { eprintln!("{e}"); std::process::exit(1) }
+                }
+                #[cfg(not(windows))]
+                { eprintln!("--display {spec}: Windows only"); std::process::exit(1) }
+            }
             "--init-config" => {
                 let Some(p) = args.next() else { usage() };
                 if let Err(e) = init_config(&p) { eprintln!("{e}"); std::process::exit(2) }
@@ -236,7 +253,7 @@ async fn serve(settings: config::Settings) {
         Err(e) => { eprintln!("{e}"); platform::pause_if_double_clicked(); std::process::exit(2) }
     };
     let app = Arc::new(App { policy, audit, jobs: Mutex::new(Default::default()), sem, redactor,
-                             downloads: std::sync::Mutex::new(Default::default()) });
+                             downloads: std::sync::Mutex::new(Default::default()), shot: std::sync::Mutex::new(None) });
     let ctx = Arc::new(Ctx { app, expected });
 
     let router = Router::new()

@@ -24,6 +24,9 @@ pub struct App {
     pub sem: Semaphore,
     pub redactor: Redactor,
     pub downloads: std::sync::Mutex<HashMap<String, Arc<ventoy::Download>>>,
+    /// last desktop_screenshot: coordinate mapping and content hash
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub shot: std::sync::Mutex<Option<(crate::desktop::Mapping, u64)>>,
 }
 
 #[cfg(unix)]
@@ -268,11 +271,221 @@ fn ok(mut v: Value) -> Value {
 }
 
 impl App {
+    /// tools/list: the base tools, plus the desktop tools on Windows when desktop=on.
+    pub fn tool_list(&self) -> Value {
+        let mut v = definitions();
+        if cfg!(windows) && self.policy.settings.desktop {
+            if let Value::Array(a) = &mut v {
+                a.extend(crate::desktop::definitions());
+            }
+        }
+        v
+    }
+
+    /// Confirmation answer for a desktop action with risk reasons, or None when it may go ahead.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn confirm_gate(&self, kind: &str, args: &Value, reasons: Vec<String>) -> Option<Value> {
+        if reasons.is_empty() {
+            return None;
+        }
+        let mut a = args.clone();
+        if let Value::Object(m) = &mut a {
+            m.remove("confirm_code");
+        }
+        let fp = Policy::fingerprint(&[kind.to_string(), a.to_string()]);
+        if self.policy.redeem(arg_str(args, "confirm_code"), fp) {
+            return None;
+        }
+        Some(json!({
+            "status": "confirmation_required", "reasons": reasons, "tool": kind,
+            "confirm_code": self.policy.issue(fp), "expires_in_s": self.policy.settings.confirm_ttl,
+            "next": "Ask the user. Only if they explicitly agree, call again with exactly the same arguments plus this confirm_code.",
+        }))
+    }
+
+    #[cfg(not(windows))]
+    async fn desktop(self: &Arc<Self>, _name: &str, _a: &Value) -> Result<Value, String> {
+        Err("desktop tools exist only in the Windows build".into())
+    }
+
+    #[cfg(windows)]
+    async fn desktop(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
+        let me = self.clone();
+        let name = name.to_string();
+        let a = a.clone();
+        tokio::task::spawn_blocking(move || me.desktop_blocking(&name, &a)).await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(windows)]
+    fn desktop_blocking(&self, name: &str, a: &Value) -> Result<Value, String> {
+        use crate::desktop as d;
+        use crate::desktop_win as w;
+        w::dpi_aware();
+        match name {
+            "desktop_windows" => {
+                let action = arg_str(a, "action").unwrap_or("list");
+                if action == "list" {
+                    return Ok(w::windows_json());
+                }
+                let h = w::find_window(arg_str(a, "window"))?;
+                if action == "close" {
+                    let t = w::window_title(h);
+                    if let Some(c) = self.confirm_gate(name, a, vec![format!("close window \"{t}\" (unsaved work may be lost)")]) {
+                        return Ok(c);
+                    }
+                }
+                w::window_action(action, h)
+            }
+            "desktop_tree" => {
+                let all = arg_bool(a, "all", false);
+                let h = if all { None } else { Some(w::find_window(arg_str(a, "window"))?) };
+                let depth = arg_i64(a, "depth", 12).clamp(1, 40) as usize;
+                let max = arg_i64(a, "max_nodes", 300).clamp(10, 2000) as usize;
+                let (uia, note, lines) = w::tree(h, all, depth, max)?;
+                let mut v = json!({"uia": uia, "count": lines.len(), "tree": lines.join("\n"),
+                                   "hint": "refs are valid until the next desktop_tree; rects are physical pixels"});
+                if !note.is_empty() {
+                    v["note"] = json!(note);
+                }
+                if lines.len() <= 1 && !uia {
+                    v["fallback"] = json!("no usable control tree: use desktop_screenshot and desktop_input with coordinates");
+                }
+                Ok(v)
+            }
+            "desktop_element" => {
+                let r = arg_i64(a, "ref", 0).max(0) as usize;
+                let action = req_str(a, "action")?.to_string();
+                let text = arg_str(a, "text").map(String::from);
+                let (ctype, cname, rect) = w::ref_info(r)?;
+                let mut reasons = vec![];
+                if matches!(action.as_str(), "click" | "double_click") && d::risky_control(&cname) {
+                    reasons.push(format!("click on \"{cname}\" ({ctype})"));
+                }
+                if let Some(t) = &text {
+                    reasons.extend(self.policy.text_danger_reasons(t).into_iter().map(|x| format!("{x} (typed)")));
+                }
+                if let Some(c) = self.confirm_gate(name, a, reasons) {
+                    return Ok(c);
+                }
+                let (cx, cy) = (rect.0 + rect.2 / 2, rect.1 + rect.3 / 2);
+                let via = if matches!(action.as_str(), "double_click" | "right_click") {
+                    None
+                } else {
+                    w::element_action(r, action.clone(), text.clone())?
+                };
+                let res = match via {
+                    Some(v) => v,
+                    None => match action.as_str() {
+                        "click" | "double_click" | "right_click" => {
+                            if rect.2 <= 0 || rect.3 <= 0 {
+                                return Err(format!("ref {r} has no on-screen rectangle to click"));
+                            }
+                            let (b, n) = match action.as_str() { "double_click" => (0, 2), "right_click" => (1, 1), _ => (0, 1) };
+                            w::click_at(cx, cy, b, n)?;
+                            json!({"via": "mouse", "at": [cx, cy]})
+                        }
+                        "set_value" => {
+                            if rect.2 > 0 && rect.3 > 0 {
+                                w::click_at(cx, cy, 0, 1)?;
+                            }
+                            w::press_combo(&[0x11, b'A' as u16])?;
+                            w::type_text(text.as_deref().unwrap_or(""))?;
+                            json!({"via": "keyboard"})
+                        }
+                        other => return Err(format!("{other} is not supported by this control")),
+                    },
+                };
+                Ok(json!({"ref": r, "control": format!("{ctype} \"{cname}\""), "action": action, "result": res}))
+            }
+            "desktop_screenshot" => {
+                let (vx, vy, vw, vh) = w::virtual_screen();
+                let (x, y, cw, ch) = if let Some(rg) = a.get("region").and_then(Value::as_array) {
+                    let n: Vec<i32> = rg.iter().filter_map(Value::as_i64).map(|v| v as i32).collect();
+                    if n.len() != 4 {
+                        return Err("region must be [x, y, width, height]".into());
+                    }
+                    (n[0], n[1], n[2], n[3])
+                } else if arg_str(a, "window").is_some() {
+                    w::window_rect(w::find_window(arg_str(a, "window"))?)
+                } else {
+                    (vx, vy, vw, vh)
+                };
+                // clip to the virtual screen
+                let (x0, y0) = (x.max(vx), y.max(vy));
+                let (x1, y1) = ((x + cw).min(vx + vw), (y + ch).min(vy + vh));
+                if x1 <= x0 || y1 <= y0 {
+                    return Err("capture area is off screen".into());
+                }
+                let mut frame = w::capture(x0, y0, x1 - x0, y1 - y0)?;
+                let max_w = arg_i64(a, "max_width", 1280).max(0) as usize;
+                let (nw, nh, scale) = d::fit(frame.w, frame.h, max_w);
+                let map = d::Mapping { ox: x0, oy: y0, scale };
+                let hash = d::frame_hash(&frame);
+                let prev = *self.shot.lock().unwrap();
+                *self.shot.lock().unwrap() = Some((map, hash));
+                if arg_bool(a, "only_if_changed", true) && prev.is_some_and(|(m, h)| h == hash && m == map) {
+                    return Ok(json!({"changed": false, "width": nw, "height": nh, "scale": scale, "origin": [x0, y0],
+                                     "note": "screen unchanged since the last screenshot; no image sent"}));
+                }
+                frame = d::downscale(&frame, nw, nh);
+                let mut marks = 0;
+                if arg_bool(a, "marks", false) {
+                    for (n, r) in w::last_rects() {
+                        let (sx, sy) = map.to_shot(r.0, r.1);
+                        let (ex, ey) = map.to_shot(r.0 + r.2, r.1 + r.3);
+                        if ex > 0 && ey > 0 && sx < nw as i32 && sy < nh as i32 {
+                            d::draw_mark(&mut frame, sx as i64, sy as i64, (ex - sx) as i64, (ey - sy) as i64, n);
+                            marks += 1;
+                        }
+                    }
+                }
+                let jpeg = arg_str(a, "format") == Some("jpeg");
+                let (bytes, mime) = if jpeg {
+                    (d::encode_jpeg(&frame, arg_i64(a, "quality", 70).clamp(20, 95) as u8)?, "image/jpeg")
+                } else {
+                    (d::encode_png(&frame), "image/png")
+                };
+                let mut v = json!({"changed": true, "width": nw, "height": nh, "scale": scale, "origin": [x0, y0],
+                                   "physical": [x1 - x0, y1 - y0], "bytes": bytes.len(), "format": mime,
+                                   "coords": "desktop_input x/y = pixels of this image; physical = origin + x*scale"});
+                if arg_bool(a, "marks", false) {
+                    v["marks"] = json!(marks);
+                    if marks == 0 {
+                        v["marks_note"] = json!("no control rectangles: call desktop_tree first (marks use its refs)");
+                    }
+                }
+                v["_image"] = json!({"data": d::b64(&bytes), "mimeType": mime});
+                Ok(v)
+            }
+            "desktop_input" => {
+                let actions = d::parse_actions(a.get("actions").unwrap_or(&Value::Null))?;
+                let danger = |t: &str| self.policy.text_danger_reasons(t);
+                let reasons = d::batch_reasons(&actions, w::foreground_is_console(), &danger);
+                if let Some(c) = self.confirm_gate(name, a, reasons) {
+                    return Ok(c);
+                }
+                let physical = arg_str(a, "coords") == Some("physical");
+                let map = self.shot.lock().unwrap().map(|(m, _)| m);
+                if !physical && map.is_none() && actions.iter().any(|x| matches!(x, d::Action::Move { .. } | d::Action::Drag { .. }
+                        | d::Action::Click { x: Some(_), .. } | d::Action::Scroll { x: Some(_), .. })) {
+                    return Err("no screenshot yet: take desktop_screenshot first, or pass coords=physical".into());
+                }
+                let m = map.unwrap_or(d::Mapping { ox: 0, oy: 0, scale: 1.0 });
+                let f = move |x: f64, y: f64| if physical { (x.round() as i32, y.round() as i32) } else { m.to_physical(x, y) };
+                let done = w::run_actions(&actions, &f)?;
+                Ok(json!({"done": done, "count": done.len()}))
+            }
+            other => Err(format!("unknown desktop tool {other}")),
+        }
+    }
+
     /// Run a tool, audit it, and return (result json, is_error).
     /// Inputs run unmodified; only what is returned (and logged) is redacted.
     pub async fn call(self: &Arc<Self>, ip: &str, name: &str, args: &Value) -> (Value, bool) {
         let start = Instant::now();
-        let res = self.dispatch(name, args).await;
+        let mut res = self.dispatch(name, args).await;
+        // screenshots bypass the text redactor (base64 is not text) and are re-attached afterwards
+        let image = match &mut res { Ok(Value::Object(m)) => m.remove("_image"), _ => None };
         let ms = start.elapsed().as_millis() as u64;
         let mut logged_args = args.clone();
         self.redactor.value(&mut logged_args, &mut Counts::default());
@@ -290,6 +503,12 @@ impl App {
                         m.insert("redacted".into(), json!(counts.footer()));
                     }
                     extra.insert("redacted".into(), json!(counts.footer()));
+                }
+                if let Some(img) = image {
+                    extra.insert("image_bytes".into(), json!(img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0)));
+                    if let Value::Object(m) = &mut v {
+                        m.insert("_image".into(), img);
+                    }
                 }
                 self.audit.write(ip, name, &logged_args, &status, ms, extra);
                 (v, false)
@@ -473,6 +692,12 @@ impl App {
 
     async fn dispatch(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
         let s = &self.policy.settings;
+        if name.starts_with("desktop_") && crate::desktop::TOOL_NAMES.contains(&name) {
+            if !s.desktop {
+                return Err("desktop tools are off; set desktop=on in shellgate.env to enable them".into());
+            }
+            return self.desktop(name, a).await;
+        }
         match name {
             "run_command" => {
                 let cmd = req_str(a, "command")?;

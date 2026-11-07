@@ -1,0 +1,125 @@
+name: ShellGate PE build
+# Builds the ShellGate PE rescue image from the build script only, to prove the script works.
+# Licensing: Microsoft's ADK/WinPE licence forbids distributing a prebuilt WinPE image, and this
+# repository is public (any signed-in user can download an Actions artifact). So:
+#   * push / pull_request: build + verify, upload NOTHING but the text build report;
+#   * workflow_dispatch with an age public key: the ISO is age-encrypted to that key and kept 1 day,
+#     so only the holder of the private key (the maintainer's own machine) can use it.
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "amd64, x86 or both"
+        default: amd64
+        type: choice
+        options: [amd64, x86, both]
+      age_recipient:
+        description: "age public key (age1...) to encrypt the ISO for; empty = do not upload the image"
+        required: false
+        default: ""
+  push:
+    paths:
+      - "openwrt/pe-build/**"
+      - ".github/workflows/pe-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  shellgate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,i686-pc-windows-gnu
+      - run: pip install ziglang cargo-zigbuild
+      - working-directory: openwrt
+        run: |
+          cargo zigbuild --release --target x86_64-pc-windows-gnu
+          cargo zigbuild --release --target i686-pc-windows-gnu
+          mkdir -p ../sgbin
+          cp target/x86_64-pc-windows-gnu/release/shellgate.exe ../sgbin/shellgate-x86_64-windows.exe
+          cp target/i686-pc-windows-gnu/release/shellgate.exe ../sgbin/shellgate-i686-windows.exe
+          sha256sum ../sgbin/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shellgate-windows-exe
+          path: sgbin/
+          retention-days: 1
+
+  pe:
+    needs: shellgate
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, x86]
+    steps:
+      - name: Skip arch not requested
+        id: want
+        shell: pwsh
+        run: |
+          $a = '${{ github.event.inputs.arch }}'
+          if (-not $a) { $a = 'amd64' }   # push: the x64 image is enough to prove the script
+          $go = ($a -eq 'both') -or ($a -eq '${{ matrix.arch }}')
+          "go=$($go.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v4
+        if: steps.want.outputs.go == 'true'
+      - uses: actions/download-artifact@v4
+        if: steps.want.outputs.go == 'true'
+        with:
+          name: shellgate-windows-exe
+          path: sgbin
+      - uses: actions/cache@v4
+        if: steps.want.outputs.go == 'true'
+        with:
+          path: build/pe/download
+          key: pe-dl-${{ matrix.arch }}-${{ hashFiles('openwrt/pe-build/tools.json') }}
+      - name: Build ShellGate PE
+        if: steps.want.outputs.go == 'true'
+        shell: pwsh
+        run: |
+          $exe = if ('${{ matrix.arch }}' -eq 'x86') { 'sgbin\shellgate-i686-windows.exe' } else { 'sgbin\shellgate-x86_64-windows.exe' }
+          & openwrt\pe-build\Build-ShellGatePE.ps1 -Arch ${{ matrix.arch }} -Out "$PWD\build\pe" -ShellGate (Resolve-Path $exe)
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify the image (offline)
+        if: steps.want.outputs.go == 'true'
+        shell: pwsh
+        run: |
+          & openwrt\pe-build\Test-ShellGatePE.ps1 -Out "$PWD\build\pe" -Arch ${{ matrix.arch }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build report (text only)
+        if: always() && steps.want.outputs.go == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pe-report-${{ matrix.arch }}
+          path: |
+            build/pe/build-report-*.json
+            build/pe/verify-*.txt
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Encrypt the ISO for the maintainer (dispatch with age key only)
+        if: steps.want.outputs.go == 'true' && github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.age_recipient, 'age1')
+        shell: pwsh
+        run: |
+          $u = 'https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-windows-amd64.zip'
+          Invoke-WebRequest $u -OutFile age.zip
+          if ((Get-FileHash age.zip).Hash -ne 'F48D8F8F9EBE903AB5027ED067652F2CC1DB94BC206976430133B905DCD8E8C7') { throw 'age zip sha256 mismatch' }
+          Expand-Archive age.zip -DestinationPath agebin
+          $age = (Get-ChildItem agebin -Recurse -Filter age.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory enc | Out-Null
+          $iso = "build\pe\ShellGatePE-${{ matrix.arch }}.iso"
+          & $age -r '${{ github.event.inputs.age_recipient }}' -o "enc\ShellGatePE-${{ matrix.arch }}.iso.age" $iso
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Content "$iso.sha256" | Set-Content "enc\ShellGatePE-${{ matrix.arch }}.iso.sha256"
+          Get-ChildItem enc | Format-Table Name, Length
+      - name: Upload encrypted ISO (1 day)
+        if: steps.want.outputs.go == 'true' && github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.age_recipient, 'age1')
+        uses: actions/upload-artifact@v4
+        with:
+          name: shellgate-pe-${{ matrix.arch }}-encrypted
+          path: enc/
+          retention-days: 1
+          compression-level: 0

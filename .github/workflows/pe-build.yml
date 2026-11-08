@@ -17,6 +17,10 @@ on:
         description: "age public key (age1...) to encrypt the ISO for; empty = do not upload the image"
         required: false
         default: ""
+      prerelease:
+        description: "also publish the age-encrypted ISO as a temporary prerelease (pe-test-*) so a machine without GitHub sign-in can fetch it; delete it after use"
+        type: boolean
+        default: false
   push:
     paths:
       - "editions/pe/pe-build/**"
@@ -52,6 +56,8 @@ jobs:
   pe:
     needs: shellgate
     runs-on: windows-latest
+    permissions:
+      contents: write   # only used by the opt-in prerelease step below
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -124,3 +130,12 @@ jobs:
           path: enc/
           retention-days: 1
           compression-level: 0
+      - name: Temporary prerelease of the encrypted ISO (opt-in)
+        if: steps.want.outputs.go == 'true' && github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.age_recipient, 'age1') && github.event.inputs.prerelease == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "pe-test-${{ github.run_id }}-${{ matrix.arch }}"
+          gh release create $tag --repo ${{ github.repository }} --target ${{ github.sha }} --prerelease --title "$tag (age-encrypted, temporary)" --notes "Temporary age-encrypted test image; unusable without the maintainer's private key. Will be deleted after download." (Get-ChildItem enc).FullName
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

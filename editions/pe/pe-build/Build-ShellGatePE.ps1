@@ -395,9 +395,12 @@ if (-not $NoIso) {
     # oscdimg.exe and inside the media. Newer ADKs also ship efisys_EX.bin (Windows UEFI CA 2023).
     $oscDir = Split-Path $adk.Oscdimg
     $dirs = @("$Media\fwfiles", $oscDir, "$Media\media\Boot", "$Media\media\efi\microsoft\boot")
-    $pick = { param($names) foreach ($d in $dirs) { foreach ($n in $names) { $f = Join-Path $d $n; if (Test-Path $f) { return $f } } } }
+    # name order wins over directory order: the *_noprompt* UEFI image boots straight in. The prompting
+    # efisys.bin waits for "Press any key to boot from CD or DVD" and, unattended (remote rescue, a VM,
+    # Ventoy's UEFI chain), times out and falls back to the next boot entry.
+    $pick = { param($names) foreach ($n in $names) { foreach ($d in $dirs) { $f = Join-Path $d $n; if (Test-Path $f) { return $f } } } }
     $etfs = & $pick @('etfsboot.com')
-    $efisys = & $pick @('efisys.bin', 'efisys_EX.bin', 'efisys_noprompt.bin')
+    $efisys = & $pick @('efisys_noprompt.bin', 'efisys_EX_noprompt.bin', 'efisys.bin', 'efisys_EX.bin')
     Say "boot sectors: $etfs ; $efisys" Gray
     if (-not $etfs -or -not $efisys) { Die "etfsboot.com / efisys.bin not found in: $($dirs -join '; ')" }
     if (Test-Path $iso) { Remove-Item $iso -Force }

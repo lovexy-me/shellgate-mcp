@@ -186,9 +186,13 @@ $Components = @(
     'WinPE-WMI', 'WinPE-NetFX', 'WinPE-Scripting', 'WinPE-PowerShell', 'WinPE-StorageWMI',
     'WinPE-DismCmdlets', 'WinPE-SecureBootCmdlets', 'WinPE-EnhancedStorage', 'WinPE-SecureStartup',
     'WinPE-FMAPI', 'WinPE-PlatformId', 'WinPE-HTA', 'WinPE-MDAC', 'WinPE-Dot3Svc',
-    'WinPE-PPPoE', 'WinPE-RNDIS', 'WinPE-WDS-Tools', 'WinPE-SRT', 'WinPE-Setup',
-    'WinPE-FontSupport-ZH-CN', 'WinPE-LegacySetup', 'WinPE-WinReCfg', 'WinPE-Rejuv', 'WinPE-GamingPeripherals'
+    'WinPE-PPPoE', 'WinPE-RNDIS', 'WinPE-WDS-Tools', 'WinPE-SRT',
+    'WinPE-FontSupport-ZH-CN', 'WinPE-WinReCfg', 'WinPE-Rejuv', 'WinPE-GamingPeripherals'
 )
+# Left out on purpose: WinPE-Setup and WinPE-LegacySetup (needs Setup). With WinPE-Setup in the image the PE
+# resets about 10 s after the Windows logo (seen 2026-11-08 in KVM, amd64 ADK 26100 and x86 ADK 2004; a
+# component-by-component boot test isolated it). Nothing here uses setup.exe: win-install applies images
+# with DISM + bcdboot.
 # Components with no language pack of their own
 $NoLangPack = @('WinPE-FontSupport-ZH-CN', 'WinPE-PlatformId', 'WinPE-FMAPI', 'WinPE-GamingPeripherals')
 

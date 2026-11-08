@@ -65,7 +65,7 @@ Ventoy盘\
 
 WMI、NetFX、Scripting、PowerShell、StorageWMI、DismCmdlets、SecureBootCmdlets、EnhancedStorage、SecureStartup
 （BitLocker / manage-bde）、FMAPI、PlatformId、HTA、MDAC、Dot3Svc（802.1X 有线）、PPPoE、RNDIS（手机 USB 共享网络）、
-WDS-Tools、SRT、Setup、LegacySetup、WinReCfg、Rejuv、GamingPeripherals、FontSupport-ZH-CN。ADK 里没有的会在报告里
+WDS-Tools、SRT、WinReCfg、Rejuv、GamingPeripherals、FontSupport-ZH-CN。**不装 WinPE-Setup / LegacySetup**：装了 Setup 的 PE 开机约 10 秒即自动重启（KVM 中逐个组件对照确认），装机走 DISM + bcdboot 用不到它。ADK 里没有的会在报告里
 列为 missing，不会中断构建。
 
 ## 工具

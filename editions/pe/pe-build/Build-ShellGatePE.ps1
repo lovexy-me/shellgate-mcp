@@ -41,7 +41,8 @@ param(
     [switch]$AllowUnpinned,                   # accept tools whose sha256 is null in tools.json
     [switch]$NoIso,
     [int]$ScratchMB = 512,
-    [string[]]$Skip = @()                     # diagnostics: skip build stages (components, intl, tools, drivers)
+    [string[]]$Skip = @(),                    # diagnostics: skip build stages (components, intl, tools, drivers)
+    [string[]]$OnlyComponents = @()           # diagnostics: add only these optional components (names without WinPE-)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -200,7 +201,8 @@ function Add-Components($Mount, $OcRoot) {
         & $Dism /Image:$Mount /Add-Package /PackagePath:"$lp" /Quiet | Out-Null
         if ($LASTEXITCODE -eq 0) { $added += 'zh-cn lp.cab' } else { $missing += "zh-cn lp.cab(dism $LASTEXITCODE)" }
     } else { $missing += 'zh-cn lp.cab' }
-    foreach ($c in $Components) {
+    $list = if ($OnlyComponents) { @($OnlyComponents | ForEach-Object { if ($_ -like 'WinPE-*') { $_ } else { "WinPE-$_" } }) } else { $Components }
+    foreach ($c in $list) {
         $cab = Join-Path $OcRoot "$c.cab"
         if (-not (Test-Path $cab)) { $missing += $c; continue }
         Say "  组件 $c"
@@ -364,6 +366,7 @@ try {
         Copy-Item (Join-Path $PSScriptRoot "files\$f") (Join-Path $Mount "Windows\System32\$f") -Force
     }
     $pe = Join-Path $Mount 'Program Files\ShellGatePE'
+    New-Item -ItemType Directory -Force -Path $pe | Out-Null
     Copy-Item (Join-Path $PSScriptRoot 'files\menu.hta') (Join-Path $pe 'menu.hta') -Force
     Copy-Item (Join-Path $PSScriptRoot 'files\bin') $pe -Recurse -Force
     # bootsect.exe (NTLDR/BOOTMGR boot sectors for XP-style and legacy repairs) ships with the ADK

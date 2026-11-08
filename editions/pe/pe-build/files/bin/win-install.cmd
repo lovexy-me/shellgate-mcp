@@ -25,7 +25,7 @@ if /i "%~1"=="check" goto :check
 echo 未知子命令 %1 & goto :help
 
 :help
-findstr /b "rem " "%~f0" | findstr /v "====" | more
+for /f "usebackq tokens=* delims=" %%L in ("%~f0") do (set "L=%%L" & if "!L:~0,4!"=="rem " if not "!L:~4,4!"=="====" echo(!L:~4!)
 exit /b 0
 
 rem ---------------------------------------------------------------- apply
@@ -50,7 +50,7 @@ if exist "%SRC%\AMD64\" goto xp
 if exist "%SRC%\i386\" goto xp
 
 rem ---- ISO: 挂载后找 sources\install.*
-echo %SRC% | findstr /i "\.iso$" >nul && (
+for %%F in ("%SRC%") do if /i "%%~xF"==".iso" (
   echo [i] ISO 需先挂载：PE 下用 "imdisk" 或把 ISO 解包到目录后再传目录。
   echo     ShellGate 里通常直接传 Ventoy 盘上已解包的目录，或用 7za x 解到临时盘。
   exit /b 2
@@ -59,7 +59,7 @@ set "WIM=%SRC%"
 if exist "%SRC%\sources\install.wim" set "WIM=%SRC%\sources\install.wim"
 if exist "%SRC%\sources\install.esd" set "WIM=%SRC%\sources\install.esd"
 if not exist "%WIM%" echo 找不到镜像 %WIM% & exit /b 2
-echo %WIM% | findstr /i "\.gho$" >nul && (
+for %%F in ("%WIM%") do if /i "%%~xF"==".gho" (
   echo [x] GHO 需要 Norton Ghost（专有、不可再分发，不内置）。
   echo     可行替代：把 GHO 在别处还原后用 wimlib-imagex capture 成 WIM，再用本脚本释放。
   exit /b 3

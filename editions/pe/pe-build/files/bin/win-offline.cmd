@@ -26,7 +26,7 @@ if /i "%~1"=="fixboot" (echo 引导修复请运行 win-disk.cmd fixboot ...& exit /b 2)
 if /i "%~1"=="bcdlist" goto bcdlist
 echo 未知子命令 %1 & goto :help
 :help
-findstr /b "rem " "%~f0" | findstr /v "====" | more
+for /f "usebackq tokens=* delims=" %%L in ("%~f0") do (set "L=%%L" & if "!L:~0,4!"=="rem " if not "!L:~4,4!"=="====" echo(!L:~4!)
 exit /b 0
 
 :hive
@@ -40,7 +40,7 @@ exit /b 0
 call :hive "%W%" || exit /b 2
 reg load HKLM\SG_SAM "%HROOT%\SAM" >nul || (echo 无法加载 SAM & exit /b 1)
 echo --- 本地账户 ---
-for /f "tokens=*" %%k in ('reg query "HKLM\SG_SAM\SAM\Domains\Account\Users\Names" 2^>nul ^| findstr /v "Names$"') do echo %%~nxk
+for /f "tokens=*" %%k in ('reg query "HKLM\SG_SAM\SAM\Domains\Account\Users\Names" 2^>nul') do if /i not "%%~nxk"=="Names" echo %%~nxk
 reg unload HKLM\SG_SAM >nul
 exit /b 0
 
@@ -69,7 +69,7 @@ set "H=%~3"
 if "%H%"=="" echo 用法: win-offline reg ^<windows:^> ^<system^|software^|sam^|default^|ntuser:用户^> ^<reg 命令...^> & exit /b 2
 call :hive "%W%" || exit /b 2
 set "F=%HROOT%\%H%"
-echo %H% | findstr /i "^ntuser:" >nul && (
+if /i "!H:~0,7!"=="ntuser:" (
   for /f "tokens=2 delims=:" %%u in ("%H%") do set "F=%W%\Users\%%u\NTUSER.DAT"
   if not exist "!F!" for /f "tokens=2 delims=:" %%u in ("%H%") do set "F=%W%\Documents and Settings\%%u\NTUSER.DAT"
 )

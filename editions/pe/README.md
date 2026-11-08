@@ -1,4 +1,6 @@
-# ShellGate 随身 Ventoy 救援盘版（v0.3.0）
+# ShellGate PE 维护版（随身 Ventoy 救援盘，v0.3.0）
+
+> 这是 **PE 维护版**：WinPE / Windows x64、x86，以 cmd 为主、PowerShell/WMI 可用，带 Ventoy 工具、桌面截图键鼠（`desktop=on`）、装机修复脚本和自建 PE（[`pe-build/`](pe-build/README.md)）。用 `--features edition-pe` 编译；U 盘上救援 Linux 用的 x86_64 静态版用 `--features edition-linux`。配置样例 [`shellgate.env.example`](shellgate.env.example)，发布标签 `pe-v<版本>`。路由器用 [OpenWrt 版](../openwrt/README.md)，WSL2 用 [WSL 版](../wsl/README.md)。
 
 同一个 Rust 单文件程序，现在可以在 **Linux（x86_64 musl 静态）** 和 **Windows（x86_64 .exe）** 上运行，并能直接管理插着的 Ventoy U 盘（增删镜像、改 `ventoy.json`）。
 
@@ -80,7 +82,7 @@ tunnel_token=在 Cloudflare 后台为这个 U 盘单独建的隧道的 token
 
 ## 在各种 PE 里自动启动
 
-模板都在 `openwrt/pe-autostart/`，**都不含令牌**：令牌只在 U 盘的 `shellgate/shellgate.env` 里。按你要用的 PE 选一种或几种（互不冲突，重复启动时第二个会因端口占用直接退出）：
+模板都在 `editions/pe/pe-autostart/`，**都不含令牌**：令牌只在 U 盘的 `shellgate/shellgate.env` 里。按你要用的 PE 选一种或几种（互不冲突，重复启动时第二个会因端口占用直接退出）：
 
 | PE | 放什么 | 原理 |
 |---|---|---|
@@ -148,13 +150,14 @@ pe_network=1|0        # WinPE + lan/tunnel：自动 wpeutil InitializeNetwork；
 ```sh
 pip install ziglang cargo-zigbuild
 rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu
-cd openwrt
-cargo zigbuild --release --target x86_64-unknown-linux-musl
-cargo zigbuild --release --target x86_64-pc-windows-gnu
+cd core
+cargo zigbuild --release --no-default-features --features edition-linux --target x86_64-unknown-linux-musl
+cargo zigbuild --release --no-default-features --features edition-pe --target x86_64-pc-windows-gnu
+cargo zigbuild --release --no-default-features --features edition-pe --target i686-pc-windows-gnu
 ```
 
 测试：`cargo test`；端到端：
-`SHELLGATE_BIN=openwrt/target/release/shellgate pytest -q tests/test_e2e.py tests/test_ventoy_e2e.py`
+`SHELLGATE_BIN=core/target/release/shellgate pytest -q tests/test_e2e.py tests/test_ventoy_e2e.py`
 
 ## 已知限制
 

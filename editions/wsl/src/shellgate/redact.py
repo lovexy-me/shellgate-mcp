@@ -1,7 +1,7 @@
 """Output redaction: masks addresses, keys, tokens and secrets before text leaves the host.
 
 Every rule is "candidate regex + boundary/validity check in code" (no look-around), so the
-Rust build in openwrt/src/redact.rs can implement exactly the same behaviour.
+Rust build in core/src/redact.rs can implement exactly the same behaviour.
 
 Placeholders: <ip> <ipv6> <mac> <key> <token> <uuid> <x> (secret values) <domain>.
 """

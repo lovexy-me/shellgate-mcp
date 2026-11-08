@@ -19,7 +19,8 @@ on:
         default: ""
   push:
     paths:
-      - "openwrt/pe-build/**"
+      - "editions/pe/pe-build/**"
+      - "core/**"
       - ".github/workflows/pe-build.yml"
 
 permissions:
@@ -34,10 +35,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu,i686-pc-windows-gnu
       - run: pip install ziglang cargo-zigbuild
-      - working-directory: openwrt
+      - working-directory: core
         run: |
-          cargo zigbuild --release --target x86_64-pc-windows-gnu
-          cargo zigbuild --release --target i686-pc-windows-gnu
+          cargo zigbuild --release --no-default-features --features edition-pe --target x86_64-pc-windows-gnu
+          cargo zigbuild --release --no-default-features --features edition-pe --target i686-pc-windows-gnu
           mkdir -p ../sgbin
           cp target/x86_64-pc-windows-gnu/release/shellgate.exe ../sgbin/shellgate-x86_64-windows.exe
           cp target/i686-pc-windows-gnu/release/shellgate.exe ../sgbin/shellgate-i686-windows.exe
@@ -76,19 +77,19 @@ jobs:
         if: steps.want.outputs.go == 'true'
         with:
           path: build/pe/download
-          key: pe-dl-${{ matrix.arch }}-${{ hashFiles('openwrt/pe-build/tools.json') }}
+          key: pe-dl-${{ matrix.arch }}-${{ hashFiles('editions/pe/pe-build/tools.json') }}
       - name: Build ShellGate PE
         if: steps.want.outputs.go == 'true'
         shell: pwsh
         run: |
           $exe = if ('${{ matrix.arch }}' -eq 'x86') { 'sgbin\shellgate-i686-windows.exe' } else { 'sgbin\shellgate-x86_64-windows.exe' }
-          & openwrt\pe-build\Build-ShellGatePE.ps1 -Arch ${{ matrix.arch }} -Out "$PWD\build\pe" -ShellGate (Resolve-Path $exe)
+          & editions\pe\pe-build\Build-ShellGatePE.ps1 -Arch ${{ matrix.arch }} -Out "$PWD\build\pe" -ShellGate (Resolve-Path $exe)
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Verify the image (offline)
         if: steps.want.outputs.go == 'true'
         shell: pwsh
         run: |
-          & openwrt\pe-build\Test-ShellGatePE.ps1 -Out "$PWD\build\pe" -Arch ${{ matrix.arch }}
+          & editions\pe\pe-build\Test-ShellGatePE.ps1 -Out "$PWD\build\pe" -Arch ${{ matrix.arch }}
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build report (text only)
         if: always() && steps.want.outputs.go == 'true'

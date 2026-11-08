@@ -7,7 +7,7 @@ REPO="lovexy-me/shellgate-mcp"
 BIN=/usr/bin/shellgate
 CONF_DIR=/etc/shellgate
 CONF=$CONF_DIR/env
-RAW="https://raw.githubusercontent.com/$REPO/main/openwrt/files"
+RAW="https://raw.githubusercontent.com/$REPO/main/editions/openwrt/files"
 
 fetch() { # url dest
 	if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
@@ -27,8 +27,21 @@ if [ -n "$1" ]; then
 	echo "==> Installing $1"
 	cp "$1" "$BIN.new"
 else
-	echo "==> Downloading shellgate-$TARGET"
-	fetch "https://github.com/$REPO/releases/latest/download/shellgate-$TARGET" "$BIN.new"
+	# Releases are per edition (openwrt-v*, pe-v*, wsl-v*): pick the newest openwrt-v* tag,
+	# or the one given in SHELLGATE_TAG. Falls back to the pre-split asset name in the latest release.
+	TAG="${SHELLGATE_TAG:-}"
+	if [ -z "$TAG" ]; then
+		fetch "https://api.github.com/repos/$REPO/releases?per_page=30" /tmp/sg-releases.json 2>/dev/null || true
+		TAG=$(sed -n 's/.*"tag_name": *"\(openwrt-v[^"]*\)".*/\1/p' /tmp/sg-releases.json 2>/dev/null | head -1)
+		rm -f /tmp/sg-releases.json
+	fi
+	if [ -n "$TAG" ]; then
+		echo "==> Downloading $TAG shellgate-openwrt-$TARGET"
+		fetch "https://github.com/$REPO/releases/download/$TAG/shellgate-openwrt-$TARGET" "$BIN.new"
+	else
+		echo "==> No openwrt-v* release found; trying shellgate-$TARGET from the latest release"
+		fetch "https://github.com/$REPO/releases/latest/download/shellgate-$TARGET" "$BIN.new"
+	fi
 fi
 chmod 755 "$BIN.new"
 "$BIN.new" --version >/dev/null || { echo "binary does not run on this device"; rm -f "$BIN.new"; exit 1; }

@@ -6,7 +6,7 @@
 mod audit;
 mod config;
 mod desktop;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "desktop"))]
 mod desktop_win;
 mod exec;
 mod net;
@@ -97,7 +97,7 @@ async fn handle_message(ctx: &Ctx, ip: &str, msg: &Value) -> Option<Value> {
             json!({
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "shellgate", "version": VERSION},
+                "serverInfo": {"name": "shellgate", "version": VERSION, "edition": tools::EDITION},
                 "instructions": instructions(),
             })
         }
@@ -202,13 +202,13 @@ fn main() {
             // WinPE helper: set the screen resolution (WIDTHxHEIGHT | max | list) and exit
             "--display" => {
                 let spec = args.next().unwrap_or_else(|| "list".into());
-                #[cfg(windows)]
+                #[cfg(all(windows, feature = "desktop"))]
                 match desktop_win::set_display(&spec) {
                     Ok(m) => { println!("{m}"); return; }
                     Err(e) => { eprintln!("{e}"); std::process::exit(1) }
                 }
-                #[cfg(not(windows))]
-                { eprintln!("--display {spec}: Windows only"); std::process::exit(1) }
+                #[cfg(not(all(windows, feature = "desktop")))]
+                { eprintln!("--display {spec}: Windows desktop build only"); std::process::exit(1) }
             }
             "--init-config" => {
                 let Some(p) = args.next() else { usage() };

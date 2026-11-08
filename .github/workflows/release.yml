@@ -1,43 +1,43 @@
 name: Release
+# One release per edition. Tag prefixes:
+#   openwrt-v<cargo version>  -> router binaries        (core/Cargo.toml version)
+#   pe-v<cargo version>       -> Windows x64/x86 exe + rescue-stick Linux binary + pe-build kit
+#   wsl-v<python version>     -> Python wheel/sdist      (editions/wsl/pyproject.toml + __init__)
 on:
   push:
-    tags: ["v*"]
+    tags: ["openwrt-v*", "pe-v*", "wsl-v*"]
   workflow_dispatch:
+    inputs:
+      edition:
+        description: "openwrt, pe or wsl (build artifacts only, no release)"
+        type: choice
+        options: [openwrt, pe, wsl]
+        default: pe
 permissions:
   contents: write
 jobs:
-  check-version:
+  which:
     runs-on: ubuntu-latest
+    outputs:
+      edition: ${{ steps.e.outputs.edition }}
     steps:
       - uses: actions/checkout@v4
-      - name: Tag matches pyproject, __init__ and Cargo.toml
-        if: startsWith(github.ref, 'refs/tags/')
+      - id: e
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          py=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
-          init=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/shellgate/__init__.py)
-          rs=$(sed -n 's/^version = "\(.*\)"/\1/p' openwrt/Cargo.toml | head -1)
-          echo "tag=$tag pyproject=$py init=$init cargo=$rs"
-          [ "$tag" = "$py" ] && [ "$tag" = "$init" ] && [ "$tag" = "$rs" ]
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then ed="${GITHUB_REF_NAME%%-v*}"; ver="${GITHUB_REF_NAME#*-v}"; else ed="${{ github.event.inputs.edition }}"; ver=; fi
+          echo "edition=$ed" >> "$GITHUB_OUTPUT"
+          [ -z "$ver" ] && exit 0
+          case "$ed" in
+            openwrt|pe) have=$(sed -n 's/^version = "\(.*\)"/\1/p' core/Cargo.toml | head -1) ;;
+            wsl) have=$(sed -n 's/^version = "\(.*\)"/\1/p' editions/wsl/pyproject.toml | head -1)
+                 init=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' editions/wsl/src/shellgate/__init__.py)
+                 [ "$have" = "$init" ] || { echo "pyproject $have != __init__ $init"; exit 1; } ;;
+          esac
+          echo "tag=$ver source=$have"; [ "$ver" = "$have" ]
 
-  python:
-    needs: check-version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e ".[dev]" build
-      - run: pytest -q
-      - run: python -m build --sdist --wheel --outdir dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: python-dist
-          path: dist/*
-
-  rust:
-    needs: check-version
+  openwrt:
+    needs: which
+    if: needs.which.outputs.edition == 'openwrt'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -51,46 +51,69 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: pip install ziglang cargo-zigbuild
-      - working-directory: openwrt
-        run: cargo test --release
-      - working-directory: openwrt
-        run: cargo zigbuild --release --no-default-features --target ${{ matrix.target }}   # routers: no ventoy_add downloader, keeps the binary small
-      - run: cp openwrt/target/${{ matrix.target }}/release/shellgate shellgate-${{ matrix.target }}
+      - working-directory: core
+        run: cargo zigbuild --release --no-default-features --features edition-openwrt --target ${{ matrix.target }}
+      - run: cp core/target/${{ matrix.target }}/release/shellgate shellgate-openwrt-${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: shellgate-${{ matrix.target }}
-          path: shellgate-${{ matrix.target }}
+          name: openwrt-${{ matrix.target }}
+          path: shellgate-openwrt-*
 
-  rust-windows:   # Ventoy rescue stick, double-click on any Windows PC
-    needs: check-version
+  pe:
+    needs: which
+    if: needs.which.outputs.edition == 'pe'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-gnu,i686-pc-windows-gnu,x86_64-unknown-linux-musl
       - run: pip install ziglang cargo-zigbuild
-      - working-directory: openwrt
-        run: cargo zigbuild --release --target x86_64-pc-windows-gnu
-      - run: cp openwrt/target/x86_64-pc-windows-gnu/release/shellgate.exe shellgate-x86_64-pc-windows-gnu.exe
+      - working-directory: core
+        run: |
+          cargo test --release
+          cargo zigbuild --release --no-default-features --features edition-pe --target x86_64-pc-windows-gnu
+          cargo zigbuild --release --no-default-features --features edition-pe --target i686-pc-windows-gnu
+          cargo zigbuild --release --no-default-features --features edition-linux --target x86_64-unknown-linux-musl
+      - run: |
+          cp core/target/x86_64-pc-windows-gnu/release/shellgate.exe shellgate-pe-x86_64-windows.exe
+          cp core/target/i686-pc-windows-gnu/release/shellgate.exe shellgate-pe-i686-windows.exe
+          cp core/target/x86_64-unknown-linux-musl/release/shellgate shellgate-pe-x86_64-linux-musl
+          (cd editions/pe && zip -qr ../../shellgate-pe-kit.zip pe-build pe-autostart README.md)
       - uses: actions/upload-artifact@v4
         with:
-          name: shellgate-x86_64-pc-windows-gnu
-          path: shellgate-x86_64-pc-windows-gnu.exe
+          name: pe
+          path: |
+            shellgate-pe-*
+            shellgate-pe-kit.zip
+
+  wsl:
+    needs: which
+    if: needs.which.outputs.edition == 'wsl'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e "editions/wsl[dev]" build
+      - run: pytest -q tests
+      - run: python -m build --sdist --wheel --outdir dist editions/wsl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsl
+          path: dist/*
 
   release:
-    needs: [python, rust, rust-windows]
+    needs: [which, openwrt, pe, wsl]
+    if: always() && startsWith(github.ref, 'refs/tags/') && !contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - run: sha256sum shellgate-* *.whl *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - run: sha256sum * > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            shellgate-*
-            *.whl
-            *.tar.gz
-            SHA256SUMS
+          name: ${{ github.ref_name }}
+          files: "*"

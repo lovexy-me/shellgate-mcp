@@ -25,7 +25,7 @@ pub struct App {
     pub redactor: Redactor,
     pub downloads: std::sync::Mutex<HashMap<String, Arc<ventoy::Download>>>,
     /// last desktop_screenshot: coordinate mapping and content hash
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(all(windows, feature = "desktop")), allow(dead_code))]
     pub shot: std::sync::Mutex<Option<(crate::desktop::Mapping, u64)>>,
 }
 
@@ -38,6 +38,17 @@ const DEFAULT_INTERPRETER: &str = "sh";
 #[cfg(windows)]
 const DEFAULT_INTERPRETER: &str = "powershell";
 const MAX_DOWNLOADS: usize = 2;
+
+/// Which edition this binary was built as (cargo feature edition-*); shown in system_info and initialize.
+pub const EDITION: &str = if cfg!(feature = "edition-openwrt") {
+    "openwrt"
+} else if cfg!(feature = "edition-pe") {
+    "pe"
+} else if cfg!(feature = "edition-linux") {
+    "linux"
+} else {
+    "full"
+};
 const MAX_STDIN: usize = 4_000_000;
 
 /// Removes a private temp directory when dropped, whatever happened in between.
@@ -274,7 +285,12 @@ impl App {
     /// tools/list: the base tools, plus the desktop tools on Windows when desktop=on.
     pub fn tool_list(&self) -> Value {
         let mut v = definitions();
-        if cfg!(windows) && self.policy.settings.desktop {
+        if !cfg!(feature = "ventoy") {
+            if let Value::Array(a) = &mut v {
+                a.retain(|t| !t["name"].as_str().unwrap_or("").starts_with("ventoy_"));
+            }
+        }
+        if cfg!(all(windows, feature = "desktop")) && self.policy.settings.desktop {
             if let Value::Array(a) = &mut v {
                 a.extend(crate::desktop::definitions());
             }
@@ -283,7 +299,7 @@ impl App {
     }
 
     /// Confirmation answer for a desktop action with risk reasons, or None when it may go ahead.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(all(windows, feature = "desktop")), allow(dead_code))]
     fn confirm_gate(&self, kind: &str, args: &Value, reasons: Vec<String>) -> Option<Value> {
         if reasons.is_empty() {
             return None;
@@ -303,12 +319,12 @@ impl App {
         }))
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(all(windows, feature = "desktop")))]
     async fn desktop(self: &Arc<Self>, _name: &str, _a: &Value) -> Result<Value, String> {
-        Err("desktop tools exist only in the Windows build".into())
+        Err("desktop tools exist only in the Windows desktop (PE edition) build".into())
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "desktop"))]
     async fn desktop(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
         let me = self.clone();
         let name = name.to_string();
@@ -316,7 +332,7 @@ impl App {
         tokio::task::spawn_blocking(move || me.desktop_blocking(&name, &a)).await.map_err(|e| e.to_string())?
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "desktop"))]
     fn desktop_blocking(&self, name: &str, a: &Value) -> Result<Value, String> {
         use crate::desktop as d;
         use crate::desktop_win as w;
@@ -692,6 +708,9 @@ impl App {
 
     async fn dispatch(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
         let s = &self.policy.settings;
+        if name.starts_with("ventoy_") && !cfg!(feature = "ventoy") {
+            return Err(format!("{name}: this {EDITION} edition is built without the ventoy tools"));
+        }
         if name.starts_with("desktop_") && crate::desktop::TOOL_NAMES.contains(&name) {
             if !s.desktop {
                 return Err("desktop tools are off; set desktop=on in shellgate.env to enable them".into());
@@ -887,7 +906,7 @@ impl App {
                     .await.map_err(|e| e.to_string())?;
                 Ok(json!({"status": "ok", "matches": res.0, "truncated": res.1}))
             }
-            "system_info" => Ok(system_info()),
+            "system_info" => Ok({ let mut v = system_info(); v["edition"] = json!(EDITION); v }),
             "audit_tail" => {
                 let n = arg_i64(a, "n", 20).clamp(1, 200) as usize;
                 Ok(json!({"status": "ok", "entries": self.audit.tail(n)}))

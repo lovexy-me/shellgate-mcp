@@ -6,7 +6,7 @@ dist/
 build/
 env
 *.bak-*
-openwrt/target/
+core/target/
 *.sgtmp
 
 # rescue-stick configs hold the access token; only the .example is tracked

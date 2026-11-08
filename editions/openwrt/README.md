@@ -1,6 +1,6 @@
 # ShellGate for OpenWrt (Rust)
 
-> v0.3.0 起同一份代码也能编译成 **Windows .exe** 和 **x86_64 Linux 静态版**，用于随身 Ventoy 救援盘（局域网/隧道模式、Ventoy 镜像管理），见 [README-ventoy.md](README-ventoy.md)。
+> 这是 **OpenWrt 版**（路由器场景）。同一 Rust 核心（`core/`）按场景编译出不同版本：PE 维护版见 [`editions/pe`](../pe/README.md)，WSL2/Linux 版见 [`editions/wsl`](../wsl/README.md)。本版用 `--features edition-openwrt` 编译：不含 Ventoy、桌面截图键鼠和 HTTPS 下载，体积最小。
 
 与主项目相同的 MCP 接口和鉴权，用 Rust 重写成**单个静态二进制**（aarch64 约 1.4 MB，空闲内存约 1–2 MB），适合 360 T7 这类小闪存路由器。不依赖 Python、bash 或 systemd。
 
@@ -36,7 +36,7 @@ SSH 登录路由器后：
 
 ```sh
 cd /tmp
-wget https://raw.githubusercontent.com/lovexy-me/shellgate-mcp/main/openwrt/files/install.sh
+wget https://raw.githubusercontent.com/lovexy-me/shellgate-mcp/main/editions/openwrt/files/install.sh
 sh install.sh
 ```
 
@@ -66,11 +66,11 @@ sh uninstall.sh            # 加 --purge 删除配置
 ```sh
 pip install ziglang cargo-zigbuild
 rustup target add aarch64-unknown-linux-musl
-cd openwrt
-cargo zigbuild --release --target aarch64-unknown-linux-musl
+cd core
+cargo zigbuild --release --no-default-features --features edition-openwrt --target aarch64-unknown-linux-musl
 ```
 
-打 `v*` 标签时 GitHub Actions 会自动编译三个架构并发布到 Releases。
+打 `openwrt-v<版本>` 标签时（版本号取 `core/Cargo.toml`），GitHub Actions 编译 aarch64、armv7、x86_64 三个架构，发布为 `shellgate-openwrt-<目标>`。`install.sh` 自动找最新的 `openwrt-v*` 发布；也可用 `SHELLGATE_TAG=openwrt-v0.3.0 sh install.sh` 指定。
 
 测试：`cargo test`，以及用 Python 端到端测试跑 Rust 二进制：
-`SHELLGATE_BIN=openwrt/target/release/shellgate pytest -q tests/test_e2e.py`
+`SHELLGATE_BIN=core/target/release/shellgate pytest -q tests/test_e2e.py`

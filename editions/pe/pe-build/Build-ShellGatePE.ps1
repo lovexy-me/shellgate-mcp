@@ -391,12 +391,15 @@ Say "WIM: $wim ($([math]::Round((Get-Item $wim).Length/1MB,1)) MB)"
 if (-not $NoIso) {
     if (-not $adk.Oscdimg) { Die "oscdimg.exe not found in the ADK Deployment Tools" }
     $iso = Join-Path $Out "ShellGatePE-$Arch.iso"
-    $fw = "$Media\fwfiles"
-    $etfs = Join-Path $fw 'etfsboot.com'
-    # newer ADKs ship efisys_EX.bin (Windows UEFI CA 2023) beside or instead of efisys.bin
-    $efisys = @('efisys.bin', 'efisys_EX.bin', 'efisys_noprompt.bin') | ForEach-Object { Join-Path $fw $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
-    Say "fwfiles: $((Get-ChildItem $fw -EA SilentlyContinue | ForEach-Object Name) -join ', ')" Gray
-    if (-not (Test-Path $etfs) -or -not $efisys) { Die "boot sector files missing in $fw" }
+    # copype of older ADKs leaves fwfiles\; ADK 10.1.26100 copype does not, but the same files sit beside
+    # oscdimg.exe and inside the media. Newer ADKs also ship efisys_EX.bin (Windows UEFI CA 2023).
+    $oscDir = Split-Path $adk.Oscdimg
+    $dirs = @("$Media\fwfiles", $oscDir, "$Media\media\Boot", "$Media\media\efi\microsoft\boot")
+    $pick = { param($names) foreach ($d in $dirs) { foreach ($n in $names) { $f = Join-Path $d $n; if (Test-Path $f) { return $f } } } }
+    $etfs = & $pick @('etfsboot.com')
+    $efisys = & $pick @('efisys.bin', 'efisys_EX.bin', 'efisys_noprompt.bin')
+    Say "boot sectors: $etfs ; $efisys" Gray
+    if (-not $etfs -or -not $efisys) { Die "etfsboot.com / efisys.bin not found in: $($dirs -join '; ')" }
     if (Test-Path $iso) { Remove-Item $iso -Force }
     # BIOS + UEFI dual boot
     $log = & $adk.Oscdimg -m -o -u2 -udfver102 "-bootdata:2#p0,e,b$etfs#pEF,e,b$efisys" "$Media\media" $iso 2>&1

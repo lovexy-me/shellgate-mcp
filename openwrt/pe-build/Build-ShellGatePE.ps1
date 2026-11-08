@@ -66,11 +66,30 @@ function Get-File($Url, $Dest, $Sha256) {
     }
     Say "下载    $Url"
     $tmp = "$Dest.part"
-    try {
-        Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -MaximumRedirection 10 `
-            -Headers @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-    } catch { Remove-Item $tmp -EA SilentlyContinue; throw "download failed: $Url -> $_" }
-    $h = (Get-FileHash $tmp -Algorithm SHA256).Hash
+    $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+    $curl = Get-Command curl.exe -EA SilentlyContinue
+    $h = $null
+    # Large files (virtio-win ISO, ~790 MB) were silently truncated by Invoke-WebRequest on CI runners:
+    # use curl.exe with resume/retry when present, and re-download up to 3 times on a pinned-hash mismatch.
+    for ($try = 1; $try -le 3; $try++) {
+        Remove-Item $tmp -EA SilentlyContinue
+        try {
+            if ($curl) {
+                & $curl.Source -L --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors `
+                    -C - -A $ua -o $tmp $Url
+                if ($LASTEXITCODE) { throw "curl exit $LASTEXITCODE" }
+            } else {
+                Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -MaximumRedirection 10 -Headers @{ 'User-Agent' = $ua }
+            }
+        } catch {
+            Remove-Item $tmp -EA SilentlyContinue
+            if ($try -eq 3) { throw "download failed: $Url -> $_" }
+            Say "  下载失败，重试 ($try/3): $_" Yellow; continue
+        }
+        $h = (Get-FileHash $tmp -Algorithm SHA256).Hash
+        if (-not $Sha256 -or $Sha256 -eq 'microsoft-signed' -or $h -eq $Sha256.ToUpper()) { break }
+        if ($try -lt 3) { Say "  sha256 不符（$((Get-Item $tmp).Length) 字节），重新下载 ($try/3)" Yellow }
+    }
     if ($Sha256 -eq 'microsoft-signed') {
         # ADK bootstrappers change with every servicing release: verify the Authenticode signature instead
         $sig = Get-AuthenticodeSignature $tmp

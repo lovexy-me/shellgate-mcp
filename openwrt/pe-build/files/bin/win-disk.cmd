@@ -6,7 +6,7 @@ rem
 rem   win-disk.cmd layout  <disk> <uefi|bios> [espMB] [--apply]
 rem        GPT(UEFI): ESP(FAT32,S:) + MSR + Windows(NTFS,W:)
 rem        MBR(BIOS): 单个活动 NTFS 分区(W:)，XP/7/10 通用
-rem        不加 --apply 只打印 diskpart 脚本（预演）
+rem        不加 --apply 只打印 diskpart 脚本（预演）；盘符默认 W:，可先 set WINLTR=V 改
 rem   win-disk.cmd boot    <windows:> <system:> [bios|uefi] [nt52|nt60]
 rem        Vista+ : bcdboot <windows:>\Windows /s <system:> /f BIOS|UEFI /l zh-cn
 rem        XP     : bootsect /nt52 <system:> /force /mbr + 写 boot.ini
@@ -34,6 +34,7 @@ if "%DISK%"=="" echo 用法: win-disk layout ^<disk号^> ^<uefi^|bios^> [espMB] [--
 if "%FW%"=="" set "FW=uefi"
 if "%ESP%"=="" set "ESP=300"
 if /i "%ESP%"=="--apply" (set "ESP=300" & set "GO=--apply")
+if not defined WINLTR set "WINLTR=W"
 set "S=X:\dp-layout.txt"
 > "%S%" echo select disk %DISK%
 if /i "%FW%"=="uefi" (
@@ -45,13 +46,13 @@ if /i "%FW%"=="uefi" (
   >> "%S%" echo create partition msr size=16
   >> "%S%" echo create partition primary
   >> "%S%" echo format quick fs=ntfs label="Windows"
-  >> "%S%" echo assign letter=W
+  >> "%S%" echo assign letter=%WINLTR%
 ) else (
   >> "%S%" echo clean
   >> "%S%" echo convert mbr
   >> "%S%" echo create partition primary
   >> "%S%" echo format quick fs=ntfs label="Windows"
-  >> "%S%" echo assign letter=W
+  >> "%S%" echo assign letter=%WINLTR%
   >> "%S%" echo active
 )
 echo --- diskpart 脚本 ---

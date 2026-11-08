@@ -391,10 +391,19 @@ Say "WIM: $wim ($([math]::Round((Get-Item $wim).Length/1MB,1)) MB)"
 if (-not $NoIso) {
     if (-not $adk.Oscdimg) { Die "oscdimg.exe not found in the ADK Deployment Tools" }
     $iso = Join-Path $Out "ShellGatePE-$Arch.iso"
-    $etfs = "$Media\fwfiles\etfsboot.com"; $efisys = "$Media\fwfiles\efisys.bin"
+    $fw = "$Media\fwfiles"
+    $etfs = Join-Path $fw 'etfsboot.com'
+    # newer ADKs ship efisys_EX.bin (Windows UEFI CA 2023) beside or instead of efisys.bin
+    $efisys = @('efisys.bin', 'efisys_EX.bin', 'efisys_noprompt.bin') | ForEach-Object { Join-Path $fw $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+    Say "fwfiles: $((Get-ChildItem $fw -EA SilentlyContinue | ForEach-Object Name) -join ', ')" Gray
+    if (-not (Test-Path $etfs) -or -not $efisys) { Die "boot sector files missing in $fw" }
+    if (Test-Path $iso) { Remove-Item $iso -Force }
     # BIOS + UEFI dual boot
-    & $adk.Oscdimg -m -o -u2 -udfver102 -bootdata:"2#p0,e,b$etfs#pEF,e,b$efisys" "$Media\media" $iso | Out-Null
-    if ($LASTEXITCODE -ne 0) { Die "oscdimg exit $LASTEXITCODE" }
+    $log = & $adk.Oscdimg -m -o -u2 -udfver102 "-bootdata:2#p0,e,b$etfs#pEF,e,b$efisys" "$Media\media" $iso 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $log | Select-Object -Last 25 | ForEach-Object { Write-Host "  oscdimg: $_" }
+        Die "oscdimg exit $LASTEXITCODE"
+    }
     Say "ISO: $iso ($([math]::Round((Get-Item $iso).Length/1MB,1)) MB)"
     (Get-FileHash $iso -Algorithm SHA256).Hash | Set-Content "$iso.sha256"
 }

@@ -40,7 +40,8 @@ param(
     [switch]$SkipAdkInstall,                  # ADK already installed
     [switch]$AllowUnpinned,                   # accept tools whose sha256 is null in tools.json
     [switch]$NoIso,
-    [int]$ScratchMB = 512
+    [int]$ScratchMB = 512,
+    [string[]]$Skip = @()                     # diagnostics: skip build stages (components, intl, tools, drivers)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -322,16 +323,18 @@ try {
     # --- optional components
     $oc = Join-Path $adk.PeRoot 'WinPE_OCs'
     Say "加组件（全部可用的 + zh-cn 语言包）"
-    $comp = Add-Components $Mount $oc
+    $comp = if ($Skip -contains 'components') { Say '  (skipped)' Yellow; @{ Added = @(); Missing = @('skipped') } } else { Add-Components $Mount $oc }
 
     # --- locale: Chinese UI, zh-CN input, CST, UTF-8-friendly console
     Say "中文化"
-    & $Dism /Image:$Mount /Set-AllIntl:zh-cn | Out-Null
-    & $Dism /Image:$Mount /Set-TimeZone:"China Standard Time" | Out-Null
+    if ($Skip -notcontains 'intl') {
+        & $Dism /Image:$Mount /Set-AllIntl:zh-cn | Out-Null
+        & $Dism /Image:$Mount /Set-TimeZone:"China Standard Time" | Out-Null
+    }
 
     # --- tools
     Say "工具"
-    $tools = Install-Tools $Mount
+    $tools = if ($Skip -contains 'tools') { @('skipped') } else { Install-Tools $Mount }
 
     # --- ShellGate
     if (-not $ShellGate) {
@@ -346,7 +349,7 @@ try {
     Say "ShellGate: $ShellGate -> X:\Program Files\ShellGate\shellgate.exe（镜像内没有任何令牌）"
 
     # --- drivers
-    $drvDirs = @($DrvStage) + @($Drivers | Where-Object { $_ -and (Test-Path $_) })
+    $drvDirs = if ($Skip -contains 'drivers') { @() } else { @($DrvStage) + @($Drivers | Where-Object { $_ -and (Test-Path $_) }) }
     foreach ($d in $drvDirs) {
         if (-not (Get-ChildItem $d -Recurse -Filter *.inf -EA SilentlyContinue)) { continue }
         Say "注入驱动 $d"

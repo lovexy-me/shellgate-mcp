@@ -17,6 +17,10 @@ on:
         description: "age public key (age1...) to encrypt the ISO for; empty = do not upload the image"
         required: false
         default: ""
+      skip:
+        description: "diagnostics: comma list of build stages to skip (components,intl,tools,drivers); offline verify then may fail and is not fatal"
+        required: false
+        default: ""
       prerelease:
         description: "also publish the age-encrypted ISO as a temporary prerelease (pe-test-*) so a machine without GitHub sign-in can fetch it; delete it after use"
         type: boolean
@@ -89,10 +93,12 @@ jobs:
         shell: pwsh
         run: |
           $exe = if ('${{ matrix.arch }}' -eq 'x86') { 'sgbin\shellgate-i686-windows.exe' } else { 'sgbin\shellgate-x86_64-windows.exe' }
-          & editions\pe\pe-build\Build-ShellGatePE.ps1 -Arch ${{ matrix.arch }} -Out "$PWD\build\pe" -ShellGate (Resolve-Path $exe)
+          $skip = @('${{ github.event.inputs.skip }}' -split ',' | Where-Object { $_ })
+          & editions\pe\pe-build\Build-ShellGatePE.ps1 -Arch ${{ matrix.arch }} -Out "$PWD\build\pe" -ShellGate (Resolve-Path $exe) -Skip $skip
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Verify the image (offline)
         if: steps.want.outputs.go == 'true'
+        continue-on-error: ${{ github.event.inputs.skip != '' && github.event.inputs.skip != null }}
         shell: pwsh
         run: |
           & editions\pe\pe-build\Test-ShellGatePE.ps1 -Out "$PWD\build\pe" -Arch ${{ matrix.arch }}

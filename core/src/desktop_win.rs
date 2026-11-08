@@ -246,14 +246,16 @@ pub fn press_combo(keys: &[u16]) -> Result<(), String> {
     send(&v)
 }
 
-/// Any Unicode (Chinese included) as KEYEVENTF_UNICODE packets; \n becomes Enter.
+/// Text as keystrokes; \n becomes Enter. Characters the current keyboard layout can type (VkKeyScanW,
+/// at most Shift) go as real virtual-key presses with scan codes, because the legacy console host in
+/// WinPE ignores VK_PACKET (KEYEVENTF_UNICODE) input; everything else (Chinese, emoji) goes as Unicode
+/// packets, which GUI apps accept.
 pub fn type_text(text: &str) -> Result<(), String> {
     for chunk in text.split_inclusive('\n') {
         let (body, nl) = match chunk.strip_suffix('\n') { Some(b) => (b.trim_end_matches('\r'), true), None => (chunk, false) };
         let mut v = vec![];
         for u in body.encode_utf16() {
-            v.push(key_input(0, u, KEYEVENTF_UNICODE));
-            v.push(key_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+            v.extend(char_inputs(u));
         }
         for part in v.chunks(200) {
             send(part)?;
@@ -264,6 +266,26 @@ pub fn type_text(text: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The key events for one UTF-16 unit: a layout key (with Shift if needed) or a Unicode packet.
+fn char_inputs(u: u16) -> Vec<INPUT> {
+    let r = if u < 0x80 && u >= 0x20 { unsafe { VkKeyScanW(u) } } else { -1 };
+    let (vk, mods) = ((r as u16) & 0xFF, ((r as u16) >> 8) & 0xFF);
+    if r == -1 || vk == 0xFF || mods & !1 != 0 {
+        return vec![key_input(0, u, KEYEVENTF_UNICODE), key_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)];
+    }
+    let scan = |k: u16| unsafe { MapVirtualKeyW(k as u32, MAPVK_VK_TO_VSC) } as u16;
+    let mut v = vec![];
+    if mods & 1 != 0 {
+        v.push(key_input(VK_SHIFT, scan(VK_SHIFT), 0));
+    }
+    v.push(key_input(vk, scan(vk), 0));
+    v.push(key_input(vk, scan(vk), KEYEVENTF_KEYUP));
+    if mods & 1 != 0 {
+        v.push(key_input(VK_SHIFT, scan(VK_SHIFT), KEYEVENTF_KEYUP));
+    }
+    v
 }
 
 fn cursor() -> (i32, i32) {

@@ -246,7 +246,8 @@
       "redistributable": true,
       "extract": "driver-iso",
       "files": {"*": ["viostor", "vioscsi", "NetKVM", "qxldod", "Balloon"]},
-      "note": "for QEMU/KVM and Proxmox VMs; harmless on real hardware"
+      "optional": true,
+      "note": "for QEMU/KVM and Proxmox VMs; harmless on real hardware. fedorapeople.org serves a bot-check page (~4 KB) to GitHub Actions runners, so on CI this is skipped; local builds get it. Without it, put the virtio-win drivers in the stick's drivers folder (loaded at boot)."
     }
   ],
   "driver_sources": [

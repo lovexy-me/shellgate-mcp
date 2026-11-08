@@ -67,7 +67,8 @@ function Get-File($Url, $Dest, $Sha256) {
     Say "下载    $Url"
     $tmp = "$Dest.part"
     $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-    $curl = Get-Command curl.exe -EA SilentlyContinue
+    # SourceForge answers 403 to curl.exe on CI; Invoke-WebRequest works there
+    $curl = if ($Url -match '://([^/]+\.)?sourceforge\.net/') { $null } else { Get-Command curl.exe -EA SilentlyContinue }
     $h = $null
     # Large files (virtio-win ISO, ~790 MB) were silently truncated by Invoke-WebRequest on CI runners:
     # use curl.exe with resume/retry when present, and re-download up to 3 times on a pinned-hash mismatch.

@@ -87,24 +87,36 @@ pub fn feeds_interpreter(cmd: &str) -> bool {
         .any(|w| INTERPRETERS.contains(&base_name(w).as_str()))
 }
 
-/// Local script files a command would execute: `sh x.sh`, `bash -x ./y`, `. ./env`, `./run.sh`.
+/// Script file extensions a command runs directly, without naming an interpreter.
+const SCRIPT_EXTS: &[&str] = &[".sh", ".cmd", ".bat", ".ps1", ".py"];
+
+fn is_abs(p: &str) -> bool {
+    p.starts_with('/') || p.starts_with('\\') || (p.len() > 2 && p.as_bytes()[1] == b':' && (p.as_bytes()[2] == b'\\' || p.as_bytes()[2] == b'/'))
+}
+
+/// Local script files a command would execute: `sh x.sh`, `bash -x ./y`, `. ./env`, `./run.sh`,
+/// `"X:\tools\win-disk.cmd" layout ...`, `cmd /c fix.bat`, or a bare `win-disk.cmd` found on PATH.
 pub fn referenced_scripts(cmd: &str, cwd: &str, max_bytes: u64) -> Vec<(String, String)> {
     let mut found = vec![];
     for part in split_re().split(cmd) {
-        let Some(mut tokens) = shlex::split(part) else { continue };
-        while !tokens.is_empty() && (assign_re().is_match(&tokens[0]) || ["sudo", "exec", "nohup", "env"].contains(&tokens[0].as_str())) {
+        // shlex treats a backslash as an escape; Windows paths keep theirs when quoted, so protect
+        // unquoted ones by doubling them first
+        let Some(mut tokens) = shlex::split(&part.replace('\\', "\\\\")) else { continue };
+        while !tokens.is_empty() && (assign_re().is_match(&tokens[0]) || ["sudo", "exec", "nohup", "env", "call", "start"].contains(&tokens[0].to_lowercase().as_str())) {
             tokens.remove(0);
         }
         if tokens.is_empty() {
             continue;
         }
         let mut cands: Vec<String> = vec![];
-        if tokens[0].contains('/') {
+        let t0 = tokens[0].to_lowercase();
+        if tokens[0].contains('/') || tokens[0].contains('\\') || SCRIPT_EXTS.iter().any(|e| t0.ends_with(e)) {
             cands.push(tokens[0].clone());
         }
         let first = base_name(&tokens[0]);
         if INTERPRETERS.contains(&first.as_str()) || tokens[0] == "source" || tokens[0] == "." {
-            if let Some(t) = tokens[1..].iter().find(|t| !t.starts_with('-')) {
+            // cmd takes /c /k /q style switches, the others -x style ones
+            if let Some(t) = tokens[1..].iter().find(|t| !t.starts_with('-') && !(first == "cmd" && t.starts_with('/'))) {
                 cands.push(t.clone());
             }
         }
@@ -112,13 +124,20 @@ pub fn referenced_scripts(cmd: &str, cwd: &str, max_bytes: u64) -> Vec<(String, 
             let c = if let Some(rest) = c.strip_prefix('~') {
                 format!("{}{}", std::env::var("HOME").unwrap_or_default(), rest)
             } else { c };
-            let p = if c.starts_with('/') { PathBuf::from(&c) } else { Path::new(cwd).join(&c) };
-            if let Ok(m) = std::fs::metadata(&p) {
+            let mut paths = vec![if is_abs(&c) { PathBuf::from(&c) } else { Path::new(cwd).join(&c) }];
+            if !c.contains('/') && !c.contains('\\') {
+                if let Some(path) = std::env::var_os("PATH") {
+                    paths.extend(std::env::split_paths(&path).map(|d| d.join(&c)));
+                }
+            }
+            for p in paths {
+                let Ok(m) = std::fs::metadata(&p) else { continue };
                 if m.is_file() && m.len() <= max_bytes {
                     if let Ok(bytes) = std::fs::read(&p) {
                         found.push((p.to_string_lossy().to_string(), String::from_utf8_lossy(&bytes).into_owned()));
                     }
                 }
+                break;
             }
         }
     }
@@ -433,6 +452,12 @@ mod tests {
         assert!(f[0].1.contains("reboot"));
         assert!(!referenced_scripts("FOO=1 bash -e ./x.sh arg", &d, 1_000_000).is_empty());
         assert!(referenced_scripts("echo x.sh", &d, 1_000_000).is_empty());
+        // Windows-style: a .cmd run by path or by bare name on PATH, and through cmd /c
+        std::fs::write(format!("{d}/win-disk.cmd"), "@echo off\r\ndiskpart /s %TEMP%\\dp.txt\r\n").unwrap();
+        assert!(!referenced_scripts(&format!("\"{d}/win-disk.cmd\" layout 0 uefi --apply"), "/", 1_000_000).is_empty());
+        assert!(!referenced_scripts("win-disk.cmd layout 0", &d, 1_000_000).is_empty());
+        assert!(!referenced_scripts("cmd /c win-disk.cmd layout 0", &d, 1_000_000).is_empty());
+        assert!(!referenced_scripts("call win-disk.cmd boot W: S:", &d, 1_000_000).is_empty());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

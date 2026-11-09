@@ -26,7 +26,7 @@ if /i "%~1"=="fixboot" (echo 引导修复请运行 win-disk.cmd fixboot ...& exit /b 2)
 if /i "%~1"=="bcdlist" goto bcdlist
 echo 未知子命令 %1 & goto :help
 :help
-for /f "usebackq tokens=* delims=" %%L in ("%~f0") do (set "L=%%L" & if "!L:~0,4!"=="rem " if not "!L:~4,4!"=="====" echo(!L:~4!)
+for /f "usebackq tokens=* delims=" %%L in ("%~f0") do (set "L=%%L" & if "!L:~0,4!"=="rem " if not "!L:~4,4!"=="====" if not "!L:~4,4!"=="----" echo(!L:~4!)
 exit /b 0
 
 :hive

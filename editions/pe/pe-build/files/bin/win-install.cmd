@@ -25,7 +25,7 @@ if /i "%~1"=="check" goto :check
 echo Î´Öª×ÓÃüÁî %1 & goto :help
 
 :help
-for /f "usebackq tokens=* delims=" %%L in ("%~f0") do (set "L=%%L" & if "!L:~0,4!"=="rem " if not "!L:~4,4!"=="====" echo(!L:~4!)
+for /f "usebackq tokens=* delims=" %%L in ("%~f0") do (set "L=%%L" & if "!L:~0,4!"=="rem " if not "!L:~4,4!"=="====" if not "!L:~4,4!"=="----" echo(!L:~4!)
 exit /b 0
 
 rem ---------------------------------------------------------------- apply

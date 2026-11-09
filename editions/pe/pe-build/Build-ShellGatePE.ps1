@@ -376,6 +376,20 @@ try {
     # bootsect.exe (NTLDR/BOOTMGR boot sectors for XP-style and legacy repairs) ships with the ADK
     $bs = Get-ChildItem "$($adk.Root)\Deployment Tools\$Arch" -Recurse -Filter bootsect.exe -EA SilentlyContinue | Select-Object -First 1
     if ($bs) { Copy-Item $bs.FullName (Join-Path $pe 'bin\bootsect.exe') -Force; Say "bootsect.exe <- $($bs.FullName)" }
+    # WinPE (like Server Core) lacks IconCodecService.dll, which user32 needs for PNG-compressed icons:
+    # without it LoadIcon() returns NULL and Notepad++ greets you with "IconList::addIcon : LoadIcon()
+    # return null". Take the build host's copy of the matching bitness (windows-latest is 26100 too).
+    $icoTarget = Join-Path $Mount 'Windows\System32\IconCodecService.dll'
+    if (-not (Test-Path $icoTarget)) {
+        $icoSrc = if ($Arch -eq 'x86') { "$env:SystemRoot\SysWOW64\IconCodecService.dll" } else { "$env:SystemRoot\System32\IconCodecService.dll" }
+        if (Test-Path $icoSrc) { Copy-Item $icoSrc $icoTarget -Force; Say "IconCodecService.dll <- $icoSrc" }
+        else { Say "IconCodecService.dll not on the build host; Notepad++ will show a LoadIcon() warning" Yellow }
+    }
+    # Resolve-DnsName stand-in (WinPE ships neither the DnsClient module nor nslookup.exe)
+    $psMods = Join-Path $Mount 'Windows\System32\WindowsPowerShell\v1.0\Modules'
+    if ((Test-Path $psMods) -and -not (Test-Path (Join-Path $psMods 'DnsClient'))) {
+        Copy-Item (Join-Path $PSScriptRoot 'files\Modules\DnsShim') $psMods -Recurse -Force; Say 'Resolve-DnsName shim -> Modules\DnsShim'
+    }
 
     $info = [pscustomobject]@{
         built    = (Get-Date).ToString('s')

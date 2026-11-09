@@ -706,8 +706,11 @@ fn decode_mixed(b: &[u8], oem: impl Fn(&[u8]) -> String) -> String {
     let mut out = String::with_capacity(b.len() + b.len() / 2);
     for line in b.split_inclusive(|&c| c == b'\n') {
         match std::str::from_utf8(line) {
-            Ok(s) => out.push_str(s),
-            Err(_) => out.push_str(&oem(line)),
+            // Output already mixes in OEM text, so a line whose only non-ASCII is two-byte
+            // sequences is far more likely GBK that happens to parse as UTF-8 (写 = D0 B4 = "д")
+            // than Cyrillic/Latin-1 UTF-8; CJK UTF-8 always has three-byte sequences.
+            Ok(s) if line.is_ascii() || line.iter().any(|&c| c >= 0xE0) => out.push_str(s),
+            _ => out.push_str(&oem(line)),
         }
     }
     out
@@ -735,6 +738,14 @@ fn oem_decode(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_mixed_gbk_line_that_parses_as_utf8() {
+        // "写" in GBK is D0 B4, valid UTF-8 for Cyrillic "д"; "中" in GBK is D6 D0 (not UTF-8)
+        let b = [0xD6, 0xD0, b'\n', b'+', b' ', 0xD0, 0xB4, b' ', b'x', b'\n', 0xE4, 0xB8, 0xAD, b'\n', b'o', b'k', b'\n'];
+        let oem = |l: &[u8]| l.iter().map(|&c| if c >= 0x80 { '#' } else { c as char }).collect::<String>();
+        assert_eq!(decode_mixed(&b, oem), "##\n+ ## x\n中\nok\n");
+    }
 
     #[test]
     fn decode_plain_utf8() {

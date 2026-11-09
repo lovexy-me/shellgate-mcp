@@ -360,8 +360,8 @@ pub fn run_actions(actions: &[Action], map: &dyn Fn(f64, f64) -> (i32, i32)) -> 
                 }
                 Action::Key { keys, text } => {
                     press_combo(keys)?;
-                    // spelled with spaces so the output redactor leaves it alone
-                    Ok(json!({"keys": text.split('+').collect::<Vec<_>>().join(" + ")}))
+                    // not under a "keys" field: the output redactor masks any *key* field as a secret
+                    Ok(json!({"pressed": text.split('+').collect::<Vec<_>>().join(" + ")}))
                 }
                 Action::Text { text } => {
                     type_text(text)?;

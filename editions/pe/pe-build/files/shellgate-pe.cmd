@@ -25,6 +25,12 @@ if not defined STICK (
 echo ==== ShellGate PE boot %date% %time% stick=!STICK! >> "!LOG!" 2>nul
 if not exist "!LOG!" set "LOG=X:\shellgate-pe.log"
 
+rem ---- PowerShell: WinPE leaves the execution policy at Restricted, which blocks every script module
+rem      (the Resolve-DnsName shim in Modules\DnsShim included). RemoteSigned: local scripts run,
+rem      downloaded ones still need a signature.
+reg add "HKLM\SOFTWARE\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell" /v ExecutionPolicy /t REG_SZ /d RemoteSigned /f >nul 2>&1
+if exist "X:\Windows\SysWOW64" reg add "HKLM\SOFTWARE\WOW6432Node\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell" /v ExecutionPolicy /t REG_SZ /d RemoteSigned /f >nul 2>&1
+
 rem ---- PATH: tools
 set "PATH=%PATH%;%PEDIR%\bin;%PEDIR%\7zip;%PEDIR%\7zip-full;%PEDIR%\7zip-x86;%PEDIR%\wimlib;%PEDIR%\testdisk;%PEDIR%\aria2;%PEDIR%\dufs;%PEDIR%\cloudflared;%PEDIR%\notepadpp;%PEDIR%\explorerpp;%PEDIR%\smartmontools"
 setx PATH "%PATH%" /m >nul 2>&1

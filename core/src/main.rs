@@ -391,7 +391,7 @@ async fn serve(settings: config::Settings, open_admin: bool) {
         let url = format!("http://127.0.0.1:{}/#k={key}", net_settings.admin_port);
         eprintln!("admin page: {url}");
         tokio::spawn(admin::serve(net_settings.clone()));
-        if open_admin && !cfg!(target_os = "android") {
+        if open_admin && !cfg!(target_os = "android") && std::env::var_os("SHELLGATE_NO_BROWSER").is_none() {
             open_browser(&url);
         }
     }

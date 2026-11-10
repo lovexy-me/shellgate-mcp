@@ -1,7 +1,8 @@
 #!/bin/sh
 # make-inject.sh <shellgate.exe> [out.7z]
 # Builds the Ventoy injection archive (put it at <stick>/ventoy/shellgate-inject.7z and add to ventoy.json:
-#   "injection": [{ "parent": "/ISO", "archive": "/ventoy/shellgate-inject.7z" }] ).
+#   "injection": [{ "parent": "/Rescue-ISO", "archive": "/ventoy/shellgate-inject.7z" }] ).
+# On FAT32 avoid an all-upper-case 8.3 folder name such as /ISO: Ventoy reads it as /iso and the path will not match.
 # The archive holds only VentoyAutoRun.bat and shellgate\shellgate.exe: NO token. The token lives in
 # <stick>/shellgate/shellgate.env, written on your own computer with `shellgate --init-config`.
 set -eu

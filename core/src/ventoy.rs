@@ -306,7 +306,62 @@ pub fn config_set(root: &Root, content: &str) -> Result<Value, String> {
         let _ = fs::remove_file(&tmp);
         return Err(format!("write failed: {e}"));
     }
-    Ok(json!({"status": "ok", "path": platform::clean_display(&p), "bytes": content.len(), "backup": backup}))
+    let mut out = json!({"status": "ok", "path": platform::clean_display(&p), "bytes": content.len(), "backup": backup});
+    let warnings = path_warnings(&v, is_fat32(&root.fs_type));
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
+}
+
+/// A path segment that FAT stores as a bare 8.3 short name (all upper case, no long-name entry).
+/// Ventoy's GRUB reads such a name in lower case, so "/ISO/x.iso" in ventoy.json does not match a
+/// folder created as "ISO" (tested 2026-11-10, Ventoy 1.1.18: VTOY_DEFAULT_IMAGE was ignored; it worked
+/// as "/iso/x.iso" or with VTOY_DEFAULT_SEARCH_ROOT set).
+fn fat_short_upper(seg: &str) -> bool {
+    let ok = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || "_-~!#$%&'()@^{}".contains(c);
+    let (base, ext) = match seg.rsplit_once('.') {
+        Some((b, e)) => (b, Some(e)),
+        None => (seg, None),
+    };
+    !base.is_empty()
+        && base.len() <= 8
+        && base.chars().all(ok)
+        && ext.map_or(true, |e| !e.is_empty() && e.len() <= 3 && e.chars().all(ok))
+        && seg.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// Warn about paths in ventoy.json that Ventoy will probably not match on a FAT32 stick.
+pub fn path_warnings(v: &Value, fat: bool) -> Vec<String> {
+    fn walk(v: &Value, key: &str, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::String(s) if s.starts_with('/') && s.len() > 1 => out.push((key.to_string(), s.clone())),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, key, out)),
+            Value::Object(o) => o.iter().for_each(|(k, x)| walk(x, k, out)),
+            _ => {}
+        }
+    }
+    if !fat {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    walk(v, "", &mut paths);
+    let search_root = paths.iter().any(|(k, _)| k == "VTOY_DEFAULT_SEARCH_ROOT");
+    let mut out = Vec::new();
+    for (k, p) in paths {
+        if k == "VTOY_DEFAULT_SEARCH_ROOT" || (k == "VTOY_DEFAULT_IMAGE" && search_root) {
+            continue;
+        }
+        let bad: Vec<&str> = p.split('/').filter(|s| fat_short_upper(s)).collect();
+        if !bad.is_empty() {
+            out.push(format!(
+                "{k} \"{p}\": on FAT32 Ventoy sees the upper-case short name(s) {} in lower case, so this path may not match. \
+                 Write it in lower case, rename the folder to a name longer than 8 characters, or (for VTOY_DEFAULT_IMAGE) also set VTOY_DEFAULT_SEARCH_ROOT.",
+                bad.join(", ")
+            ));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- downloads
@@ -507,6 +562,20 @@ mod tests {
         assert!(download_name("https://x.org/a.iso", Some("../a.iso")).is_err());
         assert!(is_image("A.VHDX") && is_image("x.vtoy") && !is_image("x.txt"));
         assert!(valid_sha256(&"a".repeat(64)) && !valid_sha256("abc"));
+    }
+
+    #[test]
+    fn fat_case_warnings() {
+        let v = json!({"control": [{"VTOY_DEFAULT_IMAGE": "/ISO/ShellGatePE-amd64.iso"}],
+                       "injection": [{"parent": "/ISO", "archive": "/ventoy/shellgate-inject.7z"}]});
+        let w = path_warnings(&v, true);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("VTOY_DEFAULT_IMAGE") && w[1].contains("parent"));
+        assert!(path_warnings(&v, false).is_empty());
+        let ok = json!({"control": [{"VTOY_DEFAULT_SEARCH_ROOT": "/ISO"}, {"VTOY_DEFAULT_IMAGE": "/ISO/a.iso"}],
+                        "injection": [{"parent": "/iso", "archive": "/ventoy/x.7z"}, {"image": "/Rescue-ISO/Win11.iso", "archive": "/ventoy/x.7z"}]});
+        assert!(path_warnings(&ok, true).is_empty(), "{:?}", path_warnings(&ok, true));
+        assert!(fat_short_upper("WIN10.ISO") && !fat_short_upper("Win11.iso") && !fat_short_upper("REALLYLONGNAME"));
     }
 
     #[test]

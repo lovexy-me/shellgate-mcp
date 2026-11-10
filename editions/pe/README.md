@@ -86,13 +86,15 @@ tunnel_token=在 Cloudflare 后台为这个 U 盘单独建的隧道的 token
 
 | PE | 放什么 | 原理 |
 |---|---|---|
-| 官方 WinPE / Windows 安装盘（原版 ISO） | `ventoy/shellgate-inject.7z`（用 `pe-autostart/make-inject.sh shellgate.exe` 打包）+ `ventoy.json` 里 `"injection": [{"parent": "/ISO", "archive": "/ventoy/shellgate-inject.7z"}]` | Ventoy 注入插件把 `VentoyAutoRun.bat` 和 `X:\shellgate\shellgate.exe` 放进内存盘，在 winpeshl 之前执行 |
+| 官方 WinPE / Windows 安装盘（原版 ISO） | `ventoy/shellgate-inject.7z`（用 `pe-autostart/make-inject.sh shellgate.exe` 打包）+ `ventoy.json` 里 `"injection": [{"parent": "/Rescue-ISO", "archive": "/ventoy/shellgate-inject.7z"}]` | Ventoy 注入插件把 `VentoyAutoRun.bat` 和 `X:\shellgate\shellgate.exe` 放进内存盘，在 winpeshl 之前执行 |
 | FirPE | `FirPE/Hooks/onBootFinished.cmd` + `shellgate/pe-start.cmd` | FirPE 生命周期钩子，所有服务启动完后执行（钩子文件按 GBK 读，模板只用 ASCII） |
 | HotPE | `HotPE/HotPE.INI` + `shellgate/pe-start.cmd` | HotPE 启动时加载任意盘 `\HotPE\HotPE.INI`（PECMD 脚本） |
 | 微PE（WePE） | `WEPE/WEPE.INI` + `shellgate/pe-start.cmd` | 微PE 启动时 `PECMD LOAD \WEPE\WEPE.INI` |
 | 其他 PE / 手动 | `shellgate/pe-start.cmd` | 双击或在命令行运行；它在所有盘符里找 `\shellgate\shellgate.exe` + `shellgate.env` |
 
 `pe-start.cmd` 与钩子模板都要求 U 盘上有 `shellgate/shellgate.exe` 和 `shellgate/shellgate.env`。
+
+**FAT32 U 盘注意大小写**：`ISO`、`WIN10.ISO` 这类全大写、不超过 8.3 的名字，在 FAT32 上只存短名，Ventoy 读出来是小写（`iso`）。`ventoy.json` 里写 `/ISO/...` 就对不上，例如 `VTOY_DEFAULT_IMAGE` 会被忽略，倒计时结束后启动的是菜单第一项（Ventoy 1.1.18 实测）。解决：放镜像的文件夹用超过 8 个字符的名字（如 `Rescue-ISO`，大小写会原样保留），或在 `ventoy.json` 里写小写路径，或同时设 `VTOY_DEFAULT_SEARCH_ROOT`。用 `ventoy_config_set` 写配置时，FAT32 上遇到这类路径会在结果里给出 `warnings`。exFAT、NTFS 不受影响。
 
 **WinPE 里程序会自动做的事（v0.3.x）**
 

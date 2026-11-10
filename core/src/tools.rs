@@ -257,7 +257,7 @@ pub fn definitions() -> Value {
          "inputSchema": obj(json!({"path": s("Image path relative to the Ventoy partition, as shown by ventoy_list"), "confirm_code": s("One-time code from the confirmation_required answer, only after the user agreed")}), &["path"])},
         {"name": "ventoy_config_get", "description": "Read ventoy/ventoy.json from the Ventoy partition (raw text plus parsed JSON and validity).",
          "inputSchema": obj(json!({}), &[])},
-        {"name": "ventoy_config_set", "description": "Replace ventoy/ventoy.json. The content must be a valid JSON object (checked before writing); the old file is kept as ventoy.json.bak-<timestamp>. Write placeholders like <ip> back only if they are really meant literally: output is redacted.",
+        {"name": "ventoy_config_set", "description": "Replace ventoy/ventoy.json. The content must be a valid JSON object (checked before writing); the old file is kept as ventoy.json.bak-<timestamp>. On FAT32 the result may carry warnings about paths Ventoy will not match (upper-case 8.3 folder names such as /ISO are seen in lower case). Write placeholders like <ip> back only if they are really meant literally: output is redacted.",
          "inputSchema": obj(json!({"content": s("Complete new ventoy.json text")}), &["content"])},
     ]);
     #[cfg(feature = "net-tools")]

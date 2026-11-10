@@ -99,6 +99,7 @@ jobs:
     needs: apk
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: apk, path: dist }
       - name: enable KVM
@@ -112,37 +113,7 @@ jobs:
           target: google_apis
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
-          script: |
-            set -x; adb install -r dist/test-debug.apk
-            adb shell pm grant io.shellgate.app android.permission.POST_NOTIFICATIONS || true
-            adb shell am start -n io.shellgate.app/.MainActivity
-            sleep 15
-            adb forward tcp:18790 tcp:8790 && adb forward tcp:18791 tcp:8791
-            curl -sf http://127.0.0.1:18790/health
-            adb shell run-as io.shellgate.app cat files/logs/shellgate.log | tail -20
-            TOKEN=$(adb shell run-as io.shellgate.app sh -c "'grep ^token= files/shellgate.env'" | tr -d '\r' | cut -d= -f2)
-            test ${#TOKEN} -ge 32
-            KEY=$(adb shell run-as io.shellgate.app cat files/logs/admin.key | tr -d '\r')
-            curl -sf -H "x-admin-key: $KEY" http://127.0.0.1:18791/api/status | head -c 400; echo
-            mcp() { curl -sf -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' http://127.0.0.1:18790/mcp -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"; echo; }
-            mcp run_command '{"command":"id; uname -a; getprop ro.build.version.release"}' | grep -q exit_code
-            mcp run_command '{"command":"id; uname -a; getprop ro.build.version.release"}'
-            mcp lan_scan '{"targets":"10.0.2.2-3","ports":"53,5037"}'
-            mcp http_request '{"url":"https://www.cloudflare.com/cdn-cgi/trace","max_bytes":300}' | grep -q http_status
-            # cloudflared runs on Android and reaches Cloudflare: quick tunnel to the MCP port
-            LIB=$(adb shell pm dump io.shellgate.app | tr -d '\r' | sed -n 's/.*legacyNativeLibraryDir=\(.*\)/\1/p' | head -1)/x86_64
-            adb shell run-as io.shellgate.app $LIB/libcloudflared.so --version
-            adb shell "run-as io.shellgate.app sh -c 'cd files && $LIB/libcloudflared.so tunnel --no-autoupdate --url http://127.0.0.1:8790 > logs/quick.log 2>&1 &'"
-            sleep 25
-            adb shell run-as io.shellgate.app cat files/logs/quick.log | tail -15
-            URL=$(adb shell run-as io.shellgate.app cat files/logs/quick.log | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1)
-            echo "quick tunnel: $URL"
-            test -n "$URL"
-            for i in 1 2 3 4 5 6; do curl -sf "$URL/health" && break; sleep 5; done
-            curl -sf "$URL/health"
-            # restart from the admin API keeps the service alive (exec in place)
-            curl -sf -X POST -H "x-admin-key: $KEY" http://127.0.0.1:18791/api/restart; sleep 4
-            curl -sf http://127.0.0.1:18790/health
+          script: bash editions/android/ci-emulator-test.sh
 
   release:
     needs: [apk, emulator-test]

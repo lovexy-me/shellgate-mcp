@@ -121,6 +121,13 @@ pub fn referenced_scripts(cmd: &str, cwd: &str, max_bytes: u64) -> Vec<(String, 
             }
         }
         for c in cands {
+            // `win-disk.cmd help`, `x.sh --help`: asking a script for its usage doesn't run its body
+            if let Some(i) = tokens.iter().position(|t| *t == c) {
+                let rest = &tokens[i + 1..];
+                if rest.len() == 1 && ["help", "/?", "-?", "-h", "--help", "/h", "/help"].contains(&rest[0].to_lowercase().as_str()) {
+                    continue;
+                }
+            }
             let c = if let Some(rest) = c.strip_prefix('~') {
                 format!("{}{}", std::env::var("HOME").unwrap_or_default(), rest)
             } else { c };
@@ -134,6 +141,10 @@ pub fn referenced_scripts(cmd: &str, cwd: &str, max_bytes: u64) -> Vec<(String, 
                 let Ok(m) = std::fs::metadata(&p) else { continue };
                 if m.is_file() && m.len() <= max_bytes {
                     if let Ok(bytes) = std::fs::read(&p) {
+                        // a compiled program is not a script: its strings are not commands it will run
+                        if bytes.starts_with(b"\x7fELF") || bytes.starts_with(b"MZ") || bytes[..bytes.len().min(4096)].contains(&0) {
+                            break;
+                        }
                         found.push((p.to_string_lossy().to_string(), String::from_utf8_lossy(&bytes).into_owned()));
                     }
                 }
@@ -458,6 +469,11 @@ mod tests {
         assert!(!referenced_scripts("win-disk.cmd layout 0", &d, 1_000_000).is_empty());
         assert!(!referenced_scripts("cmd /c win-disk.cmd layout 0", &d, 1_000_000).is_empty());
         assert!(!referenced_scripts("call win-disk.cmd boot W: S:", &d, 1_000_000).is_empty());
+        assert!(referenced_scripts("win-disk.cmd help", &d, 1_000_000).is_empty());
+        assert!(referenced_scripts("cmd /c win-disk.cmd /?", &d, 1_000_000).is_empty());
+        assert!(!referenced_scripts("win-disk.cmd help layout", &d, 1_000_000).is_empty());
+        std::fs::write(format!("{d}/tool"), b"\x7fELF\x02\x01\x00reboot rm -rf").unwrap();
+        assert!(referenced_scripts(&format!("{d}/tool -c x"), "/", 1_000_000).is_empty());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -51,16 +51,15 @@ impl HeadTail {
     }
 }
 
-async fn collect<R: AsyncRead + Unpin>(mut r: R, limit: usize) -> HeadTail {
-    let mut ht = HeadTail::new(limit);
+/// Reads a pipe into a shared buffer, so whatever arrived is still there if we stop waiting.
+async fn collect<R: AsyncRead + Unpin>(mut r: R, ht: Arc<Mutex<HeadTail>>) {
     let mut buf = [0u8; 8192];
     loop {
         match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => ht.push(&buf[..n]),
+            Ok(n) => ht.lock().unwrap().push(&buf[..n]),
         }
     }
-    ht
 }
 
 fn command(s: &Settings, cmd: &str, cwd: &str) -> Command {
@@ -101,8 +100,10 @@ pub async fn run_cmd(s: &Settings, sem: &Semaphore, mut cmd: Command, timeout: u
         }
         _ => None,
     };
-    let out = tokio::spawn(collect(child.stdout.take().unwrap(), s.max_output_bytes));
-    let err = tokio::spawn(collect(child.stderr.take().unwrap(), s.max_output_bytes));
+    let out_buf = Arc::new(Mutex::new(HeadTail::new(s.max_output_bytes)));
+    let err_buf = Arc::new(Mutex::new(HeadTail::new(s.max_output_bytes)));
+    let out = tokio::spawn(collect(child.stdout.take().unwrap(), out_buf.clone()));
+    let err = tokio::spawn(collect(child.stderr.take().unwrap(), err_buf.clone()));
     let mut timed_out = false;
     let status = match tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await {
         Ok(st) => st.ok(),
@@ -115,23 +116,28 @@ pub async fn run_cmd(s: &Settings, sem: &Semaphore, mut cmd: Command, timeout: u
     if let Some(w) = writer {
         w.abort();
     }
-    // a grandchild that escaped the process group could hold the pipes open; don't wait forever
-    let grab = |h: tokio::task::JoinHandle<HeadTail>| async move {
-        match tokio::time::timeout(Duration::from_secs(5), h).await {
-            Ok(Ok(ht)) => ht.finish(),
-            _ => (String::new(), false),
-        }
+    // a program the command started (e.g. `start notepad`, a GUI app, a daemon) inherits the pipes
+    // and keeps them open after the command itself exits; keep what arrived and stop waiting
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    let (a, b) = tokio::join!(tokio::time::timeout_at(deadline, out), tokio::time::timeout_at(deadline, err));
+    let held_open = a.is_err() || b.is_err();
+    let take = |b: &Arc<Mutex<HeadTail>>| {
+        std::mem::replace(&mut *b.lock().unwrap(), HeadTail::new(0)).finish()
     };
-    let (stdout, t1) = grab(out).await;
-    let (stderr, t2) = grab(err).await;
-    Ok(json!({
+    let (stdout, t1) = take(&out_buf);
+    let (stderr, t2) = take(&err_buf);
+    let mut v = json!({
         "exit_code": status.and_then(|s| s.code()),
         "stdout": stdout,
         "stderr": stderr,
         "timed_out": timed_out,
         "truncated": t1 || t2,
         "duration_ms": start.elapsed().as_millis() as u64,
-    }))
+    });
+    if held_open && !timed_out {
+        v["note"] = json!("the command exited but a program it started is still running and holding its output open; output after exit is not captured (use start_job to follow a long-running program)");
+    }
+    Ok(v)
 }
 
 pub struct Job {

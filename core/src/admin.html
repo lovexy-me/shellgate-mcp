@@ -3,206 +3,333 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111317" media="(prefers-color-scheme: dark)">
 <title>ShellGate</title>
 <style>
-  :root { color-scheme: light dark; --b:#2d6cdf; --g:#1f9d55; --r:#d14343; --mut:#888; }
-  * { box-sizing: border-box; }
-  body { font: 15px/1.5 -apple-system, "Segoe UI", Roboto, system-ui, sans-serif; margin:0; padding:16px; max-width:720px; margin:0 auto; }
-  h1 { font-size:20px; margin:4px 0 2px; }
-  h2 { font-size:15px; margin:18px 0 8px; color:var(--mut); text-transform:uppercase; letter-spacing:.04em; }
-  .card { border:1px solid rgba(128,128,128,.3); border-radius:12px; padding:14px; margin:10px 0; }
-  .row { display:flex; justify-content:space-between; gap:12px; padding:4px 0; }
-  .row .k { color:var(--mut); } .row .v { text-align:right; word-break:break-all; font-variant-numeric:tabular-nums; }
-  .pill { display:inline-block; padding:1px 9px; border-radius:999px; font-size:13px; }
-  .ok { background:rgba(31,157,85,.15); color:var(--g); } .bad { background:rgba(209,67,67,.15); color:var(--r); }
-  .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; }
-  code { background:rgba(128,128,128,.14); padding:1px 5px; border-radius:5px; }
-  button { font:inherit; padding:9px 14px; border-radius:9px; border:1px solid var(--b); background:var(--b); color:#fff; cursor:pointer; }
-  button.sec { background:transparent; color:var(--b); }
-  button:disabled { opacity:.5; cursor:default; }
-  input, select { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid rgba(128,128,128,.4); background:transparent; color:inherit; width:100%; }
-  label { display:block; margin:8px 0 3px; color:var(--mut); font-size:13px; }
-  .log { background:rgba(128,128,128,.08); border-radius:8px; padding:8px; max-height:200px; overflow:auto; white-space:pre-wrap; font-size:12px; }
-  .muted { color:var(--mut); font-size:13px; }
-  .copy { float:right; font-size:12px; padding:3px 8px; }
-  .hint { font-size:12px; color:var(--mut); margin-top:3px; }
+  :root { color-scheme: light dark;
+    --bg:#f5f6f8; --card:#fff; --line:rgba(0,0,0,.08); --tx:#15171a; --mut:#6b7280;
+    --b:#2563eb; --bs:rgba(37,99,235,.10); --g:#16a34a; --gs:rgba(22,163,74,.12);
+    --y:#d97706; --ys:rgba(217,119,6,.12); --r:#dc2626; --rs:rgba(220,38,38,.10); }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg:#111317; --card:#1b1e24; --line:rgba(255,255,255,.08); --tx:#e8eaed; --mut:#9aa0a6;
+    --b:#5b8cff; --bs:rgba(91,140,255,.14); --g:#34c46a; --gs:rgba(52,196,106,.14);
+    --y:#f0a43a; --ys:rgba(240,164,58,.14); --r:#f06060; --rs:rgba(240,96,96,.14); } }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html { background:var(--bg); }
+  body { font:15px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", Roboto, system-ui, sans-serif; color:var(--tx);
+    margin:0 auto; padding:14px 14px calc(28px + env(safe-area-inset-bottom)); max-width:560px; }
+  header { display:flex; align-items:center; gap:10px; padding:4px 2px 12px; }
+  .logo { width:34px; height:34px; border-radius:10px; background:var(--b); color:#fff; display:grid; place-items:center; font-weight:700; font-size:17px; }
+  header .t { font-weight:650; font-size:18px; line-height:1.2; }
+  header .s { color:var(--mut); font-size:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; }
+  .sec-t { font-size:13px; color:var(--mut); margin:20px 4px 6px; font-weight:600; }
+  /* status hero */
+  .hero { display:flex; gap:14px; align-items:flex-start; }
+  .dot { flex:none; width:44px; height:44px; border-radius:50%; display:grid; place-items:center; background:var(--gs); }
+  .dot i { width:14px; height:14px; border-radius:50%; background:var(--g); box-shadow:0 0 0 6px var(--gs); }
+  .dot.warn { background:var(--ys); } .dot.warn i { background:var(--y); box-shadow:0 0 0 6px var(--ys); }
+  .dot.bad { background:var(--rs); } .dot.bad i { background:var(--r); box-shadow:0 0 0 6px var(--rs); }
+  .dot.off { background:rgba(128,128,128,.12); } .dot.off i { background:#9aa0a6; box-shadow:none; }
+  .hero h2 { font-size:18px; margin:2px 0 2px; }
+  .hero .d { color:var(--mut); font-size:13px; word-break:break-all; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+  .chip { font-size:12px; padding:2px 9px; border-radius:999px; background:rgba(128,128,128,.12); color:var(--mut); }
+  /* rows */
+  .kv { display:flex; align-items:center; gap:10px; padding:10px 0; border-top:1px solid var(--line); }
+  .kv:first-child { border-top:0; padding-top:0; }
+  .kv .k { color:var(--mut); font-size:13px; min-width:64px; }
+  .kv .v { flex:1; min-width:0; word-break:break-all; }
+  .mono { font-family:ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size:13px; }
+  /* buttons */
+  button { font:inherit; font-size:14px; font-weight:600; min-height:42px; padding:9px 16px; border-radius:12px; border:0; background:var(--b); color:#fff; cursor:pointer; }
+  button.ghost { background:var(--bs); color:var(--b); }
+  button.plain { flex:none; white-space:nowrap; background:transparent; color:var(--b); padding:6px 8px; min-height:34px; font-weight:500; }
+  button.danger { background:var(--rs); color:var(--r); }
+  button.sm { min-height:34px; padding:5px 12px; font-size:13px; border-radius:10px; }
+  button:disabled { opacity:.45; cursor:default; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  .btns.full button { flex:1; }
+  /* mode picker */
+  .modes { display:grid; gap:8px; }
+  .mode { display:flex; gap:12px; align-items:center; padding:12px 14px; border:1.5px solid var(--line); border-radius:14px; cursor:pointer; }
+  .mode b { display:block; font-size:15px; } .mode span { color:var(--mut); font-size:12.5px; }
+  .mode .r { flex:none; width:20px; height:20px; border-radius:50%; border:2px solid rgba(128,128,128,.5); }
+  .mode.on { border-color:var(--b); background:var(--bs); } .mode.on .r { border:6px solid var(--b); }
+  .seg { display:flex; background:rgba(128,128,128,.12); border-radius:11px; padding:3px; margin:14px 0 4px; }
+  .seg button { flex:1; background:transparent; color:var(--mut); min-height:34px; padding:4px; border-radius:9px; font-weight:500; font-size:13px; }
+  .seg button.on { background:var(--card); color:var(--tx); box-shadow:0 1px 3px rgba(0,0,0,.12); }
+  /* forms */
+  label { display:block; margin:12px 0 5px; color:var(--mut); font-size:13px; }
+  .in { display:flex; gap:6px; align-items:center; }
+  input[type=text], input[type=password], input:not([type]), select { font:inherit; font-size:15px; padding:10px 12px; border-radius:11px; border:1px solid var(--line);
+    background:rgba(128,128,128,.07); color:inherit; width:100%; min-width:0; outline:none; }
+  input:focus { border-color:var(--b); }
+  .hint { font-size:12.5px; color:var(--mut); margin-top:6px; }
+  .msg { font-size:13px; margin-top:10px; min-height:1px; }
   .err { color:var(--r); } .good { color:var(--g); }
+  .switch { position:relative; width:46px; height:28px; flex:none; }
+  .switch input { opacity:0; width:0; height:0; }
+  .switch span { position:absolute; inset:0; border-radius:999px; background:rgba(128,128,128,.35); transition:.2s; }
+  .switch span:before { content:""; position:absolute; width:22px; height:22px; left:3px; top:3px; border-radius:50%; background:#fff; transition:.2s; }
+  .switch input:checked + span { background:var(--g); } .switch input:checked + span:before { transform:translateX(18px); }
+  details > summary { list-style:none; cursor:pointer; color:var(--b); font-size:14px; font-weight:500; padding:4px 0; }
+  details > summary::-webkit-details-marker { display:none; }
+  details > summary:before { content:"▸ "; } details[open] > summary:before { content:"▾ "; }
+  pre { margin:10px 0 0; background:rgba(128,128,128,.08); border-radius:10px; padding:10px; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; font-size:12px; }
+  .toast { position:fixed; left:50%; bottom:calc(24px + env(safe-area-inset-bottom)); transform:translateX(-50%); background:rgba(20,20,20,.88); color:#fff;
+    padding:9px 16px; border-radius:999px; font-size:13px; opacity:0; transition:opacity .2s; pointer-events:none; }
+  .toast.show { opacity:1; }
+  [hidden] { display:none !important; }
 </style>
 </head>
 <body>
-<h1>ShellGate <span id="ver" class="muted"></span></h1>
-<div class="muted" id="sub">加载中…</div>
+<header>
+  <div class="logo">S</div>
+  <div><div class="t">ShellGate</div><div class="s" id="ver">加载中…</div></div>
+</header>
 
+<div id="need-key" class="card" hidden><b class="err">需要管理密钥</b><div class="hint">请从 app 打开，或用带 #k= 的链接。</div></div>
+
+<!-- status -->
 <div class="card">
-  <div class="row"><span class="k">状态</span><span class="v" id="st-net"></span></div>
-  <div class="row"><span class="k">公网地址</span><span class="v mono" id="st-pub">—</span></div>
-  <div class="row"><span class="k">局域网</span><span class="v mono" id="st-lan">—</span></div>
-  <div class="row"><span class="k">本机</span><span class="v mono" id="st-local"></span></div>
-  <div class="row"><span class="k">隧道连接</span><span class="v" id="st-tun"></span></div>
-  <div class="row"><span class="k">运行时长</span><span class="v" id="st-up"></span></div>
-</div>
-
-<h2>给 AI / MCP 客户端</h2>
-<div class="card">
-  <button class="copy sec" onclick="copyCfg()">复制</button>
-  <div class="muted">把下面这段填进支持 MCP 的客户端（含访问令牌，请勿外传）：</div>
-  <pre class="log mono" id="cfg">需要管理密钥才能显示令牌</pre>
-</div>
-
-<h2>Cloudflare 隧道</h2>
-<div class="card" id="cf-card">
-  <div class="muted">用你自己的 Cloudflare API 令牌，自动建好隧道和域名，让任何地方都能连上这台设备。令牌只用这一次，默认不保存。</div>
-  <label>Cloudflare API 令牌 <span class="hint">需要 区域:DNS 编辑 + 账户:Cloudflare Tunnel 编辑 权限</span></label>
-  <div style="display:flex;gap:6px"><input id="cf-token" type="password" autocomplete="off" placeholder="API Token" style="flex:1"><button type="button" class="sec" onclick="peek('cf-token',this)">显示</button></div>
-  <label>公网域名 <span class="hint">该域名须已托管在这个 Cloudflare 账户</span></label>
-  <input id="cf-host" autocomplete="off" placeholder="pc.yourdomain.com">
-  <div id="cf-acct"></div>
-  <label style="display:inline-flex;align-items:center;gap:6px;width:auto;margin-top:10px"><input type="checkbox" id="cf-save" style="width:auto"> 保存令牌以便以后修改</label>
-  <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-    <button class="sec" onclick="cf('plan')">检查令牌 / 列出域名</button>
-    <button onclick="cf('create')">建立隧道</button>
-    <button class="sec" style="border-color:var(--r);color:var(--r)" onclick="cf('remove')">删除隧道</button>
+  <div class="hero">
+    <div class="dot off" id="dot"><i></i></div>
+    <div style="min-width:0;flex:1">
+      <h2 id="st-title">连接中…</h2>
+      <div class="d" id="st-desc"></div>
+      <div class="chips" id="chips"></div>
+    </div>
   </div>
-  <div id="cf-out" class="hint" style="margin-top:10px"></div>
+  <div class="msg" id="s-out"></div>
 </div>
 
-<h2>设置</h2>
+<!-- AI client -->
+<div class="sec-t">连接 AI</div>
 <div class="card">
-  <label>网络模式</label>
-  <select id="s-net">
-    <option value="local">local — 只听本机（配合隧道/SSH）</option>
-    <option value="lan">lan — 同局域网直连</option>
-    <option value="tunnel">tunnel — Cloudflare 隧道</option>
-  </select>
-  <div id="tun-fields" style="display:none">
-    <label style="margin-top:10px">已有隧道令牌（eyJ 开头，可留空不改）</label>
-    <div style="display:flex;gap:6px"><input id="s-tt" type="password" autocomplete="off" placeholder="在 Cloudflare 后台「隧道 → 安装连接器」里复制" style="flex:1"><button type="button" class="sec" onclick="peek('s-tt',this)">显示</button></div>
-    <div class="hint" id="s-tt-state"></div>
-    <label style="margin-top:10px">公网地址</label>
-    <input id="s-pu" placeholder="https://xxx.你的域名">
-    <div class="hint">后台给这条隧道加「公共主机名」，服务填 http://localhost:8790（本机端口）。</div>
+  <div class="kv"><span class="k">地址</span><span class="v mono" id="st-url">—</span><button class="plain sm" onclick="copyText(URLV,'地址已复制')">复制</button></div>
+  <div class="kv"><span class="k">访问令牌</span><span class="v mono" id="st-tok">—</span><button class="plain sm" id="tok-btn" onclick="toggleTok()">显示</button></div>
+  <div class="btns full">
+    <button onclick="copyCfg()">复制客户端配置</button>
   </div>
-  <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+  <div class="hint">配置里含访问令牌，只粘贴到你自己的 AI 客户端。截图或贴日志前不要点「显示」。</div>
+  <pre class="mono" id="cfg" hidden></pre>
+  <div class="btns"><button class="plain sm" onclick="newToken()">换新访问令牌</button></div>
+</div>
+
+<!-- network -->
+<div class="sec-t">网络</div>
+<div class="card">
+  <div class="modes" id="modes">
+    <div class="mode" data-m="local"><div class="r"></div><div><b>仅本机</b><span>最安全，只有这台设备自己能连</span></div></div>
+    <div class="mode" data-m="lan"><div class="r"></div><div><b>局域网</b><span>同一 Wi-Fi 下的电脑直接连</span></div></div>
+    <div class="mode" data-m="tunnel"><div class="r"></div><div><b>外网（Cloudflare 隧道）</b><span>在任何地方都能连，需要自己的域名</span></div></div>
+  </div>
+
+  <div id="tun-fields" hidden>
+    <div class="seg"><button id="tab-have" class="on" onclick="tab('have')">我已有隧道</button><button id="tab-auto" onclick="tab('auto')">帮我自动建</button></div>
+
+    <div id="pane-have">
+      <label>隧道令牌（eyJ 开头）</label>
+      <div class="in"><input id="s-tt" type="password" autocomplete="off" placeholder="Cloudflare 后台 → 隧道 → 安装连接器里复制"><button class="plain sm" onclick="peek('s-tt',this)">显示</button></div>
+      <div class="hint" id="s-tt-state"></div>
+      <label>公网地址</label>
+      <input id="s-pu" autocomplete="off" placeholder="https://xxx.你的域名">
+      <div class="hint">在隧道的「公共主机名」里，服务填 <span class="mono">http://127.0.0.1:<span id="port">8790</span></span></div>
+    </div>
+
+    <div id="pane-auto" hidden>
+      <label>Cloudflare API 令牌</label>
+      <div class="in"><input id="cf-token" type="password" autocomplete="off" placeholder="需要 DNS 编辑 + Tunnel 编辑权限"><button class="plain sm" onclick="peek('cf-token',this)">显示</button></div>
+      <label>公网域名</label>
+      <input id="cf-host" autocomplete="off" placeholder="phone.你的域名.com">
+      <div id="cf-acct"></div>
+      <label style="display:flex;align-items:center;gap:8px;color:var(--tx)"><input type="checkbox" id="cf-save" style="width:auto"> 保存 API 令牌，以后可一键删除隧道</label>
+      <div class="btns">
+        <button class="ghost" onclick="cf('plan')">检查令牌</button>
+        <button onclick="cf('create')">建立隧道</button>
+        <button class="danger" onclick="if(confirm('删除这条隧道和它的域名记录？')) cf('remove')">删除隧道</button>
+      </div>
+      <div class="msg" id="cf-out"></div>
+    </div>
+  </div>
+
+  <div class="btns full" id="save-bar" hidden>
+    <button class="ghost" onclick="discard()">取消</button>
     <button onclick="saveNet()">保存并重启</button>
-    <button class="sec" onclick="doRestart()">重启服务</button>
-    <button class="sec" onclick="newToken()">换新访问令牌</button>
   </div>
-  <div id="s-out" class="hint" style="margin-top:8px"></div>
 </div>
 
-<div id="app-sec" style="display:none">
-<h2>手机</h2>
+<!-- phone -->
+<div id="app-sec" hidden>
+  <div class="sec-t">手机</div>
+  <div class="card">
+    <div class="kv"><span class="v">开机自启</span><label class="switch"><input type="checkbox" id="a-auto" onchange="SGApp.setAutostart(this.checked)"><span></span></label></div>
+    <div class="kv"><span class="v">后台常驻<div class="hint" id="a-batt-h"></div></span><button class="ghost sm" id="a-batt" onclick="SGApp.requestBatteryExempt()">去设置</button></div>
+  </div>
+</div>
+
+<!-- logs & maintenance -->
+<div class="sec-t">维护</div>
 <div class="card">
-  <div class="row"><span class="k">开机自启</span><span class="v"><input type="checkbox" id="a-auto" style="width:auto" onchange="SGApp.setAutostart(this.checked)"></span></div>
-  <div class="row"><span class="k">电池优化</span><span class="v" id="a-batt"></span></div>
-  <div class="hint">要让手机息屏后也一直在线：允许不受电池优化限制；国产系统还要在「应用启动管理 / 后台运行」里放行 ShellGate。</div>
-  <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-    <button class="sec" onclick="SGApp.requestBatteryExempt()">取消电池优化</button>
-    <button class="sec" style="border-color:var(--r);color:var(--r)" onclick="if(confirm('停止 ShellGate？停止后远程就连不上了。')) SGApp.stop()">停止服务</button>
+  <details id="logbox">
+    <summary>运行日志</summary>
+    <pre class="mono" id="events">（暂无）</pre>
+    <div class="btns"><button class="ghost sm" onclick="copyText($('events').textContent,'日志已复制（不含令牌）')">复制日志</button></div>
+  </details>
+  <div class="btns full">
+    <button class="ghost" onclick="doRestart()">重启服务</button>
+    <button class="danger" id="stop-btn" hidden onclick="if(confirm('停止 ShellGate？停止后远程就连不上了。')) SGApp.stop()">停止服务</button>
   </div>
 </div>
-</div>
 
-<h2>日志</h2>
-<div class="card"><div class="log mono" id="events"></div></div>
+<div class="toast" id="toast"></div>
 
 <script>
 let KEY = new URLSearchParams(location.hash.slice(1)).get('k') || sessionStorage.getItem('sgk') || '';
 if (KEY) { sessionStorage.setItem('sgk', KEY); history.replaceState(null,'',location.pathname); }
-let CFG = null, NET_DIRTY = false, RESTART_AT = 0;
+let CFG = null, TOK = '', URLV = '', CUR = 'local', SEL = null, NET_DIRTY = false, RESTART_AT = 0, TOK_SHOWN = false;
 const $ = id => document.getElementById(id);
 function hdr(extra) { const h = {'content-type':'application/json'}; if (KEY) h['x-admin-key'] = KEY; return Object.assign(h, extra||{}); }
 async function api(path, opt) { const r = await fetch(path, Object.assign({headers: hdr(opt&&opt.reveal?{'x-reveal':'1'}:{})}, opt||{})); return r.json(); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
-function esc(s){ return (s==null?'':String(s)); }
+// Turn cloudflared's last error into one plain sentence.
+function why(e){
+  if(!e) return '';
+  if(/\[::1\]:53|127\.0\.0\.1:53|lookup .*(refused|no such host)|DNS/i.test(e)) return '查不到 Cloudflare 的地址（DNS 不通）。检查网络，或更新到最新版。';
+  if(/Unauthorized|invalid.*token|token.*invalid|not.*valid.*tunnel/i.test(e)) return '隧道令牌无效，请重新复制粘贴。';
+  if(/timeout|i\/o timeout|deadline/i.test(e)) return '连 Cloudflare 超时，网络可能拦了 7844 端口。';
+  return e.length > 140 ? e.slice(0,140)+'…' : e;
+}
+
+function status(d){
+  const t = d.tunnel || {}, n = d.net;
+  let cls='', title='', desc='';
+  if (n==='tunnel') {
+    if (t.running && t.connections>0) { title='在线 · 外网可连'; desc=d.public_url||''; }
+    else if (t.running) { cls='warn'; title='正在连接隧道…'; desc=why(t.last_error) || '通常十几秒内连上'; }
+    else { cls='bad'; title='隧道没连上'; desc=why(t.last_error) || '隧道程序没在运行'; }
+  } else if (n==='lan') { title='在线 · 局域网'; desc=d.lan_url || d.lan_ip || ''; }
+  else { title='在线 · 仅本机'; desc=d.local_url; }
+  $('dot').className='dot '+cls; $('st-title').textContent=title; $('st-desc').textContent=desc;
+  const chips=['运行 '+fmtDur(d.uptime_s)];
+  if (d.lan_ip) chips.push('局域网 '+d.lan_ip);
+  if (n==='tunnel' && t.connections>0) chips.push(t.connections+' 条隧道连接');
+  if (t.restarts>0 && n==='tunnel') chips.push('隧道重启 '+t.restarts+' 次');
+  $('chips').innerHTML = chips.map(c=>'<span class="chip">'+esc(c)+'</span>').join('');
+}
+
 async function load() {
   let d;
-  try { d = await api('/api/status', {reveal:true}); } catch(e){ $('sub').textContent = RESTART_AT ? '重启中…' : '连接失败'; return; }
-  if (d.error) { $('sub').innerHTML='<span class="err">需要管理密钥（打开 app 或用带 #k= 的链接）</span>'; return; }
-  $('ver').textContent = 'v'+d.version+' · '+d.edition;
-  $('sub').textContent = d.os+'/'+d.arch;
-  const net = d.net;
-  $('st-net').innerHTML = '<span class="pill ok">'+net+'</span>';
-  $('st-pub').textContent = d.public_url || '—';
-  $('st-lan').textContent = d.lan_url || (d.lan_ip? d.lan_ip : '—');
-  $('st-local').textContent = d.local_url;
-  const t = d.tunnel;
-  $('st-tun').innerHTML = net!=='tunnel' ? '<span class="muted">未启用</span>'
-     : (t.running && t.connections>0 ? '<span class="pill ok">已连接 ('+t.connections+')</span>'
-        : (t.running ? '<span class="pill">连接中…</span>' : '<span class="pill bad">未运行</span>'))
-       + (t.last_error? '<div class="hint err">'+esc(t.last_error)+'</div>':'');
-  $('st-up').textContent = fmtDur(d.uptime_s);
-  if (!NET_DIRTY) { $('s-net').value = net; showTun(); }
-  if (document.activeElement !== $('s-pu') && !$('s-pu').dataset.dirty) $('s-pu').value = (d.public_url || '').replace(/\/mcp$/, '');
-  $('s-tt-state').textContent = (t && t.configured) ? '已保存过一个隧道令牌（为安全不显示）；留空就继续用它，填新的会替换。' : '还没有保存隧道令牌。';
+  try { d = await api('/api/status', {reveal:true}); }
+  catch(e){ $('st-title').textContent = RESTART_AT ? '重启中…' : '连不上服务'; $('dot').className='dot '+(RESTART_AT?'warn':'bad'); return; }
+  if (d.error) { $('need-key').hidden=false; return; }
+  $('need-key').hidden=true;
+  $('ver').textContent = 'v'+d.version+' · '+d.edition+' · '+d.os+'/'+d.arch;
+  CUR = d.net; status(d);
+  const m = /:(\d+)\/mcp$/.exec(d.local_url||''); if (m) $('port').textContent = m[1];
+  URLV = d.public_url || d.lan_url || d.local_url || '';
+  $('st-url').textContent = URLV || '—';
+  if (d.client_config) {
+    CFG = JSON.stringify(d.client_config, null, 2);
+    try { const a = Object.values(d.client_config.mcpServers)[0].headers.Authorization; TOK = a.replace(/^Bearer\s+/,''); } catch(e) { TOK=''; }
+  }
+  showTok();
+  if (!NET_DIRTY) { SEL = CUR; paint(); }
+  const pu = $('s-pu'); if (document.activeElement !== pu && !pu.dataset.dirty) pu.value = (d.public_url || '').replace(/\/mcp$/, '');
+  $('s-tt-state').textContent = (d.tunnel && d.tunnel.configured) ? '已保存过隧道令牌（不显示）。留空继续用它，填新的会替换。' : '还没有保存隧道令牌。';
   if (RESTART_AT) {
     const since = (Date.now() - RESTART_AT) / 1000;
-    if (d.uptime_s <= since + 1) { flash('s-out', '已重启，当前模式：' + net, 'good'); RESTART_AT = 0; }
-    else if (since > 30) { flash('s-out', '30 秒内没有重启成功，请看下面的日志', 'err'); RESTART_AT = 0; }
+    if (d.uptime_s <= since + 1) { flash('s-out', '已重启，当前：'+modeName(CUR), 'good'); RESTART_AT = 0; }
+    else if (since > 30) { flash('s-out', '30 秒内没有重启成功，请看运行日志', 'err'); RESTART_AT = 0; $('logbox').open = true; }
   }
-  if (d.client_config) { CFG = JSON.stringify(d.client_config, null, 2); $('cfg').textContent = CFG; }
-  $('events').textContent = (d.events||[]).map(e => new Date(e.t*1000).toLocaleTimeString()+'  '+e.m).join('\n') || '（暂无）';
-  if (d.tunnel_log && d.tunnel_log.length) $('events').textContent += '\n\n--- cloudflared ---\n' + d.tunnel_log.join('\n');
-  $('events').scrollTop = $('events').scrollHeight;
+  let log = (d.events||[]).map(e => new Date(e.t*1000).toLocaleTimeString()+'  '+e.m).join('\n') || '（暂无）';
+  if (d.tunnel_log && d.tunnel_log.length) log += '\n\n--- cloudflared ---\n' + d.tunnel_log.join('\n');
+  const ev = $('events'), atEnd = ev.scrollTop + ev.clientHeight >= ev.scrollHeight - 20;
+  ev.textContent = log; if (atEnd) ev.scrollTop = ev.scrollHeight;
 }
+function modeName(m){ return {local:'仅本机', lan:'局域网', tunnel:'外网隧道'}[m] || m; }
+function showTok(){
+  $('st-tok').textContent = !TOK ? '—' : (TOK_SHOWN ? TOK : '•••••••• '+TOK.slice(-4));
+  $('tok-btn').textContent = TOK_SHOWN ? '隐藏' : '显示';
+  $('cfg').hidden = !TOK_SHOWN; if (TOK_SHOWN && CFG) $('cfg').textContent = CFG;
+}
+function toggleTok(){ TOK_SHOWN = !TOK_SHOWN; showTok(); }
+function paint(){
+  document.querySelectorAll('.mode').forEach(e => e.classList.toggle('on', e.dataset.m === SEL));
+  $('tun-fields').hidden = SEL !== 'tunnel';
+  $('save-bar').hidden = !NET_DIRTY;
+}
+function pick(m){ SEL = m; NET_DIRTY = (m !== CUR) || !!$('s-tt').value || !!$('s-pu').dataset.dirty; paint(); }
+function discard(){ NET_DIRTY=false; $('s-tt').value=''; delete $('s-pu').dataset.dirty; SEL=CUR; paint(); load(); }
+function tab(w){ $('tab-have').classList.toggle('on', w==='have'); $('tab-auto').classList.toggle('on', w==='auto');
+  $('pane-have').hidden = w!=='have'; $('pane-auto').hidden = w!=='auto'; $('save-bar').hidden = w==='auto' || !NET_DIRTY; }
+
 function appSec(){
   if(!window.SGApp) return;
-  $('app-sec').style.display='';
+  $('app-sec').hidden=false; $('stop-btn').hidden=false;
   $('a-auto').checked = SGApp.autostart();
-  $('a-batt').innerHTML = SGApp.batteryExempt() ? '<span class="pill ok">不受限制</span>' : '<span class="pill bad">受限制</span>';
+  const ok = SGApp.batteryExempt();
+  $('a-batt').hidden = ok;
+  $('a-batt-h').innerHTML = ok ? '<span class="good">已允许，息屏也在线</span>'
+    : '<span class="err">受电池优化限制，息屏后可能掉线</span>；国产系统还要在「应用启动管理」里放行';
 }
 function fmtDur(s){ s=s|0; const d=s/86400|0,h=(s%86400)/3600|0,m=(s%3600)/60|0; return d?d+'天'+h+'时':(h?h+'时'+m+'分':m+'分'); }
-function copyCfg(){ if(CFG) navigator.clipboard.writeText(CFG).then(()=>flash('cf-out','已复制','good')); }
-function flash(id,msg,cls){ const e=$(id); e.textContent=msg; e.className='hint '+(cls||''); }
+let TT=0; function toast(m){ const e=$('toast'); e.textContent=m; e.classList.add('show'); clearTimeout(TT); TT=setTimeout(()=>e.classList.remove('show'),1600); }
+function copyText(s,m){ if(!s) return; (navigator.clipboard ? navigator.clipboard.writeText(s) : Promise.reject()).then(()=>toast(m||'已复制'), ()=>{ const t=document.createElement('textarea'); t.value=s; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); toast(m||'已复制'); }); }
+function copyCfg(){ if(CFG) copyText(CFG,'配置已复制（含令牌）'); }
+function flash(id,msg,cls){ const e=$(id); e.textContent=msg; e.className='msg '+(cls||''); }
 
 async function cf(action){
   const token=$('cf-token').value.trim(), host=$('cf-host').value.trim();
-  if(!token){ flash('cf-out','请填 API 令牌','err'); return; }
-  if(action!=='plan' && !host){ flash('cf-out','请填公网域名','err'); return; }
+  if(!token){ flash('cf-out','先填 Cloudflare API 令牌','err'); return; }
+  if(action==='create' && !host){ flash('cf-out','先填公网域名','err'); return; }
   flash('cf-out','处理中…');
   const acctSel = $('cf-acct').querySelector('select');
   const body = {action, api_token:token, hostname:host, save_token:$('cf-save').checked};
   if (acctSel && acctSel.value) body.account_id = acctSel.value;
-  const d = await api('/api/cloudflare', {method:'POST', body:JSON.stringify(body)});
+  let d; try { d = await api('/api/cloudflare', {method:'POST', body:JSON.stringify(body)}); } catch(e){ flash('cf-out','请求失败','err'); return; }
   if(d.status==='error' || d.error){ flash('cf-out', d.error||'失败','err'); return; }
   if(action==='plan'){
-    let html = '令牌有效 · 账户：'+esc(d.account&&d.account.name);
-    if(d.zones && d.zones.length>1){
-      html += '<div style="margin-top:6px">可用域名：'+d.zones.map(z=>'<code>'+esc(z.name)+'</code>').join(' ')+'</div>';
-    }
-    html += '<div class="good" style="margin-top:6px">'+esc(d.next)+'</div>';
-    $('cf-out').innerHTML = html; $('cf-out').className='hint';
+    let html = '<span class="good">令牌有效</span> · 账户：'+esc(d.account&&d.account.name);
+    if(d.zones && d.zones.length) html += '<div style="margin-top:6px">可用域名：'+d.zones.map(z=>'<span class="mono">'+esc(z.name)+'</span>').join('、')+'</div>';
+    if(d.next) html += '<div class="hint">'+esc(d.next)+'</div>';
+    $('cf-out').innerHTML = html; $('cf-out').className='msg';
     return;
   }
-  if(action==='remove'){ flash('cf-out','已删除隧道，已切回 local；正在重启…','good'); await restartNow(); return; }
-  $('cf-out').innerHTML = '<span class="good">隧道已建立：</span><code>'+esc(d.mcp_url)+'</code><div>正在重启生效…</div>';
+  if(action==='remove'){ flash('cf-out','已删除隧道，切回仅本机，正在重启…','good'); await restartNow(); return; }
+  $('cf-out').innerHTML = '<span class="good">隧道已建立：</span><span class="mono">'+esc(d.mcp_url)+'</span><div class="hint">正在重启生效…</div>';
   await restartNow();
 }
 async function saveNet(){
-  const b = {net:$('s-net').value};
-  if (b.net==='tunnel') { const t=$('s-tt').value.trim(), u=$('s-pu').value.trim(); if(t) b.tunnel_token=t; if(u) b.public_url=u; }
-  const d = await api('/api/settings',{method:'POST',body:JSON.stringify(b)});
-  $('s-tt').value='';
+  const b = {net:SEL};
+  if (SEL==='tunnel') { const t=$('s-tt').value.trim(), u=$('s-pu').value.trim();
+    if(t && !/^eyJ/.test(t)){ flash('s-out','隧道令牌应以 eyJ 开头，请检查','err'); return; }
+    if(u && !/^https:\/\//.test(u)){ flash('s-out','公网地址要以 https:// 开头','err'); return; }
+    if(t) b.tunnel_token=t; if(u) b.public_url=u; }
+  let d; try { d = await api('/api/settings',{method:'POST',body:JSON.stringify(b)}); } catch(e){ flash('s-out','保存失败','err'); return; }
   if(d.error||d.status==='error'){ flash('s-out',d.error||'失败','err'); return; }
-  NET_DIRTY = false; delete $('s-pu').dataset.dirty;
-  flash('s-out','已保存，重启中…','good'); await restartNow();
+  $('s-tt').value=''; NET_DIRTY = false; delete $('s-pu').dataset.dirty; paint();
+  flash('s-out','已保存，正在重启…'); await restartNow();
 }
 async function restartNow(){
-  RESTART_AT = Date.now();
+  RESTART_AT = Date.now(); $('st-title').textContent='重启中…'; $('dot').className='dot warn';
   try { await api('/api/restart',{method:'POST'}); } catch(e) {}
   setTimeout(load,2500);
 }
-async function doRestart(){ flash('s-out','重启中…'); await restartNow(); }
+async function doRestart(){ flash('s-out','正在重启…'); await restartNow(); }
 async function newToken(){
-  if(!confirm('换一个新的访问令牌？旧令牌立刻作废，所有 AI 客户端都要改成新配置。')) return;
+  if(!confirm('换一个新的访问令牌？旧令牌立刻作废，所有 AI 客户端都要换成新配置。')) return;
   const d = await api('/api/settings',{method:'POST',body:JSON.stringify({new_token:true})});
   if(d.error||d.status==='error'){ flash('s-out',d.error||'失败','err'); return; }
-  flash('s-out','已换新令牌，重启中…（重启后在上面复制新配置）','good'); await restartNow();
+  TOK_SHOWN=false; flash('s-out','已换新令牌，正在重启…重启后重新复制配置','good'); await restartNow();
 }
 function peek(id,b){ const e=$(id); const show=e.type==='password'; e.type=show?'text':'password'; b.textContent=show?'隐藏':'显示'; }
-function showTun(){ $('tun-fields').style.display = $('s-net').value==='tunnel' ? '' : 'none'; }
-$('s-pu').addEventListener('input',()=>{ $('s-pu').dataset.dirty='1'; NET_DIRTY = true; });
-$('s-net').addEventListener('change',()=>{ NET_DIRTY = true; showTun(); });
+document.querySelectorAll('.mode').forEach(e => e.addEventListener('click', () => pick(e.dataset.m)));
+$('s-pu').addEventListener('input',()=>{ $('s-pu').dataset.dirty='1'; pick(SEL); });
+$('s-tt').addEventListener('input',()=>pick(SEL));
 ['cf-token','cf-host'].forEach(id => $(id).addEventListener('input', () => { if ($('cf-out').classList.contains('err')) flash('cf-out',''); }));
 load(); appSec(); setInterval(()=>{load(); appSec();}, 5000);
 </script>

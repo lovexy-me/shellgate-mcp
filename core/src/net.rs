@@ -51,7 +51,25 @@ pub async fn supervise_cloudflared(s: Settings) {
             Err(_) => (Stdio::null(), Stdio::null()),
         };
         let mut c = platform::new_command(&bin);
-        c.args(["tunnel", "--no-autoupdate", "run"])
+        c.args(["tunnel", "--no-autoupdate"]);
+        if no_system_resolv_conf() {
+            // Android has no /etc/resolv.conf, so Go's built-in resolver asks [::1]:53 and edge
+            // discovery fails ("lookup _v2-origintunneld._tcp.argotunnel.com on [::1]:53 ...
+            // connection refused"). Use the platform resolver (cgo/bionic) for cloudflared's own
+            // lookups, and resolve the edge here (libc getaddrinfo works) and hand cloudflared
+            // the addresses, so it does not need the SRV lookup at all.
+            c.env("GODEBUG", "netdns=cgo");
+            let edges = resolve_edges().await;
+            if edges.is_empty() {
+                ev("tunnel mode: could not resolve region1/region2.v2.argotunnel.com here either; check the phone's network");
+            } else {
+                ev(format!("tunnel mode: no /etc/resolv.conf, giving cloudflared {} edge address(es)", edges.len()));
+            }
+            for e in &edges {
+                c.arg("--edge").arg(e);
+            }
+        }
+        c.arg("run")
             .env("TUNNEL_TOKEN", &s.tunnel_token)
             .stdin(Stdio::null()).stdout(out).stderr(err);
         let started = std::time::Instant::now();
@@ -74,6 +92,27 @@ pub async fn supervise_cloudflared(s: Settings) {
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(60);
     }
+}
+
+/// True where Go programs cannot find a DNS server on their own (Android: no /etc/resolv.conf).
+fn no_system_resolv_conf() -> bool {
+    cfg!(target_os = "android") || (cfg!(unix) && !Path::new("/etc/resolv.conf").exists())
+}
+
+/// Cloudflare tunnel edge addresses (port 7844) resolved with the platform resolver, IPv4 first.
+async fn resolve_edges() -> Vec<String> {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for h in ["region1.v2.argotunnel.com:7844", "region2.v2.argotunnel.com:7844"] {
+        if let Ok(Ok(addrs)) = tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host(h)).await {
+            for a in addrs.take(4) {
+                let s = a.to_string();
+                if a.is_ipv4() { if !v4.contains(&s) { v4.push(s) } } else if !v6.contains(&s) { v6.push(s) }
+            }
+        }
+    }
+    v4.extend(v6);
+    v4
 }
 
 /// Tunnel state read from the tail of cloudflared.log: connections registered since the last

@@ -46,6 +46,10 @@ pub const EDITION: &str = if cfg!(feature = "edition-openwrt") {
     "pe"
 } else if cfg!(feature = "edition-linux") {
     "linux"
+} else if cfg!(feature = "edition-android") {
+    "android"
+} else if cfg!(feature = "edition-portable") {
+    "portable"
 } else {
     "full"
 };
@@ -210,7 +214,8 @@ pub fn definitions() -> Value {
     let i = |d: &str| json!({"type": "integer", "description": d});
     let b = |d: &str| json!({"type": "boolean", "description": d});
     let confirm = s("One-time code from a previous confirmation_required answer, only after the user agreed");
-    json!([
+    #[allow(unused_mut)]
+    let mut v = json!([
         {"name": "run_command", "description": "Run a shell command (Linux: /bin/sh -c; Windows: cmd /C, or PowerShell when SHELLGATE_SHELL=powershell) and wait for it. Returns exit_code, stdout, stderr. timeout in seconds (default 60, max 600); for longer work use start_job. stdin (optional) is written to the command's standard input, e.g. command=\"ssh host sh -s\" with the script body in stdin.",
          "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory (default: home)"), "timeout": i("Seconds"), "stdin": s("Text written to the command's stdin"), "confirm_code": confirm.clone()}), &["command"])},
         {"name": "run_script", "description": "Run a multi-line script and wait for it (Linux: sh, bash, python3, ash; Windows: powershell, pwsh, cmd, python; with no interpreter given and no working PowerShell, as in most WinPE, cmd is used and the result carries a note). The script is written to a private temp file (removed afterwards) and run as `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as run_command. Returns exit_code, stdout, stderr.",
@@ -254,7 +259,25 @@ pub fn definitions() -> Value {
          "inputSchema": obj(json!({}), &[])},
         {"name": "ventoy_config_set", "description": "Replace ventoy/ventoy.json. The content must be a valid JSON object (checked before writing); the old file is kept as ventoy.json.bak-<timestamp>. Write placeholders like <ip> back only if they are really meant literally: output is redacted.",
          "inputSchema": obj(json!({"content": s("Complete new ventoy.json text")}), &["content"])},
-    ])
+    ]);
+    #[cfg(feature = "net-tools")]
+    if let Value::Array(a) = &mut v {
+        a.extend([
+        json!({"name": "lan_scan", "description": "Find hosts on the local network by a TCP connect sweep (no root needed). targets: CIDR like 192.168.1.0/24, a range 192.168.1.10-40, or one address; defaults to the /24 around each local address. ports defaults to a common set (ssh, http(s), smb, rdp, adb 5555, vnc, rtsp...). Returns each responding host with its open ports and their likely service. Useful from a phone or WinPE to locate a TV (adb 5555) or PC (smb/rdp) on the far LAN.",
+         "inputSchema": obj(json!({"targets": s("CIDR, range or address; comma-separate several (optional)"), "ports": s("comma-separated ports (optional)"), "timeout_ms": i("per-connection timeout, default 600"), "concurrency": i("parallel connections, default 256")}), &[])}),
+        json!({"name": "http_request", "description": "Make an HTTP(S) request from this host and return status, headers and body (text, or base64 for binary). For talking to a device's web API/UI on the far LAN (router, camera, TV). insecure=true skips TLS verification for self-signed certs. Body is capped (default 256 KB).",
+         "inputSchema": obj(json!({"url": s("http:// or https:// URL"), "method": s("GET (default), POST, PUT, ..."), "headers": json!({"type": "object", "description": "request headers (optional)", "additionalProperties": {"type": "string"}}), "body": s("request body (optional)"), "insecure": b("skip TLS certificate verification (self-signed devices)"), "timeout_s": i("default 30, max 120"), "max_bytes": i("max body bytes, default 262144")}), &["url"])}),
+        ]);
+    }
+    #[cfg(feature = "admin")]
+    if let Value::Array(a) = &mut v {
+        a.extend([
+        json!({"name": "connection_info", "description": "This server's own connection details for an MCP client: the public tunnel URL (if set), the LAN address, the edition, tunnel status and uptime. Does not include the token.", "inputSchema": obj(json!({}), &[])}),
+        json!({"name": "cloudflare_setup", "description": "Set up (or tear down) a Cloudflare named tunnel for this host from the user's own Cloudflare API token, and switch this server to tunnel mode. Steps: verify the token, pick the account and the zone for the hostname, create a tunnel, add a DNS CNAME and the ingress route to http://127.0.0.1:<port>, write tunnel_token and public_url into the config, and start cloudflared. The API token is used only for this call and is not stored unless save_token=true. action: plan (check token, list zones/accounts), create (do it), remove (delete the tunnel and DNS record).",
+         "inputSchema": obj(json!({"action": s("plan | create | remove"), "api_token": s("Cloudflare API token (Zone:DNS edit + Account:Cloudflare Tunnel edit). Not stored unless save_token=true"), "hostname": s("public hostname, e.g. pc.example.com (must be a zone in this account)"), "account_id": s("Cloudflare account id (optional if the token has one account)"), "tunnel_name": s("tunnel name (default: the hostname's first label)"), "save_token": b("also save the API token in the config for later changes (default false)")}), &["action"])}),
+        ]);
+    }
+    v
 }
 
 fn arg_str<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
@@ -907,6 +930,53 @@ impl App {
                 Ok(json!({"status": "ok", "matches": res.0, "truncated": res.1}))
             }
             "system_info" => Ok({ let mut v = system_info(); v["edition"] = json!(EDITION); v }),
+            #[cfg(feature = "net-tools")]
+            "lan_scan" => {
+                let specs: Vec<String> = match arg_str(a, "targets").filter(|t| !t.trim().is_empty()) {
+                    Some(t) => t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+                    None => crate::lan::default_targets(),
+                };
+                if specs.is_empty() {
+                    return Err("no LAN address found; pass targets, e.g. 192.168.1.0/24".into());
+                }
+                let mut targets = vec![];
+                for sp in &specs {
+                    targets.extend(crate::lan::parse_targets(sp)?);
+                }
+                targets.sort();
+                targets.dedup();
+                targets.truncate(2048);
+                let ports: Vec<u16> = match arg_str(a, "ports").filter(|p| !p.trim().is_empty()) {
+                    Some(p) => p.split(',').map(|x| x.trim().parse::<u16>().map_err(|_| format!("bad port: {x}"))).collect::<Result<_, _>>()?,
+                    None => crate::lan::DEFAULT_PORTS.to_vec(),
+                };
+                if ports.is_empty() || ports.len() > 64 {
+                    return Err("ports: 1 to 64 ports".into());
+                }
+                let timeout = arg_i64(a, "timeout_ms", 600).clamp(50, 5000) as u64;
+                let conc = arg_i64(a, "concurrency", 256).clamp(8, 512) as usize;
+                let mut v = crate::lan::scan(targets, ports, timeout, conc).await;
+                v["targets"] = json!(specs);
+                Ok(v)
+            }
+            #[cfg(feature = "net-tools")]
+            "http_request" => {
+                let url = req_str(a, "url")?.to_string();
+                let method = arg_str(a, "method").unwrap_or("GET").to_string();
+                let headers: Vec<(String, String)> = a.get("headers").and_then(Value::as_object)
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect())
+                    .unwrap_or_default();
+                let body = arg_str(a, "body").map(str::to_string);
+                let insecure = arg_bool(a, "insecure", false);
+                let timeout = arg_i64(a, "timeout_s", 30).clamp(1, 120) as u64;
+                let max = arg_i64(a, "max_bytes", 262_144).clamp(1024, 4_000_000) as usize;
+                tokio::task::spawn_blocking(move || crate::lan::http_request(&method, &url, &headers, body.as_deref(), timeout, insecure, max))
+                    .await.map_err(|e| e.to_string())?
+            }
+            #[cfg(feature = "admin")]
+            "connection_info" => Ok(crate::admin::connection_info(s, false)),
+            #[cfg(feature = "admin")]
+            "cloudflare_setup" => crate::cf::tool(s, a).await,
             "audit_tail" => {
                 let n = arg_i64(a, "n", 20).clamp(1, 200) as usize;
                 Ok(json!({"status": "ok", "entries": self.audit.tail(n)}))

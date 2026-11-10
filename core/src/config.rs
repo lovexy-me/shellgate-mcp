@@ -80,6 +80,10 @@ pub struct Settings {
     pub pe_network: bool,
     /// Windows desktop tools (screenshot, UI Automation, mouse/keyboard). Off unless desktop=on.
     pub desktop: bool,
+    /// Local admin page (status, connection info, Cloudflare setup) on 127.0.0.1:<admin_port>; 0 = off.
+    pub admin_port: u16,
+    /// Public https base URL of this server (set by the Cloudflare wizard), e.g. https://pc.example.com
+    pub public_url: String,
 }
 
 impl Settings {
@@ -94,7 +98,7 @@ impl Settings {
             confirm_ttl: 60, shell: platform::default_shell(), backup_on_write: true, env_file: String::new(),
             redact: true, redact_domains: vec![], net: NetMode::Local, tunnel_token: String::new(),
             cloudflared: String::new(), mdns: false, mdns_name: "ventoy-rescue".into(), ventoy_root: String::new(),
-            state_dir: String::new(), pe_network: true, desktop: false,
+            state_dir: String::new(), pe_network: true, desktop: false, admin_port: 0, public_url: String::new(),
         }
     }
 }
@@ -209,6 +213,96 @@ fn looks_like_placeholder(t: &str) -> bool {
     ["change", "replace", "your", "token-here", "填写", "请", "<", ">", "xxxx", "example"].iter().any(|p| l.contains(p))
 }
 
+/// Portable / Android builds: when no config exists yet, create one with a fresh token
+/// (next to the executable for the portable build, or at the path given with --env-file).
+pub fn ensure_config(path: &Path) -> Result<bool, String> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    use std::io::Write;
+    let token = crate::policy::random_hex(24);
+    let mut f = platform::private_opts().write(true).create_new(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(template(&token).as_bytes()).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Where a self-configuring build keeps its config when nothing was found.
+pub fn self_config_path(cli: Option<String>) -> PathBuf {
+    let found = locate_env_file(cli.clone());
+    if found.is_file() || cli.is_some() || env::var_os("SHELLGATE_ENV_FILE").is_some() {
+        return found;
+    }
+    platform::exe_dir().map(|d| d.join(STICK_ENV_NAME)).unwrap_or(found)
+}
+
+/// Set (Some) or remove (None) keys in the env file, keeping every other line and comment.
+/// Keys are written in their short form (`tunnel_token=`). The file is rewritten atomically.
+pub fn set_keys(path: &Path, changes: &[(&str, Option<String>)]) -> Result<(), String> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let text = text.trim_start_matches('\u{feff}');
+    let mut done = vec![false; changes.len()];
+    let mut out: Vec<String> = vec![];
+    for raw in text.lines() {
+        let line = raw.trim();
+        let key = if line.starts_with('#') || line.starts_with(';') { None } else { line.split_once('=').map(|(k, _)| full_key(k.trim())) };
+        // a commented template line `#key=` is replaced in place by the first set of that key
+        let commented = line.strip_prefix('#').and_then(|l| l.split_once('=')).map(|(k, _)| k.trim().to_string())
+            .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_lowercase() || c == '_')).map(|k| full_key(&k));
+        let mut replaced = false;
+        for (i, (k, v)) in changes.iter().enumerate() {
+            let fk = full_key(k);
+            if key.as_deref() == Some(fk.as_str()) {
+                if !done[i] {
+                    if let Some(v) = v { out.push(format!("{k}={v}")); }
+                    done[i] = true;
+                }
+                replaced = true; // drop duplicates and removed keys
+                break;
+            }
+            if commented.as_deref() == Some(fk.as_str()) && !done[i] && v.is_some() && !text_has_key(text, &fk) {
+                out.push(raw.to_string());
+                out.push(format!("{k}={}", v.as_ref().unwrap()));
+                done[i] = true;
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            out.push(raw.to_string());
+        }
+    }
+    for (i, (k, v)) in changes.iter().enumerate() {
+        if !done[i] {
+            if let Some(v) = v { out.push(format!("{k}={v}")); }
+        }
+    }
+    for (k, v) in changes {
+        if let Some(v) = v {
+            if v.contains('\n') || v.contains('\r') {
+                return Err(format!("{k}: value must be one line"));
+            }
+        }
+    }
+    let tmp = path.with_extension("env.tmp");
+    {
+        use std::io::Write;
+        let _ = fs::remove_file(&tmp);
+        let mut f = platform::private_opts().write(true).create_new(true).open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        f.write_all((out.join("\n") + "\n").as_bytes()).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
+}
+
+fn text_has_key(text: &str, fk: &str) -> bool {
+    text.lines().any(|l| {
+        let l = l.trim();
+        !l.starts_with('#') && l.split_once('=').map(|(k, _)| full_key(k.trim()) == fk).unwrap_or(false)
+    })
+}
+
 pub fn load(env_file: Option<String>) -> Result<Settings, String> {
     let path = locate_env_file(env_file);
     load_env_file(&path);
@@ -252,7 +346,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
     let h = platform::home();
     let cfg_dir = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     #[cfg(unix)]
-    let default_state = "/var/log/shellgate".to_string();
+    let default_state = if crate::SELF_CONFIG && !cfg_dir.is_empty() { format!("{cfg_dir}/logs") } else { "/var/log/shellgate".to_string() };
     #[cfg(windows)]
     let default_state = if cfg_dir.is_empty() { format!("{}\\shellgate", env::temp_dir().display()) } else { format!("{cfg_dir}\\logs") };
     let state_dir = get("SHELLGATE_STATE_DIR", &default_state);
@@ -284,7 +378,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
     protected.extend(split(&get("SHELLGATE_PROTECTED_PATHS", "")));
 
     #[cfg(unix)]
-    let default_dirs = format!("/tmp,{h},/etc/config");
+    let default_dirs = if cfg!(target_os = "android") { h.clone() } else { format!("/tmp,{h},/etc/config") };
     #[cfg(windows)]
     let default_dirs = {
         let mut d = vec![env::temp_dir().display().to_string(), h.clone()];
@@ -317,11 +411,13 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
         tunnel_token,
         cloudflared: get("SHELLGATE_CLOUDFLARED", ""),
         mdns: truthy(&get("SHELLGATE_MDNS", if net == NetMode::Lan { "1" } else { "0" })),
-        mdns_name: get("SHELLGATE_MDNS_NAME", "ventoy-rescue").trim_end_matches(".local").to_string(),
+        mdns_name: get("SHELLGATE_MDNS_NAME", if cfg!(feature = "edition-pe") || cfg!(feature = "edition-linux") { "ventoy-rescue" } else { "shellgate" }).trim_end_matches(".local").to_string(),
         ventoy_root,
         state_dir: expand(&state_dir),
         pe_network: truthy(&get("SHELLGATE_PE_NETWORK", "1")),
         desktop: truthy(&get("SHELLGATE_DESKTOP", "0")),
+        admin_port: num("SHELLGATE_ADMIN_PORT", if cfg!(feature = "admin") { 8791 } else { 0 }),
+        public_url: get("SHELLGATE_PUBLIC_URL", "").trim_end_matches('/').to_string(),
     })
 }
 
@@ -383,6 +479,9 @@ token={token}
 # Windows only: desktop tools (screenshots, UI Automation control tree, mouse and keyboard).
 # Off by default; every action is written to the audit log; risky key combos need a confirm code.
 #desktop=on
+
+# Local admin page (status, connection info, Cloudflare setup) on http://127.0.0.1:8791 ; 0 = off
+#admin_port=8791
 ")
 }
 

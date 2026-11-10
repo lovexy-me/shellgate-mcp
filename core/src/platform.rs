@@ -356,7 +356,7 @@ pub fn shell_command(shell: &str, cmd: &str) -> Command {
 pub fn default_shell() -> String {
     #[cfg(unix)]
     {
-        "/bin/sh".into()
+        if cfg!(target_os = "android") { "/system/bin/sh".into() } else { "/bin/sh".into() }
     }
     #[cfg(windows)]
     {

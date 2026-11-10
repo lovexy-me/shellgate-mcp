@@ -3,12 +3,19 @@
 //! Implements the MCP Streamable HTTP transport in stateless JSON-response mode:
 //! every POST /mcp carries one JSON-RPC message (or a batch) and gets a JSON reply.
 
+#[cfg(feature = "admin")]
+mod admin;
 mod audit;
+#[cfg(feature = "admin")]
+mod cf;
 mod config;
 mod desktop;
 #[cfg(all(windows, feature = "desktop"))]
 mod desktop_win;
+mod events;
 mod exec;
+#[cfg(feature = "net-tools")]
+mod lan;
 mod net;
 mod platform;
 mod policy;
@@ -31,6 +38,61 @@ use tokio::sync::{Mutex, Semaphore};
 use tools::App;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Portable and Android builds create their own config on first start (with a fresh token).
+pub const SELF_CONFIG: bool = cfg!(any(feature = "edition-portable", feature = "edition-android", target_os = "android"));
+
+static RESTART: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static RESTART_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the server to stop and start again with a freshly read config (admin page, Cloudflare wizard).
+#[allow(dead_code)]
+pub fn request_restart() {
+    RESTART_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+    // let the HTTP reply go out first
+    tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_millis(400)).await; RESTART.notify_waiters(); RESTART.notify_one(); });
+}
+
+/// Replace this process with a fresh copy of itself (same arguments), so the config is re-read
+/// from scratch. Unix keeps the PID (exec), which a supervising Android service relies on.
+fn reexec() -> ! {
+    let exe = std::env::current_exe().expect("current_exe");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // drop the SHELLGATE_* values that came from the config file, so edits take effect
+        let mut c = std::process::Command::new(&exe);
+        c.args(&args);
+        for (k, _) in std::env::vars() {
+            if k.starts_with("SHELLGATE_") && !PRESERVE_ENV.with(|p| p.borrow().contains(&k)) {
+                c.env_remove(&k);
+            }
+        }
+        let e = c.exec();
+        eprintln!("restart failed: {e}");
+        std::process::exit(75)
+    }
+    #[cfg(windows)]
+    {
+        let mut c = std::process::Command::new(&exe);
+        c.args(&args);
+        for (k, _) in std::env::vars() {
+            if k.starts_with("SHELLGATE_") && !PRESERVE_ENV.with(|p| p.borrow().contains(&k)) {
+                c.env_remove(&k);
+            }
+        }
+        match c.spawn() {
+            Ok(_) => std::process::exit(0),
+            Err(e) => { eprintln!("restart failed: {e}"); std::process::exit(75) }
+        }
+    }
+}
+
+thread_local! {
+    /// SHELLGATE_* variables that were set in the real environment before the config was read.
+    static PRESERVE_ENV: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 const PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 #[cfg(unix)]
 const SHELL_NOTE: &str = "- Commands run as the service user via /bin/sh -c; cwd and env do not persist between calls.\n\
@@ -192,12 +254,13 @@ fn init_config(path: &str) -> Result<(), String> {
 }
 
 fn main() {
-    let mut env_file = None;
+    let mut env_file: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--env-file" | "--config" => env_file = args.next(),
             "--version" | "-V" => { println!("{VERSION}"); return; }
+            "--open" => {}
             "--gen-token" => { println!("{}", new_token()); return; }
             // WinPE helper: set the screen resolution (WIDTHxHEIGHT | max | list) and exit
             "--display" => {
@@ -218,6 +281,20 @@ fn main() {
             _ => usage(),
         }
     }
+    PRESERVE_ENV.with(|p| *p.borrow_mut() = std::env::vars().map(|(k, _)| k).filter(|k| k.starts_with("SHELLGATE_")).collect());
+    let mut open_admin = false;
+    if SELF_CONFIG {
+        let path = config::self_config_path(env_file.clone());
+        match config::ensure_config(&path) {
+            Ok(true) => { eprintln!("first start: created {} with a new access token", path.display()); open_admin = true; }
+            Ok(false) => {}
+            Err(e) => { eprintln!("{e}"); platform::pause_if_double_clicked(); std::process::exit(2) }
+        }
+        env_file = Some(path.to_string_lossy().to_string());
+    }
+    if std::env::args().any(|a| a == "--open") {
+        open_admin = true;
+    }
     let settings = match config::load(env_file) {
         Ok(s) => s,
         Err(e) => {
@@ -227,10 +304,25 @@ fn main() {
         }
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    rt.block_on(serve(settings));
+    rt.block_on(serve(settings, open_admin));
+    drop(rt);
+    if RESTART_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
+        reexec();
+    }
 }
 
-async fn serve(settings: config::Settings) {
+/// Open the admin page in the default browser (portable build, first start or --open).
+#[allow(unused_variables)]
+fn open_browser(url: &str) {
+    #[cfg(windows)]
+    { let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn(); }
+    #[cfg(all(unix, not(target_os = "android")))]
+    { let _ = std::process::Command::new("xdg-open").arg(url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn(); }
+}
+
+#[allow(unused_variables)]
+async fn serve(settings: config::Settings, open_admin: bool) {
+    events::mark_started();
     let addr: SocketAddr = match format!("{}:{}", settings.host, settings.port).parse() {
         Ok(a) => a,
         Err(e) => { eprintln!("bad listen address: {e}"); platform::pause_if_double_clicked(); std::process::exit(2) }
@@ -293,7 +385,22 @@ async fn serve(settings: config::Settings) {
         }
         config::NetMode::Local => {}
     }
-    let shutdown = platform::shutdown_signal();
+    #[cfg(feature = "admin")]
+    if net_settings.admin_port != 0 {
+        let key = admin::ensure_key(&net_settings);
+        let url = format!("http://127.0.0.1:{}/#k={key}", net_settings.admin_port);
+        eprintln!("admin page: {url}");
+        tokio::spawn(admin::serve(net_settings.clone()));
+        if open_admin && !cfg!(target_os = "android") {
+            open_browser(&url);
+        }
+    }
+    let shutdown = async {
+        tokio::select! {
+            _ = platform::shutdown_signal() => {}
+            _ = RESTART.notified() => { events::ev("restarting with the new config"); }
+        }
+    };
     if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
         eprintln!("server error: {e}");
     }

@@ -29,13 +29,19 @@ fn find_cloudflared(configured: &str) -> Option<String> {
 /// TUNNEL_TOKEN environment variable, never on the command line (so it is not visible in `ps`).
 /// Output goes to `<state_dir>/cloudflared.log`, which sits in a protected directory.
 pub async fn supervise_cloudflared(s: Settings) {
+    use crate::events::{ev, TUNNEL_PID, TUNNEL_RESTARTS, TUNNEL_RUNNING};
+    use std::sync::atomic::Ordering;
     let Some(bin) = find_cloudflared(&s.cloudflared) else {
-        eprintln!("tunnel mode: cloudflared not found (put cloudflared next to shellgate, on PATH, or set cloudflared=); \
-                   ShellGate keeps listening on {}:{} only", s.host, s.port);
+        ev(format!("tunnel mode: cloudflared not found (put cloudflared next to shellgate, on PATH, or set cloudflared=); \
+                   ShellGate keeps listening on {}:{} only", s.host, s.port));
         return;
     };
     let log_path = Path::new(&s.state_dir).join("cloudflared.log");
     let _ = std::fs::create_dir_all(&s.state_dir);
+    // keep the log from growing without bound on phones and sticks
+    if std::fs::metadata(&log_path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
+        let _ = std::fs::rename(&log_path, log_path.with_extension("log.1"));
+    }
     let mut backoff = 5u64;
     loop {
         let log = platform::private_opts().create(true).append(true).open(&log_path);
@@ -51,11 +57,16 @@ pub async fn supervise_cloudflared(s: Settings) {
         let started = std::time::Instant::now();
         match c.spawn() {
             Ok(mut child) => {
-                eprintln!("tunnel mode: cloudflared started (pid {:?}), log: {}", child.id(), log_path.display());
+                TUNNEL_RUNNING.store(true, Ordering::Relaxed);
+                TUNNEL_PID.store(child.id().unwrap_or(0), Ordering::Relaxed);
+                ev(format!("tunnel mode: cloudflared started (pid {:?}), log: {}", child.id(), log_path.display()));
                 let st = child.wait().await;
-                eprintln!("tunnel mode: cloudflared exited ({st:?}); restarting in {backoff}s");
+                TUNNEL_RUNNING.store(false, Ordering::Relaxed);
+                TUNNEL_PID.store(0, Ordering::Relaxed);
+                TUNNEL_RESTARTS.fetch_add(1, Ordering::Relaxed);
+                ev(format!("tunnel mode: cloudflared exited ({st:?}); restarting in {backoff}s"));
             }
-            Err(e) => eprintln!("tunnel mode: cannot start {bin}: {e}; retrying in {backoff}s"),
+            Err(e) => ev(format!("tunnel mode: cannot start {bin}: {e}; retrying in {backoff}s")),
         }
         if started.elapsed() > Duration::from_secs(120) {
             backoff = 5;
@@ -63,6 +74,27 @@ pub async fn supervise_cloudflared(s: Settings) {
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(60);
     }
+}
+
+/// Tunnel state read from the tail of cloudflared.log: connections registered since the last
+/// start, and the last error line (redacted by the caller).
+pub fn tunnel_log_state(state_dir: &str) -> (u32, Option<String>, Vec<String>) {
+    let p = Path::new(state_dir).join("cloudflared.log");
+    let text = std::fs::read(&p).map(|b| {
+        let start = b.len().saturating_sub(64 * 1024);
+        String::from_utf8_lossy(&b[start..]).to_string()
+    }).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let from = lines.iter().rposition(|l| l.contains("Starting tunnel") || l.contains("Starting metrics server")).unwrap_or(0);
+    let mut conns: i32 = 0;
+    let mut last_err = None;
+    for l in &lines[from..] {
+        if l.contains("Registered tunnel connection") { conns += 1; }
+        if l.contains("Unregistered tunnel connection") || l.contains("Connection terminated") { conns -= 1; }
+        if l.contains(" ERR ") { last_err = Some(l.to_string()); }
+    }
+    let tail = lines.iter().rev().take(40).rev().map(|l| l.to_string()).collect();
+    (conns.max(0) as u32, last_err, tail)
 }
 
 // ---------------------------------------------------------------- WinPE network
@@ -142,6 +174,13 @@ const MDNS_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_PORT: u16 = 5353;
 
 /// The IPv4 address other LAN hosts should use to reach us (address of the default-route interface).
+/// All IPv4 addresses that look like a LAN (for lan_scan defaults and the admin page).
+pub fn lan_ipv4s() -> Vec<Ipv4Addr> {
+    let mut v: Vec<Ipv4Addr> = vec![];
+    if let Some(ip) = primary_ipv4() { v.push(ip); }
+    v
+}
+
 pub fn primary_ipv4() -> Option<Ipv4Addr> {
     for target in ["224.0.0.251:5353", "192.168.255.255:9", "10.255.255.255:9"] {
         if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {

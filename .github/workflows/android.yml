@@ -1,0 +1,163 @@
+name: Android
+# Builds the ShellGate Android app (editions/android): the Rust binary and cloudflared are
+# cross-compiled with the NDK and packed as lib*.so, then the APK is built and tested in an
+# emulator (server starts, MCP answers, cloudflared reaches Cloudflare through a quick tunnel).
+# Tag android-v<cargo version> publishes the APK as a release.
+on:
+  push:
+    branches: ["**"]
+    tags: ["android-v*"]
+    paths: ["core/**", "editions/android/**", ".github/workflows/android.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  API: "24"
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { abi: arm64-v8a, rust: aarch64-linux-android, goarch: arm64, clang: aarch64-linux-android }
+          - { abi: x86_64,    rust: x86_64-linux-android,  goarch: amd64, clang: x86_64-linux-android }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      - name: NDK toolchain
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ls "$BIN/${{ matrix.clang }}${API}-clang"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "NDKCC=$BIN/${{ matrix.clang }}${API}-clang" >> "$GITHUB_ENV"
+      - name: shellgate (Rust)
+        working-directory: core
+        run: |
+          T=${{ matrix.rust }}; U=$(echo "$T" | tr 'a-z-' 'A-Z_')
+          export CARGO_TARGET_${U}_LINKER="$NDKCC"
+          export CC_${T//-/_}="$NDKCC" AR_${T//-/_}="$BIN/llvm-ar"
+          cargo build --release --no-default-features --features edition-android --target $T
+          mkdir -p ../out && cp target/$T/release/shellgate ../out/libshellgate.so
+      - name: cloudflared (latest release, built for Android)
+        run: |
+          TAG=$(curl -fsSL https://api.github.com/repos/cloudflare/cloudflared/releases/latest | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])')
+          echo "cloudflared $TAG"
+          git clone -q --depth 1 --branch "$TAG" https://github.com/cloudflare/cloudflared.git cfd
+          echo "CFD_TAG=$TAG" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cfd/go.mod
+          cache: false
+      - run: |
+          cd cfd
+          CGO_ENABLED=1 GOOS=android GOARCH=${{ matrix.goarch }} CC="$NDKCC" \
+            go build -trimpath -ldflags "-s -w -X main.Version=$CFD_TAG -X main.BuildTime=$(date -u +%F)" \
+            -o ../out/libcloudflared.so ./cmd/cloudflared
+          file ../out/*.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jni-${{ matrix.abi }}
+          path: out/*.so
+
+  apk:
+    needs: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: jni-arm64-v8a, path: editions/android/app/src/main/jniLibs/arm64-v8a }
+      - uses: actions/download-artifact@v4
+        with: { name: jni-x86_64, path: editions/android/app/src/main/jniLibs/x86_64 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.10.2" }
+      - name: build
+        working-directory: editions/android
+        run: |
+          # release signing only when a keystore secret exists; otherwise debug-signed
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > $RUNNER_TEMP/sg.jks
+            export SG_KEYSTORE=$RUNNER_TEMP/sg.jks SG_KEYSTORE_PASS="${{ secrets.ANDROID_KEYSTORE_PASS }}"
+          fi
+          gradle --no-daemon -q assembleRelease assembleDebug
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../core/Cargo.toml | head -1)
+          mkdir -p ../../dist
+          cp app/build/outputs/apk/release/app-release.apk ../../dist/shellgate-android-$V.apk
+          cp app/build/outputs/apk/debug/app-debug.apk ../../dist/test-debug.apk
+          # unsigned copy for personal builds (preset config added, then signed locally)
+          ls -la ../../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dist/*.apk
+
+  emulator-test:
+    needs: apk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: apk, path: dist }
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: |
+            set -x; adb install -r dist/test-debug.apk
+            adb shell pm grant io.shellgate.app android.permission.POST_NOTIFICATIONS || true
+            adb shell am start -n io.shellgate.app/.MainActivity
+            sleep 15
+            adb forward tcp:18790 tcp:8790 && adb forward tcp:18791 tcp:8791
+            curl -sf http://127.0.0.1:18790/health
+            adb shell run-as io.shellgate.app cat files/logs/shellgate.log | tail -20
+            TOKEN=$(adb shell run-as io.shellgate.app sh -c "'grep ^token= files/shellgate.env'" | tr -d '\r' | cut -d= -f2)
+            test ${#TOKEN} -ge 32
+            KEY=$(adb shell run-as io.shellgate.app cat files/logs/admin.key | tr -d '\r')
+            curl -sf -H "x-admin-key: $KEY" http://127.0.0.1:18791/api/status | head -c 400; echo
+            mcp() { curl -sf -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' http://127.0.0.1:18790/mcp -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"; echo; }
+            mcp run_command '{"command":"id; uname -a; getprop ro.build.version.release"}' | grep -q exit_code
+            mcp run_command '{"command":"id; uname -a; getprop ro.build.version.release"}'
+            mcp lan_scan '{"targets":"10.0.2.2-3","ports":"53,5037"}'
+            mcp http_request '{"url":"https://www.cloudflare.com/cdn-cgi/trace","max_bytes":300}' | grep -q http_status
+            # cloudflared runs on Android and reaches Cloudflare: quick tunnel to the MCP port
+            LIB=$(adb shell pm dump io.shellgate.app | tr -d '\r' | sed -n 's/.*legacyNativeLibraryDir=\(.*\)/\1/p' | head -1)/x86_64
+            adb shell run-as io.shellgate.app $LIB/libcloudflared.so --version
+            adb shell "run-as io.shellgate.app sh -c 'cd files && $LIB/libcloudflared.so tunnel --no-autoupdate --url http://127.0.0.1:8790 > logs/quick.log 2>&1 &'"
+            sleep 25
+            adb shell run-as io.shellgate.app cat files/logs/quick.log | tail -15
+            URL=$(adb shell run-as io.shellgate.app cat files/logs/quick.log | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1)
+            echo "quick tunnel: $URL"
+            test -n "$URL"
+            for i in 1 2 3 4 5 6; do curl -sf "$URL/health" && break; sleep 5; done
+            curl -sf "$URL/health"
+            # restart from the admin API keeps the service alive (exec in place)
+            curl -sf -X POST -H "x-admin-key: $KEY" http://127.0.0.1:18791/api/restart; sleep 4
+            curl -sf http://127.0.0.1:18790/health
+
+  release:
+    needs: [apk, emulator-test]
+    if: startsWith(github.ref, 'refs/tags/android-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' core/Cargo.toml | head -1)
+          [ "${GITHUB_REF_NAME#android-v}" = "$V" ] || { echo "tag != Cargo version $V"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with: { name: apk, path: dist }
+      - run: rm dist/test-debug.apk && cd dist && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          prerelease: true
+          files: dist/*

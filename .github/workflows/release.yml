@@ -3,15 +3,18 @@ name: Release
 #   openwrt-v<cargo version>  -> router binaries        (core/Cargo.toml version)
 #   pe-v<cargo version>       -> Windows x64/x86 exe + rescue-stick Linux binary + pe-build kit
 #   wsl-v<python version>     -> Python wheel/sdist      (editions/wsl/pyproject.toml + __init__)
+#   portable-v<cargo version> -> unzip-and-run PC builds (Windows x64 zip, Linux x64/arm64 tar.gz), each
+#                                with cloudflared; first start creates the config and opens the admin page
+# (Android: see android.yml, tag android-v*)
 on:
   push:
-    tags: ["openwrt-v*", "pe-v*", "wsl-v*"]
+    tags: ["openwrt-v*", "pe-v*", "wsl-v*", "portable-v*"]
   workflow_dispatch:
     inputs:
       edition:
-        description: "openwrt, pe or wsl (build artifacts only, no release)"
+        description: "openwrt, pe, wsl or portable (build artifacts only, no release)"
         type: choice
-        options: [openwrt, pe, wsl]
+        options: [openwrt, pe, wsl, portable]
         default: pe
 permissions:
   contents: write
@@ -28,7 +31,7 @@ jobs:
           echo "edition=$ed" >> "$GITHUB_OUTPUT"
           [ -z "$ver" ] && exit 0
           case "$ed" in
-            openwrt|pe) have=$(sed -n 's/^version = "\(.*\)"/\1/p' core/Cargo.toml | head -1) ;;
+            openwrt|pe|portable) have=$(sed -n 's/^version = "\(.*\)"/\1/p' core/Cargo.toml | head -1) ;;
             wsl) have=$(sed -n 's/^version = "\(.*\)"/\1/p' editions/wsl/pyproject.toml | head -1)
                  init=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' editions/wsl/src/shellgate/__init__.py)
                  [ "$have" = "$init" ] || { echo "pyproject $have != __init__ $init"; exit 1; } ;;
@@ -104,8 +107,57 @@ jobs:
           name: wsl
           path: dist/*
 
+  portable:
+    needs: which
+    if: needs.which.outputs.edition == 'portable'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - run: pip install ziglang cargo-zigbuild
+      - working-directory: core
+        run: |
+          cargo test --release
+          for t in x86_64-pc-windows-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            cargo zigbuild --release --no-default-features --features edition-portable --target $t
+          done
+      - name: package (with the latest cloudflared)
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' core/Cargo.toml | head -1)
+          CF=https://github.com/cloudflare/cloudflared/releases/latest/download
+          pk() { # name binary cloudflared-asset cloudflared-name
+            d=pkg/$1; mkdir -p $d
+            cp "$2" $d/; curl -fsSL -o "$d/$4" "$CF/$3"; chmod +x $d/* 2>/dev/null || true
+            cp editions/portable/README.txt $d/
+          }
+          pk shellgate-portable-$V-windows-x64 core/target/x86_64-pc-windows-gnu/release/shellgate.exe cloudflared-windows-amd64.exe cloudflared.exe
+          pk shellgate-portable-$V-linux-x64 core/target/x86_64-unknown-linux-musl/release/shellgate cloudflared-linux-amd64 cloudflared
+          pk shellgate-portable-$V-linux-arm64 core/target/aarch64-unknown-linux-musl/release/shellgate cloudflared-linux-arm64 cloudflared
+          cd pkg
+          zip -qr ../shellgate-portable-$V-windows-x64.zip shellgate-portable-$V-windows-x64
+          tar czf ../shellgate-portable-$V-linux-x64.tar.gz shellgate-portable-$V-linux-x64
+          tar czf ../shellgate-portable-$V-linux-arm64.tar.gz shellgate-portable-$V-linux-arm64
+          cd .. && ls -la shellgate-portable-*
+      - name: smoke test (linux x64)
+        run: |
+          d=$(ls -d pkg/*linux-x64); cd $d
+          (SHELLGATE_PORT=18790 SHELLGATE_ADMIN_PORT=18791 ./shellgate > run.log 2>&1 &); sleep 2
+          cat run.log | sed -E 's/k=[0-9a-f]+/k=<key>/'
+          test -f shellgate.env && test -f logs/admin.key
+          curl -sf http://127.0.0.1:18790/health
+          curl -sf -H "x-admin-key: $(cat logs/admin.key)" http://127.0.0.1:18791/api/status | head -c 300
+          ./cloudflared --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable
+          path: |
+            shellgate-portable-*.zip
+            shellgate-portable-*.tar.gz
+
   release:
-    needs: [which, openwrt, pe, wsl]
+    needs: [which, openwrt, pe, wsl, portable]
     if: always() && startsWith(github.ref, 'refs/tags/') && !contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
     steps:

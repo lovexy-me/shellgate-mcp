@@ -37,7 +37,8 @@ echo "$out" | grep -q 'fl='
 # cloudflared runs on Android and reaches Cloudflare: quick tunnel to the MCP port
 LIB=$(adb shell pm dump $P | tr -d '\r' | sed -n 's/^ *legacyNativeLibraryDir=//p' | head -1)/x86_64
 adb shell run-as $P "$LIB/libcloudflared.so" --version
-adb shell "run-as $P sh -c 'cd files && nohup $LIB/libcloudflared.so tunnel --no-autoupdate --url http://127.0.0.1:8790 > logs/quick.log 2>&1 &'"
+# stdin must be closed too, or adb shell waits for the background process forever
+timeout 20 adb shell "run-as $P sh -c 'cd files && nohup $LIB/libcloudflared.so tunnel --no-autoupdate --url http://127.0.0.1:8790 < /dev/null > logs/quick.log 2>&1 &'" || true
 URL=
 for i in $(seq 1 30); do
   URL=$(adb shell run-as $P cat files/logs/quick.log | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | head -1 || true)

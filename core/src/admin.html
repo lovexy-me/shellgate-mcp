@@ -53,7 +53,7 @@
 <div class="card" id="cf-card">
   <div class="muted">用你自己的 Cloudflare API 令牌，自动建好隧道和域名，让任何地方都能连上这台设备。令牌只用这一次，默认不保存。</div>
   <label>Cloudflare API 令牌 <span class="hint">需要 区域:DNS 编辑 + 账户:Cloudflare Tunnel 编辑 权限</span></label>
-  <input id="cf-token" type="password" autocomplete="off" placeholder="API Token">
+  <div style="display:flex;gap:6px"><input id="cf-token" type="password" autocomplete="off" placeholder="API Token" style="flex:1"><button type="button" class="sec" onclick="peek('cf-token',this)">显示</button></div>
   <label>公网域名 <span class="hint">该域名须已托管在这个 Cloudflare 账户</span></label>
   <input id="cf-host" autocomplete="off" placeholder="pc.yourdomain.com">
   <div id="cf-acct"></div>
@@ -76,7 +76,8 @@
   </select>
   <div id="tun-fields" style="display:none">
     <label style="margin-top:10px">已有隧道令牌（eyJ 开头，可留空不改）</label>
-    <input id="s-tt" type="password" autocomplete="off" placeholder="在 Cloudflare 后台「隧道 → 安装连接器」里复制">
+    <div style="display:flex;gap:6px"><input id="s-tt" type="password" autocomplete="off" placeholder="在 Cloudflare 后台「隧道 → 安装连接器」里复制" style="flex:1"><button type="button" class="sec" onclick="peek('s-tt',this)">显示</button></div>
+    <div class="hint" id="s-tt-state"></div>
     <label style="margin-top:10px">公网地址</label>
     <input id="s-pu" placeholder="https://xxx.你的域名">
     <div class="hint">后台给这条隧道加「公共主机名」，服务填 http://localhost:8790（本机端口）。</div>
@@ -84,6 +85,7 @@
   <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
     <button onclick="saveNet()">保存并重启</button>
     <button class="sec" onclick="doRestart()">重启服务</button>
+    <button class="sec" onclick="newToken()">换新访问令牌</button>
   </div>
   <div id="s-out" class="hint" style="margin-top:8px"></div>
 </div>
@@ -107,7 +109,7 @@
 <script>
 let KEY = new URLSearchParams(location.hash.slice(1)).get('k') || sessionStorage.getItem('sgk') || '';
 if (KEY) { sessionStorage.setItem('sgk', KEY); history.replaceState(null,'',location.pathname); }
-let CFG = null;
+let CFG = null, NET_DIRTY = false, RESTART_AT = 0;
 const $ = id => document.getElementById(id);
 function hdr(extra) { const h = {'content-type':'application/json'}; if (KEY) h['x-admin-key'] = KEY; return Object.assign(h, extra||{}); }
 async function api(path, opt) { const r = await fetch(path, Object.assign({headers: hdr(opt&&opt.reveal?{'x-reveal':'1'}:{})}, opt||{})); return r.json(); }
@@ -115,7 +117,7 @@ async function api(path, opt) { const r = await fetch(path, Object.assign({heade
 function esc(s){ return (s==null?'':String(s)); }
 async function load() {
   let d;
-  try { d = await api('/api/status', {reveal:true}); } catch(e){ $('sub').textContent='连接失败'; return; }
+  try { d = await api('/api/status', {reveal:true}); } catch(e){ $('sub').textContent = RESTART_AT ? '重启中…' : '连接失败'; return; }
   if (d.error) { $('sub').innerHTML='<span class="err">需要管理密钥（打开 app 或用带 #k= 的链接）</span>'; return; }
   $('ver').textContent = 'v'+d.version+' · '+d.edition;
   $('sub').textContent = d.os+'/'+d.arch;
@@ -130,7 +132,14 @@ async function load() {
         : (t.running ? '<span class="pill">连接中…</span>' : '<span class="pill bad">未运行</span>'))
        + (t.last_error? '<div class="hint err">'+esc(t.last_error)+'</div>':'');
   $('st-up').textContent = fmtDur(d.uptime_s);
-  $('s-net').value = net;
+  if (!NET_DIRTY) { $('s-net').value = net; showTun(); }
+  if (document.activeElement !== $('s-pu') && !$('s-pu').dataset.dirty) $('s-pu').value = (d.public_url || '').replace(/\/mcp$/, '');
+  $('s-tt-state').textContent = (t && t.configured) ? '已保存过一个隧道令牌（为安全不显示）；留空就继续用它，填新的会替换。' : '还没有保存隧道令牌。';
+  if (RESTART_AT) {
+    const since = (Date.now() - RESTART_AT) / 1000;
+    if (d.uptime_s <= since + 1) { flash('s-out', '已重启，当前模式：' + net, 'good'); RESTART_AT = 0; }
+    else if (since > 30) { flash('s-out', '30 秒内没有重启成功，请看下面的日志', 'err'); RESTART_AT = 0; }
+  }
   if (d.client_config) { CFG = JSON.stringify(d.client_config, null, 2); $('cfg').textContent = CFG; }
   $('events').textContent = (d.events||[]).map(e => new Date(e.t*1000).toLocaleTimeString()+'  '+e.m).join('\n') || '（暂无）';
   if (d.tunnel_log && d.tunnel_log.length) $('events').textContent += '\n\n--- cloudflared ---\n' + d.tunnel_log.join('\n');
@@ -165,9 +174,9 @@ async function cf(action){
     $('cf-out').innerHTML = html; $('cf-out').className='hint';
     return;
   }
-  if(action==='remove'){ flash('cf-out','已删除隧道，已切回 local；正在重启…','good'); await api('/api/restart',{method:'POST'}); setTimeout(load,2500); return; }
+  if(action==='remove'){ flash('cf-out','已删除隧道，已切回 local；正在重启…','good'); await restartNow(); return; }
   $('cf-out').innerHTML = '<span class="good">隧道已建立：</span><code>'+esc(d.mcp_url)+'</code><div>正在重启生效…</div>';
-  await api('/api/restart',{method:'POST'}); setTimeout(load,2500);
+  await restartNow();
 }
 async function saveNet(){
   const b = {net:$('s-net').value};
@@ -175,10 +184,26 @@ async function saveNet(){
   const d = await api('/api/settings',{method:'POST',body:JSON.stringify(b)});
   $('s-tt').value='';
   if(d.error||d.status==='error'){ flash('s-out',d.error||'失败','err'); return; }
-  flash('s-out','已保存，重启中…','good'); await api('/api/restart',{method:'POST'}); setTimeout(load,2500);
+  NET_DIRTY = false; delete $('s-pu').dataset.dirty;
+  flash('s-out','已保存，重启中…','good'); await restartNow();
 }
-async function doRestart(){ flash('s-out','重启中…'); await api('/api/restart',{method:'POST'}); setTimeout(load,2500); }
-$('s-net').addEventListener('change',()=>{$('tun-fields').style.display=$('s-net').value==='tunnel'?'':'none';});
+async function restartNow(){
+  RESTART_AT = Date.now();
+  try { await api('/api/restart',{method:'POST'}); } catch(e) {}
+  setTimeout(load,2500);
+}
+async function doRestart(){ flash('s-out','重启中…'); await restartNow(); }
+async function newToken(){
+  if(!confirm('换一个新的访问令牌？旧令牌立刻作废，所有 AI 客户端都要改成新配置。')) return;
+  const d = await api('/api/settings',{method:'POST',body:JSON.stringify({new_token:true})});
+  if(d.error||d.status==='error'){ flash('s-out',d.error||'失败','err'); return; }
+  flash('s-out','已换新令牌，重启中…（重启后在上面复制新配置）','good'); await restartNow();
+}
+function peek(id,b){ const e=$(id); const show=e.type==='password'; e.type=show?'text':'password'; b.textContent=show?'隐藏':'显示'; }
+function showTun(){ $('tun-fields').style.display = $('s-net').value==='tunnel' ? '' : 'none'; }
+$('s-pu').addEventListener('input',()=>{ $('s-pu').dataset.dirty='1'; NET_DIRTY = true; });
+$('s-net').addEventListener('change',()=>{ NET_DIRTY = true; showTun(); });
+['cf-token','cf-host'].forEach(id => $(id).addEventListener('input', () => { if ($('cf-out').classList.contains('err')) flash('cf-out',''); }));
 load(); appSec(); setInterval(()=>{load(); appSec();}, 5000);
 </script>
 </body>

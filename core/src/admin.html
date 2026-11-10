@@ -74,6 +74,13 @@
     <option value="lan">lan — 同局域网直连</option>
     <option value="tunnel">tunnel — Cloudflare 隧道</option>
   </select>
+  <div id="tun-fields" style="display:none">
+    <label style="margin-top:10px">已有隧道令牌（eyJ 开头，可留空不改）</label>
+    <input id="s-tt" type="password" autocomplete="off" placeholder="在 Cloudflare 后台「隧道 → 安装连接器」里复制">
+    <label style="margin-top:10px">公网地址</label>
+    <input id="s-pu" placeholder="https://xxx.你的域名">
+    <div class="hint">后台给这条隧道加「公共主机名」，服务填 http://localhost:8790（本机端口）。</div>
+  </div>
   <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
     <button onclick="saveNet()">保存并重启</button>
     <button class="sec" onclick="doRestart()">重启服务</button>
@@ -163,11 +170,15 @@ async function cf(action){
   await api('/api/restart',{method:'POST'}); setTimeout(load,2500);
 }
 async function saveNet(){
-  const d = await api('/api/settings',{method:'POST',body:JSON.stringify({net:$('s-net').value})});
+  const b = {net:$('s-net').value};
+  if (b.net==='tunnel') { const t=$('s-tt').value.trim(), u=$('s-pu').value.trim(); if(t) b.tunnel_token=t; if(u) b.public_url=u; }
+  const d = await api('/api/settings',{method:'POST',body:JSON.stringify(b)});
+  $('s-tt').value='';
   if(d.error||d.status==='error'){ flash('s-out',d.error||'失败','err'); return; }
   flash('s-out','已保存，重启中…','good'); await api('/api/restart',{method:'POST'}); setTimeout(load,2500);
 }
 async function doRestart(){ flash('s-out','重启中…'); await api('/api/restart',{method:'POST'}); setTimeout(load,2500); }
+$('s-net').addEventListener('change',()=>{$('tun-fields').style.display=$('s-net').value==='tunnel'?'':'none';});
 load(); appSec(); setInterval(()=>{load(); appSec();}, 5000);
 </script>
 </body>

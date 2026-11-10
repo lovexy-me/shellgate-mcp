@@ -64,7 +64,11 @@ fn zone_for<'a>(zones: &'a [Value], hostname: &str) -> Option<&'a Value> {
 
 async fn run(s: &Settings, a: &Value) -> Result<Value, String> {
     let action = a.get("action").and_then(Value::as_str).unwrap_or("plan").to_string();
-    let token = a.get("api_token").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let token = a.get("api_token").and_then(Value::as_str).unwrap_or("").trim()
+        .trim_start_matches("Bearer ").trim().to_string();
+    if token.starts_with("eyJ") {
+        return Err("this looks like a tunnel token (eyJ...), not an API token. Create an API token under My Profile > API Tokens (it starts with cfut_), or, if this tunnel already has a public hostname pointing at this server, set it as tunnel_token instead (net=tunnel).".into());
+    }
     if token.is_empty() {
         return Err("api_token is required (a Cloudflare API token with Zone:DNS edit and Account:Cloudflare Tunnel edit)".into());
     }

@@ -149,8 +149,10 @@ mkdir -p "$dir"; s="$dir/reinstall.sh"
 if command -v curl >/dev/null 2>&1; then curl -fsSL -m 120 -o "$s" "$url"; else wget -q -T 120 -O "$s" "$url"; fi || { echo "error=download failed: $url"; exit 1; }
 head -c 200 "$s" | grep -q '^#!' || { echo "error=downloaded file is not a script"; exit 1; }
 echo "script_sha256=$(sha256sum "$s" | cut -d' ' -f1)"
-cd "$dir" && $R bash "$s" "$@" </dev/null 2>&1 | tail -n 25
+cd "$dir" || exit 1
+$R bash "$s" "$@" </dev/null >"$dir/reinstall.log" 2>&1
 rc=$?
+sed 's/\x1b\[[0-9;]*m//g' "$dir/reinstall.log" | tail -n 25
 echo "reinstall_rc=$rc"
 "#;
 
@@ -203,7 +205,7 @@ pub fn definitions() -> Vec<Value> {
         json!({"name": "firmware_flash", "description": "OpenWrt: flash a firmware image with sysupgrade. Always asks for confirmation. First verifies the sha256 (required) and `sysupgrade -T`, saves a config backup with config_backup (on OpenWrt that lands in RAM: copy it off the box with read_binary before confirming if you want to keep it), then starts sysupgrade detached; the device reboots and ShellGate drops for a few minutes. With keep_config (default) ShellGate keeps itself: its binary, config and init script are added to /etc/sysupgrade.conf so the new firmware comes back with ShellGate running. keep_config=false wipes settings (sysupgrade -n) and ShellGate with them. After it comes back, check system_info.",
             "inputSchema": obj(json!({"path": s("firmware image on this device"), "sha256": s("expected sha256 of the image"), "keep_config": b("keep settings (default true)"), "confirm_code": confirm.clone()}), &["path", "sha256"])}),
         json!({"name": "os_reinstall", "description": "Linux: reinstall the operating system over the network with the reinstall script (bin456789/reinstall; picks mirrors in mainland China itself). Wipes the system disk. Always asks for confirmation. Downloads the script, runs it with the distro and options (it prepares the installer and boot entry), then reboots when reboot=true; the install runs unattended for 5 to 30 minutes and the new system has SSH only (no ShellGate). Give ssh_key (preferred) or password for the new root login. Not for WSL (use wsl --unregister/--install from Windows) or OpenWrt (firmware_flash).",
-            "inputSchema": obj(json!({"distro": s("debian, ubuntu, alpine, almalinux, rocky, fedora, arch, opensuse, centos, ... or dd / windows"), "release": s("version, e.g. 12 for debian, 24.04 for ubuntu (optional)"), "ssh_key": s("public key or URL (github:user, http...) for root on the new system"), "password": s("root password for the new system (use ssh_key when you can)"), "extra": s("more reinstall.sh options, e.g. --ssh-port 2222 or --img URL for dd (optional)"), "script_url": s("reinstall.sh source (default: the cnb.cool mirror of bin456789/reinstall)"), "reboot": b("reboot into the installer when the script succeeds (default false)"), "confirm_code": confirm}), &["distro"])}),
+            "inputSchema": obj(json!({"distro": s("debian, ubuntu, alpine, almalinux, rocky, fedora, arch, opensuse, centos, ... or dd / windows"), "release": s("version, e.g. 12 for debian, 24.04 for ubuntu (optional)"), "username": s("login name on the new system (default root; administrator for windows)"), "ssh_key": s("public key or URL (github:user, http...) for root on the new system"), "password": s("root password for the new system (use ssh_key when you can)"), "extra": s("more reinstall.sh options, e.g. --ssh-port 2222 or --img URL for dd (optional)"), "script_url": s("reinstall.sh source (default: the cnb.cool mirror of bin456789/reinstall)"), "reboot": b("reboot into the installer when the script succeeds (default false)"), "confirm_code": confirm}), &["distro"])}),
     ]
 }
 

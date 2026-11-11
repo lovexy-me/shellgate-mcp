@@ -1071,6 +1071,15 @@ impl App {
                     }
                     args.push(r.trim().into());
                 }
+                if !matches!(distro.as_str(), "fnos" | "netboot.xyz") {
+                    let def = if distro == "windows" { "administrator" } else { "root" };
+                    let u = arg_str(a, "username").map(str::trim).filter(|u| !u.is_empty()).unwrap_or(def);
+                    if !u.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+                        return Err("username: letters, digits, _ - . only".into());
+                    }
+                    args.push("--username".into());
+                    args.push(u.into());
+                }
                 let key = arg_str(a, "ssh_key").filter(|k| !k.trim().is_empty());
                 let pw = arg_str(a, "password").filter(|k| !k.is_empty());
                 if key.is_none() && pw.is_none() {

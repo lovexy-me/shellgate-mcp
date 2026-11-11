@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(not BIN or not all(shutil.which(x) for x in ("Xv
 def desk(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("desk")
     disp = ":97"
-    xvfb = subprocess.Popen(["Xvfb", disp, "-screen", "0", "800x600x24", "-nolisten", "tcp"],
+    xvfb = subprocess.Popen(["Xvfb", disp, "-screen", "0", "800x600x24", "-nolisten", "tcp", "-noreset"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1)
     port = _free_port()
@@ -70,13 +70,15 @@ async def test_screenshot(desk):
     assert part["width"] == 100 and part["height"] == 50 and part["origin"] == [10, 20]
 
 
-async def test_input_runs(desk):
+async def test_input_moves_mouse(desk):
     url, disp = desk
     r, _ = await _call(url, "desktop_input", coords="physical",
                        actions=[{"type": "move", "x": 123, "y": 45}, {"type": "wait", "ms": 50}, {"type": "key", "keys": "shift"}])
-    # xdotool ran every action without error; the pointer position itself is not asserted because
-    # some Xvfb builds (e.g. under gVisor) ignore XTEST motion
     assert r["status"] == "ok" and r["done"] == 3
+    # Xvfb resets (pointer back to the centre) when its last client disconnects, hence -noreset above
+    loc = subprocess.run(["xdotool", "getmouselocation"], env={**os.environ, "DISPLAY": disp},
+                         capture_output=True, text=True, timeout=10).stdout
+    assert loc.startswith("x:123 y:45"), loc
 
 
 async def test_risky_combo_needs_confirm(desk):

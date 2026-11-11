@@ -26,6 +26,7 @@ mod net;
 mod platform;
 mod policy;
 mod redact;
+mod sysops;
 mod tools;
 mod ventoy;
 mod xfer;

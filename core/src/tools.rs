@@ -277,6 +277,10 @@ pub fn definitions() -> Value {
         {"name": "ventoy_config_set", "description": "Replace ventoy/ventoy.json. The content must be a valid JSON object (checked before writing); the old file is kept as ventoy.json.bak-<timestamp>. On FAT32 the result may carry warnings about paths Ventoy will not match (upper-case 8.3 folder names such as /ISO are seen in lower case). Write placeholders like <ip> back only if they are really meant literally: output is redacted.",
          "inputSchema": obj(json!({"content": s("Complete new ventoy.json text")}), &["content"])},
     ]);
+    #[cfg(all(unix, not(target_os = "android")))]
+    if let Value::Array(a) = &mut v {
+        a.extend(crate::sysops::definitions());
+    }
     #[cfg(feature = "net-tools")]
     if let Value::Array(a) = &mut v {
         a.extend([
@@ -944,6 +948,172 @@ impl App {
         Ok(ok(v))
     }
 
+    #[cfg(not(all(unix, not(target_os = "android"))))]
+    async fn sysops(&self, name: &str, _a: &Value) -> Result<Value, String> {
+        Err(format!("{name} is for Linux and OpenWrt hosts"))
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    async fn sysops(&self, name: &str, a: &Value) -> Result<Value, String> {
+        use crate::sysops as so;
+        let s = &self.policy.settings;
+        let root = so::root_prefix(&s.sudo_allow);
+        let run = |body: &'static str, args: Vec<String>, t: u64, rootp: &'static str| {
+            let mut argv = vec!["-c".to_string(), so::script(body), "sg".to_string()];
+            argv.extend(args);
+            async move {
+                let mut c = platform::new_command("sh");
+                c.args(&argv).env("SG_ROOT", rootp.trim_end()).current_dir("/");
+                exec::run_cmd(s, &self.sem, c, t, None).await
+            }
+        };
+        let finish = |mut r: Value| {
+            let out = r["stdout"].as_str().unwrap_or("").to_string();
+            let rep = so::parse_report(&out);
+            if let Value::Object(m) = &mut r {
+                m.remove("stdout");
+                m.insert("report".into(), rep);
+            }
+            r
+        };
+        let state = std::path::Path::new(&s.state_dir);
+        match name {
+            "sys_maintain" => {
+                let act = req_str(a, "action")?;
+                if !["status", "check_updates", "upgrade", "clean", "services", "logs"].contains(&act) {
+                    return Err(format!("unknown action {act}"));
+                }
+                let pk = arg_str(a, "packages").unwrap_or("").trim().to_string();
+                if pk.chars().any(|c| !(c.is_ascii_alphanumeric() || " .+-_:@=".contains(c))) {
+                    return Err("packages: names only (letters, digits, . + - _ : @ =)".into());
+                }
+                let needs_root = matches!(act, "check_updates" | "upgrade" | "clean" | "logs");
+                let rp = if needs_root { root? } else { root.unwrap_or("") };
+                if act == "upgrade" {
+                    let what = if pk.is_empty() { "upgrade all packages".to_string() } else { format!("upgrade {pk}") };
+                    if let Some(c) = self.confirm_gate(name, a, vec![what]) {
+                        return Ok(c);
+                    }
+                }
+                let t = (arg_i64(a, "timeout", if act == "upgrade" { 600 } else { 180 }).max(1) as u64).min(s.max_timeout.max(600));
+                let mut args = vec![act.to_string()];
+                args.extend(pk.split_whitespace().map(String::from));
+                Ok(ok(finish(run(so::MAINTAIN, args, t, rp).await?)))
+            }
+            "config_backup" => {
+                let rp = root?;
+                let out = match arg_str(a, "path").filter(|p| !p.is_empty()) {
+                    Some(p) => self.policy.check_path(p, true)?,
+                    None => state.join("backups").join(format!("config-{}.tar.gz", guard::now())).display().to_string(),
+                };
+                let r = finish(run(so::BACKUP, vec![out.clone()], 300, rp).await?);
+                let mut r = ok(r);
+                if std::path::Path::new(&out).is_file() {
+                    r["sha256"] = json!(xfer::sha256_file(&out)?);
+                }
+                Ok(r)
+            }
+            "firmware_check" | "firmware_flash" => {
+                let p = self.policy.check_path(req_str(a, "path")?, false)?;
+                if !std::path::Path::new(&p).is_file() {
+                    return Err(format!("{p}: not a file"));
+                }
+                let got = xfer::sha256_file(&p)?;
+                let want = arg_str(a, "sha256").unwrap_or("").trim().to_lowercase();
+                let sha_ok = want.is_empty() || want == got;
+                if name == "firmware_check" {
+                    let mut r = ok(finish(run(so::FW_CHECK, vec![p.clone()], 120, "").await?));
+                    r["sha256"] = json!(got);
+                    r["sha256_match"] = if want.is_empty() { Value::Null } else { json!(sha_ok) };
+                    return Ok(r);
+                }
+                if want.is_empty() || !sha_ok {
+                    return Err(format!("sha256 mismatch: image is {got}"));
+                }
+                let keep = arg_bool(a, "keep_config", true);
+                let what = format!("flash {p} with sysupgrade{} (device reboots)", if keep { "" } else { " -n, wiping all settings" });
+                if let Some(c) = self.confirm_gate(name, a, vec![what]) {
+                    return Ok(c);
+                }
+                let chk = finish(run(so::FW_CHECK, vec![p.clone()], 120, "").await?);
+                if chk["report"]["sysupgrade_test_rc"] != "0" {
+                    return Ok(json!({"status": "error", "error": "sysupgrade -T rejected the image", "check": chk["report"]}));
+                }
+                let bk = state.join("backups").join(format!("pre-flash-{}.tar.gz", guard::now())).display().to_string();
+                let b = finish(run(so::BACKUP, vec![bk.clone()], 300, "").await?);
+                if b["exit_code"] != 0 {
+                    return Ok(json!({"status": "error", "error": "config backup failed; not flashing", "backup": b}));
+                }
+                let mut fargs = vec![p.clone(), if keep { "1" } else { "0" }.into()];
+                if let Ok(exe) = std::env::current_exe() {
+                    fargs.push(exe.display().to_string());
+                }
+                if let Some(dir) = std::path::Path::new(&s.env_file).parent().filter(|d| d.starts_with("/etc")) {
+                    fargs.push(dir.display().to_string());
+                } else if !s.env_file.is_empty() {
+                    fargs.push(s.env_file.clone());
+                }
+                let r = finish(run(so::FW_FLASH, fargs, 60, "").await?);
+                Ok(json!({"status": if r["report"]["started"] == "yes" { "ok" } else { "error" }, "flash": r["report"], "lines": r["report"]["lines"], "backup": bk,
+                          "note": "sysupgrade starts in 3 s; the device reboots and ShellGate is unreachable for a few minutes"}))
+            }
+            "os_reinstall" => {
+                let rp = root?;
+                let distro = req_str(a, "distro")?.trim().to_lowercase();
+                if !so::DISTROS.contains(&distro.as_str()) {
+                    return Err(format!("distro must be one of {}", so::DISTROS.join(", ")));
+                }
+                let safe = |x: &str| x.chars().all(|c| !c.is_control());
+                let mut args = vec![distro.clone()];
+                if let Some(r) = arg_str(a, "release").filter(|r| !r.trim().is_empty()) {
+                    if !r.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                        return Err("release: letters, digits, dots only".into());
+                    }
+                    args.push(r.trim().into());
+                }
+                let key = arg_str(a, "ssh_key").filter(|k| !k.trim().is_empty());
+                let pw = arg_str(a, "password").filter(|k| !k.is_empty());
+                if key.is_none() && pw.is_none() {
+                    return Err("give ssh_key (preferred) or password for the new system's root login".into());
+                }
+                if let Some(k) = key { if !safe(k) { return Err("ssh_key has control characters".into()); } args.push("--ssh-key".into()); args.push(k.trim().into()); }
+                if let Some(p) = pw { if !safe(p) { return Err("password has control characters".into()); } args.push("--password".into()); args.push(p.into()); }
+                if let Some(e) = arg_str(a, "extra").filter(|e| !e.trim().is_empty()) {
+                    if !safe(e) || e.contains(['`', '$', ';', '|', '&', '<', '>']) {
+                        return Err("extra: plain options only".into());
+                    }
+                    args.extend(e.split_whitespace().map(String::from));
+                }
+                let reboot = arg_bool(a, "reboot", false);
+                let url = arg_str(a, "script_url").filter(|u| !u.is_empty()).unwrap_or(so::REINSTALL_URL).to_string();
+                if !url.starts_with("https://") {
+                    return Err("script_url must be https".into());
+                }
+                let what = format!("reinstall this machine as {}{}: the system disk is wiped", args[..if args.len() > 1 && !args[1].starts_with("--") { 2 } else { 1 }].join(" "),
+                                   if reboot { ", rebooting right away" } else { " (prepared; reboot to start)" });
+                if let Some(c) = self.confirm_gate(name, a, vec![what]) {
+                    return Ok(c);
+                }
+                let dir = state.join("reinstall").display().to_string();
+                let mut sargs = vec![url, dir];
+                sargs.extend(args);
+                let r = finish(run(so::REINSTALL, sargs, 600, rp).await?);
+                let ok_run = r["report"]["reinstall_rc"] == "0";
+                let mut out = json!({"status": if ok_run { "ok" } else { "error" }, "report": r["report"]});
+                if ok_run && reboot {
+                    let mut c = platform::new_command("sh");
+                    c.args(["-c", &format!("( sleep 3; {}reboot ) </dev/null >/dev/null 2>&1 &", rp)]);
+                    let _ = exec::run_cmd(s, &self.sem, c, 10, None).await;
+                    out["note"] = json!("rebooting into the installer in 3 s; reach the new system over SSH when it finishes");
+                } else if ok_run {
+                    out["note"] = json!("installer prepared; reboot to start it (run_command reboot)");
+                }
+                Ok(out)
+            }
+            _ => Err(format!("unknown tool {name}")),
+        }
+    }
+
     async fn dispatch(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
         let s = &self.policy.settings;
         if name.starts_with("ventoy_") && !cfg!(feature = "ventoy") {
@@ -954,6 +1124,9 @@ impl App {
                 return Err("desktop tools are off; set desktop=on in shellgate.env to enable them".into());
             }
             return self.desktop(name, a).await;
+        }
+        if matches!(name, "sys_maintain" | "config_backup" | "firmware_check" | "firmware_flash" | "os_reinstall") {
+            return self.sysops(name, a).await;
         }
         if crate::android::TOOL_NAMES.contains(&name) {
             if !cfg!(target_os = "android") {

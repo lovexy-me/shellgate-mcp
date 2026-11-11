@@ -167,6 +167,8 @@
   <div class="card">
     <div class="kv"><span class="v">开机自启</span><label class="switch"><input type="checkbox" id="a-auto" onchange="SGApp.setAutostart(this.checked)"><span></span></label></div>
     <div class="kv"><span class="v">后台常驻<div class="hint" id="a-batt-h"></div></span><button class="ghost sm" id="a-batt" onclick="SGApp.requestBatteryExempt()">去设置</button></div>
+    <div class="kv"><span class="v">屏幕控制（无障碍）<div class="hint" id="a-a11y-h"></div></span><button class="ghost sm" id="a-a11y" onclick="SGApp.openA11ySettings()">去打开</button></div>
+    <div class="kv"><span class="v">所有文件访问<div class="hint" id="a-files-h"></div></span><button class="ghost sm" id="a-files" onclick="SGApp.requestAllFiles()">去允许</button></div>
   </div>
 </div>
 
@@ -275,6 +277,17 @@ function appSec(){
   $('a-batt').hidden = ok;
   $('a-batt-h').innerHTML = ok ? '<span class="good">已允许，息屏也在线</span>'
     : '<span class="err">受电池优化限制，息屏后可能掉线</span>；国产系统还要在「应用启动管理」里放行';
+  if (SGApp.a11yEnabled) {
+    const a = SGApp.a11yEnabled();
+    $('a-a11y').textContent = a ? '设置' : '去打开';
+    $('a-a11y-h').innerHTML = a ? '<span class="good">已打开：可读屏、点按、输入、截图</span>'
+      : '关闭中。打开后远程可读屏幕控件、点按、输入（截图需安卓 11+）。在「已下载的应用」里找 ShellGate';
+  }
+  if (SGApp.allFilesGranted) {
+    const f = SGApp.allFilesGranted();
+    $('a-files').hidden = f;
+    $('a-files-h').innerHTML = f ? '<span class="good">已允许：可读写 /sdcard</span>' : '未允许：命令和文件工具只能访问应用自己的目录';
+  }
 }
 function fmtDur(s){ s=s|0; const d=s/86400|0,h=(s%86400)/3600|0,m=(s%3600)/60|0; return d?d+'天'+h+'时':(h?h+'时'+m+'分':m+'分'); }
 let TT=0; function toast(m){ const e=$('toast'); e.textContent=m; e.classList.add('show'); clearTimeout(TT); TT=setTimeout(()=>e.classList.remove('show'),1600); }

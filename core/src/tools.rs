@@ -11,6 +11,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::xfer;
+use crate::guard;
 use crate::audit::Audit;
 use crate::exec::{self, Jobs};
 use crate::platform;
@@ -28,6 +29,8 @@ pub struct App {
     /// last desktop_screenshot: coordinate mapping and content hash
     #[cfg_attr(not(all(windows, feature = "desktop")), allow(dead_code))]
     pub shot: std::sync::Mutex<Option<(crate::desktop::Mapping, u64)>>,
+    /// helper agents by kind ("session", "elevated"), see agent.rs
+    pub agents: Mutex<HashMap<String, crate::agent::Endpoint>>,
 }
 
 #[cfg(unix)]
@@ -218,7 +221,7 @@ pub fn definitions() -> Value {
     #[allow(unused_mut)]
     let mut v = json!([
         {"name": "run_command", "description": "Run a shell command (Linux: /bin/sh -c; Windows: cmd /C, or PowerShell when SHELLGATE_SHELL=powershell) and wait for it. Returns exit_code, stdout, stderr. timeout in seconds (default 60, max 600); for longer work use start_job. stdin (optional) is written to the command's standard input, e.g. command=\"ssh host sh -s\" with the script body in stdin.",
-         "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory (default: home)"), "timeout": i("Seconds"), "stdin": s("Text written to the command's stdin"), "confirm_code": confirm.clone()}), &["command"])},
+         "inputSchema": obj(json!({"command": s("Shell command"), "cwd": s("Working directory (default: home)"), "timeout": i("Seconds"), "stdin": s("Text written to the command's stdin"), "confirm_code": confirm.clone(), "sudo": b("Linux: run as root with sudo -n (no shell); only commands listed in SHELLGATE_SUDO_ALLOW, and sudoers must allow them without a password"), "elevated": b("Windows, when ShellGate is not already elevated: run as administrator through a helper started once with a UAC prompt on the user's screen (the user must accept it); later calls reuse it")}), &["command"])},
         {"name": "run_script", "description": "Run a multi-line script and wait for it (Linux: sh, bash, python3, ash; Windows: powershell, pwsh, cmd, python; with no interpreter given and no working PowerShell, as in most WinPE, cmd is used and the result carries a note). The script is written to a private temp file (removed afterwards) and run as `<interpreter> <file> <args...>`. Every line is checked by the same safety policy as run_command. Returns exit_code, stdout, stderr.",
          "inputSchema": obj(json!({"script": s("Script body"), "interpreter": {"type": "string", "enum": SCRIPT_INTERPRETERS, "default": DEFAULT_INTERPRETER, "description": SCRIPT_INTERPRETERS.join(", ")},
                                    "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the script"},
@@ -242,6 +245,13 @@ pub fn definitions() -> Value {
          "inputSchema": obj(json!({"path": s("Absolute path"), "offset": i("Byte offset, default 0"), "length": i("Bytes, default 262144, max 1048576")}), &["path"])},
         {"name": "write_binary", "description": "Upload a file in base64 chunks (each up to 1 MB decoded). Chunks go to <path>.sgpart: offset 0 starts it over, every other offset must equal the bytes already written (the answer gives next_offset, so an interrupted upload can resume). Pass the whole file's sha256 with the last chunk: it is verified, then the file replaces <path> (old one kept as .bak). On mismatch the partial file is deleted.",
          "inputSchema": obj(json!({"path": s("Absolute path"), "data": s("Base64 chunk"), "offset": i("Byte offset of this chunk, default 0"), "sha256": s("Whole file's SHA-256, with the last chunk")}), &["path", "data"])},
+        {"name": "guarded_change", "description": "Make a risky config change with automatic rollback: copies the listed files, runs the command, and unless guarded_confirm keeps it within timeout seconds, puts the files back and runs the reload command. Use it for uci / firewall / network / wireless edits made over the link they could break: after the change, check you can still reach the host, then confirm. On OpenWrt files default to /etc/config/{network,firewall,wireless,dhcp} and reload to reloading network, firewall, wifi and dnsmasq. The pending rollback survives a ShellGate restart or a reboot. Commands that only risk cutting remote access need no confirm code here (the rollback covers them); other dangerous commands still do.",
+         "inputSchema": obj(json!({"command": s("Shell command that makes the change, e.g. uci set ... && uci commit firewall && /etc/init.d/firewall reload"),
+                                   "files": {"type": "array", "items": {"type": "string"}, "description": "Files to snapshot and restore (absolute paths)"},
+                                   "reload": s("Command run after restoring the files"), "timeout": i("Seconds before the automatic rollback (15-900, default 120)"),
+                                   "cwd": s("Working directory"), "confirm_code": s("One-time code from a previous confirmation_required answer, only after the user agreed")}), &["command"])},
+        {"name": "guarded_confirm", "description": "Keep or undo a guarded_change: action=keep makes it permanent, action=rollback undoes it now, action=status (default) shows it and which files changed; with no id, lists recent guarded changes.",
+         "inputSchema": obj(json!({"id": s("Id returned by guarded_change"), "action": s("keep | rollback | status")}), &[])},
         {"name": "edit_file", "description": "Replace exact text in a file. old_string must be unique unless replace_all. Keeps a .bak copy.",
          "inputSchema": obj(json!({"path": s("Absolute path"), "old_string": s("Exact text to find"), "new_string": s("Replacement"), "replace_all": b("Replace every match")}), &["path", "old_string", "new_string"])},
         {"name": "list_dir", "description": "List a directory: name, type, size, modified time.",
@@ -276,10 +286,13 @@ pub fn definitions() -> Value {
          "inputSchema": obj(json!({"url": s("http:// or https:// URL"), "method": s("GET (default), POST, PUT, ..."), "headers": json!({"type": "object", "description": "request headers (optional)", "additionalProperties": {"type": "string"}}), "body": s("request body (optional)"), "insecure": b("skip TLS certificate verification (self-signed devices)"), "timeout_s": i("default 30, max 120"), "max_bytes": i("max body bytes, default 262144")}), &["url"])}),
         ]);
     }
+    #[cfg(feature = "admin-lite")]
+    if let Value::Array(a) = &mut v {
+        a.push(json!({"name": "connection_info", "description": "This server's own connection details for an MCP client: the public tunnel URL (if set), the LAN address, the edition, tunnel status and uptime. Does not include the token.", "inputSchema": obj(json!({}), &[])}));
+    }
     #[cfg(feature = "admin")]
     if let Value::Array(a) = &mut v {
         a.extend([
-        json!({"name": "connection_info", "description": "This server's own connection details for an MCP client: the public tunnel URL (if set), the LAN address, the edition, tunnel status and uptime. Does not include the token.", "inputSchema": obj(json!({}), &[])}),
         json!({"name": "cloudflare_setup", "description": "Set up (or tear down) a Cloudflare named tunnel for this host from the user's own Cloudflare API token, and switch this server to tunnel mode. Steps: verify the token, pick the account and the zone for the hostname, create a tunnel, add a DNS CNAME and the ingress route to http://127.0.0.1:<port>, write tunnel_token and public_url into the config, and start cloudflared. The API token is used only for this call and is not stored unless save_token=true. action: plan (check token, list zones/accounts), create (do it), remove (delete the tunnel and DNS record).",
          "inputSchema": obj(json!({"action": s("plan | create | remove"), "api_token": s("Cloudflare API token (Zone:DNS edit + Account:Cloudflare Tunnel edit). Not stored unless save_token=true"), "hostname": s("public hostname, e.g. pc.example.com (must be a zone in this account)"), "account_id": s("Cloudflare account id (optional if the token has one account)"), "tunnel_name": s("tunnel name (default: the hostname's first label)"), "save_token": b("also save the API token in the config for later changes (default false)")}), &["action"])}),
         ]);
@@ -325,6 +338,22 @@ impl App {
                 a.extend(crate::desktop::definitions());
             }
         }
+        if cfg!(target_os = "android") {
+            if let Value::Array(a) = &mut v {
+                a.extend(crate::android::definitions());
+            }
+        }
+        if cfg!(all(unix, not(target_os = "android"))) && self.policy.settings.desktop {
+            if let Value::Array(a) = &mut v {
+                a.extend(crate::desktop::definitions().into_iter()
+                    .filter(|t| ["desktop_screenshot", "desktop_input", "desktop_windows"].contains(&t["name"].as_str().unwrap_or("")))
+                    .map(|mut t| {
+                        let d = t["description"].as_str().unwrap_or("").to_string();
+                        t["description"] = json!(format!("Linux (X11/Wayland via grim, import or scrot / xdotool or ydotool / wmctrl; coordinates are physical pixels, no scaling, no Set-of-Marks): {d}"));
+                        t
+                    }));
+            }
+        }
         v
     }
 
@@ -349,17 +378,123 @@ impl App {
         }))
     }
 
-    #[cfg(not(all(windows, feature = "desktop")))]
+    #[cfg(not(any(all(windows, feature = "desktop"), all(unix, not(target_os = "android")))))]
     async fn desktop(self: &Arc<Self>, _name: &str, _a: &Value) -> Result<Value, String> {
-        Err("desktop tools exist only in the Windows desktop (PE edition) build".into())
+        Err("desktop tools exist only in the Windows and Linux desktop builds".into())
     }
 
-    #[cfg(all(windows, feature = "desktop"))]
+    #[cfg(all(unix, not(target_os = "android")))]
     async fn desktop(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
         let me = self.clone();
         let name = name.to_string();
         let a = a.clone();
+        tokio::task::spawn_blocking(move || me.desktop_linux(&name, &a)).await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn desktop_linux(&self, name: &str, a: &Value) -> Result<Value, String> {
+        use crate::desktop as d;
+        use crate::desktop_linux as l;
+        match name {
+            "desktop_screenshot" => {
+                let region = a.get("region").and_then(Value::as_array).and_then(|r| {
+                    let v: Vec<i64> = r.iter().filter_map(Value::as_i64).collect();
+                    (v.len() == 4 && v[2] > 0 && v[3] > 0).then(|| (v[0], v[1], v[2], v[3]))
+                });
+                let (png, tool) = l::screenshot(region)?;
+                let (w, h) = l::png_size(&png).unwrap_or((0, 0));
+                let hash = Policy::fingerprint(&[xfer::sha256_hex(&png)]);
+                let (ox, oy) = region.map(|r| (r.0 as i32, r.1 as i32)).unwrap_or((0, 0));
+                let map = d::Mapping { ox, oy, scale: 1.0 };
+                let prev = self.shot.lock().unwrap().replace((map, hash));
+                if arg_bool(a, "only_if_changed", true) && prev.is_some_and(|(m, h)| m == map && h == hash) {
+                    return Ok(json!({"changed": false, "width": w, "height": h, "origin": [ox, oy], "tool": tool}));
+                }
+                Ok(json!({"changed": true, "width": w, "height": h, "origin": [ox, oy], "tool": tool,
+                          "note": "coordinates are physical screen pixels (Linux screenshots are not scaled)",
+                          "_image": {"data": d::b64(&png), "mimeType": "image/png"}}))
+            }
+            "desktop_input" => {
+                let actions = d::parse_actions(a.get("actions").unwrap_or(&Value::Null))?;
+                let reasons = d::batch_reasons(&actions, false, &|t| self.policy.text_danger_reasons(t));
+                if let Some(c) = self.confirm_gate(name, a, reasons) {
+                    return Ok(c);
+                }
+                let map = if arg_str(a, "coords") == Some("physical") { None } else { self.shot.lock().unwrap().map(|x| x.0) }
+                    .unwrap_or(d::Mapping { ox: 0, oy: 0, scale: 1.0 });
+                let n = l::input(&actions, &map)?;
+                Ok(json!({"status": "ok", "done": n}))
+            }
+            "desktop_windows" => {
+                let action = arg_str(a, "action").unwrap_or("list");
+                if action == "list" {
+                    return Ok(json!({"status": "ok", "windows": l::windows()?}));
+                }
+                let (id, title) = l::find_window(arg_str(a, "window"))?;
+                if action == "close" {
+                    if let Some(c) = self.confirm_gate(name, a, vec![format!("close window \"{title}\" (unsaved work may be lost)")]) {
+                        return Ok(c);
+                    }
+                }
+                l::window_action(action, &id)
+            }
+            _ => Err(format!("{name} is not available on Linux (no UI Automation): use desktop_screenshot and desktop_input with coordinates")),
+        }
+    }
+
+    #[cfg(all(windows, feature = "desktop"))]
+    async fn desktop(self: &Arc<Self>, name: &str, a: &Value) -> Result<Value, String> {
+        if crate::agent_win::in_service_session() {
+            // a service has no desktop: hand the call to a copy of ShellGate in the user's session
+            let ep = self.agent("session").await?;
+            return crate::agent::call(&ep, &json!({"op": "desktop", "name": name, "args": a}), Duration::from_secs(120)).await;
+        }
+        let me = self.clone();
+        let name = name.to_string();
+        let a = a.clone();
         tokio::task::spawn_blocking(move || me.desktop_blocking(&name, &a)).await.map_err(|e| e.to_string())?
+    }
+
+    /// Desktop call run in this process (what a session agent does for the service).
+    pub fn desktop_local(&self, name: &str, a: &Value) -> Result<Value, String> {
+        #[cfg(all(windows, feature = "desktop"))]
+        { self.desktop_blocking(name, a) }
+        #[cfg(all(unix, not(target_os = "android")))]
+        { self.desktop_linux(name, a) }
+        #[cfg(not(any(all(windows, feature = "desktop"), all(unix, not(target_os = "android")))))]
+        { let _ = (name, a); Err("no desktop in this build".into()) }
+    }
+
+    /// Endpoint of a running helper agent of this kind, starting it if needed.
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    async fn agent(&self, kind: &str) -> Result<crate::agent::Endpoint, String> {
+        let mut agents = self.agents.lock().await;
+        if let Some(ep) = agents.get(kind) {
+            if crate::agent::call(ep, &json!({"op": "ping"}), Duration::from_secs(3)).await.is_ok() {
+                return Ok(ep.clone());
+            }
+            agents.remove(kind);
+        }
+        #[cfg(not(windows))]
+        { return Err(format!("{kind} helper agents are a Windows feature")); }
+        #[cfg(windows)]
+        {
+            let s = &self.policy.settings;
+            let secret = random_hex(16);
+            let pf = crate::agent::port_file(&s.state_dir, kind);
+            let _ = fs::remove_file(&pf);
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
+            let args = vec!["--env-file".into(), s.env_file.clone(), "--agent".into(), kind.to_string(), secret.clone(),
+                            pf.display().to_string(), std::process::id().to_string()];
+            let wait = match kind {
+                "session" => { crate::agent_win::spawn_in_user_session(&exe, &args)?; 20 }
+                "elevated" => { crate::agent_win::spawn_elevated(&exe, &args)?; 120 }
+                other => return Err(format!("unknown agent kind {other}")),
+            };
+            let ep = crate::agent::wait_ready(&pf, &secret, Duration::from_secs(wait)).await?;
+            agents.insert(kind.to_string(), ep.clone());
+            Ok(ep)
+        }
     }
 
     #[cfg(all(windows, feature = "desktop"))]
@@ -652,6 +787,69 @@ impl App {
         }))
     }
 
+    async fn android(&self, name: &str, a: &Value) -> Result<Value, String> {
+        let sd = self.policy.settings.state_dir.clone();
+        if name == "android_screen" {
+            if arg_str(a, "action") == Some("screenshot") {
+                let r = crate::android::call(&sd, json!({"op": "screenshot", "max_width": arg_i64(a, "max_width", 1080)}), Duration::from_secs(20)).await?;
+                let png = r["png"].as_str().unwrap_or("").to_string();
+                return Ok(json!({"status": "ok", "width": r["width"], "height": r["height"], "screen_width": r["screen_width"],
+                                 "screen_height": r["screen_height"], "note": "tap/swipe take screen pixels: scale by screen_width/width",
+                                 "_image": {"data": png, "mimeType": "image/png"}}));
+            }
+            let r = crate::android::call(&sd, json!({"op": "tree", "max_nodes": arg_i64(a, "max_nodes", 300)}), Duration::from_secs(20)).await?;
+            crate::android::remember_tree(r["tree"].as_str().unwrap_or(""));
+            return Ok(json!({"status": "ok", "package": r["package"], "count": r["count"], "truncated": r["truncated"], "tree": r["tree"]}));
+        }
+        let (req, reasons) = crate::android::plan(a, &|t| self.policy.text_danger_reasons(t))?;
+        if let Some(c) = self.confirm_gate(name, a, reasons) {
+            return Ok(c);
+        }
+        let r = crate::android::call(&sd, req, Duration::from_secs(15)).await?;
+        Ok(json!({"status": "ok", "result": r}))
+    }
+
+    async fn guarded_change(&self, a: &Value) -> Result<Value, String> {
+        let s = &self.policy.settings;
+        let cmd = req_str(a, "command")?;
+        let cwd = self.resolve_cwd(arg_str(a, "cwd"))?;
+        let v = self.policy.allowlist_violations(cmd);
+        if !v.is_empty() {
+            return Ok(json!({"status": "denied", "reasons": v}));
+        }
+        let openwrt = guard::is_openwrt();
+        let files: Vec<String> = match a.get("files").and_then(Value::as_array) {
+            Some(l) if !l.is_empty() => l.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            _ if openwrt => guard::OPENWRT_FILES.iter().map(|x| x.to_string()).collect(),
+            _ => vec![],
+        };
+        let mut checked = vec![];
+        for f in &files {
+            checked.push(self.policy.check_path(f, true)?);
+        }
+        let reload = match arg_str(a, "reload") {
+            Some(r) => r.to_string(),
+            None if openwrt && a.get("files").and_then(Value::as_array).is_none_or(|l| l.is_empty()) => guard::OPENWRT_RELOAD.to_string(),
+            None => String::new(),
+        };
+        let mut reasons: Vec<String> = self.policy.text_danger_reasons(cmd).into_iter()
+            .filter(|r| !guard::COVERED_REASONS.contains(&r.as_str())).collect();
+        reasons.extend(self.policy.text_danger_reasons(&reload).into_iter()
+            .filter(|r| !guard::COVERED_REASONS.contains(&r.as_str())).map(|r| format!("{r} (in reload)")));
+        if let Some(c) = self.confirm_gate("guarded_change", a, reasons) {
+            return Ok(c);
+        }
+        let timeout = (arg_i64(a, "timeout", guard::DEFAULT_TIMEOUT as i64).max(0) as u64).clamp(guard::MIN_TIMEOUT, guard::MAX_TIMEOUT);
+        let (id, dir, meta) = guard::snapshot(&s.state_dir, &checked, cmd, &reload, timeout)?;
+        // arm before running: if the command cuts us off (or restarts ShellGate) the rollback still happens
+        guard::arm(dir.clone(), s.shell.clone(), meta["deadline"].as_u64().unwrap_or(0));
+        let run_t = s.default_timeout.min(timeout.saturating_sub(5).max(5));
+        let out = exec::run_once(s, &self.sem, cmd, &cwd, run_t, None).await?;
+        let changed = guard::changed_files(&dir, &meta);
+        Ok(json!({"status": "ok", "id": id, "result": out, "changed_files": changed, "rollback_in_s": timeout,
+                  "next": format!("Check the host is still reachable and works as intended, then call guarded_confirm id={id} action=keep. Without it, the files are restored and the reload runs in {timeout} s.")}))
+    }
+
     fn backup(&self, p: &str) -> Option<String> {
         if !self.policy.settings.backup_on_write || !Path::new(p).is_file() {
             return None;
@@ -757,6 +955,12 @@ impl App {
             }
             return self.desktop(name, a).await;
         }
+        if crate::android::TOOL_NAMES.contains(&name) {
+            if !cfg!(target_os = "android") {
+                return Err(format!("{name} is only in the Android app"));
+            }
+            return self.android(name, a).await;
+        }
         match name {
             "run_command" => {
                 let cmd = req_str(a, "command")?;
@@ -765,10 +969,42 @@ impl App {
                 if stdin.is_some_and(|t| t.len() > MAX_STDIN) {
                     return Err("stdin larger than 4 MB".into());
                 }
-                if let Some(b) = self.gate("run", cmd, &cwd, arg_str(a, "confirm_code"), stdin, None, &[]) {
+                let elevated = arg_bool(a, "elevated", false);
+                if elevated && !platform::is_elevated() {
+                    if !cfg!(windows) {
+                        return Err("elevated=true is for Windows; on Linux use sudo=true with SHELLGATE_SUDO_ALLOW".into());
+                    }
+                    if let Some(b) = self.gate("elevated", cmd, &cwd, arg_str(a, "confirm_code"), stdin, None, &[]) {
+                        return Ok(b);
+                    }
+                    let t = (arg_i64(a, "timeout", s.default_timeout as i64).max(1) as u64).min(s.max_timeout);
+                    let ep = self.agent("elevated").await?;
+                    let mut r = crate::agent::call(&ep, &json!({"op": "run", "command": cmd, "cwd": cwd, "timeout": t, "stdin": stdin}),
+                                                   Duration::from_secs(t + 15)).await?;
+                    r["elevated"] = json!(true);
+                    return Ok(ok(r));
+                }
+                let sudo = arg_bool(a, "sudo", false);
+                if sudo && cfg!(windows) {
+                    return Err("sudo=true is for Linux; on Windows run ShellGate elevated instead".into());
+                }
+                let argv = if sudo { Some(crate::policy::sudo_argv(cmd, &s.sudo_allow)?) } else { None };
+                if let Some(b) = self.gate(if sudo { "sudo" } else { "run" }, cmd, &cwd, arg_str(a, "confirm_code"), stdin, None, &[]) {
                     return Ok(b);
                 }
                 let t = (arg_i64(a, "timeout", s.default_timeout as i64).max(1) as u64).min(s.max_timeout);
+                if let Some(argv) = argv {
+                    let mut args = vec!["-n".to_string(), "--".to_string()];
+                    args.extend(argv.iter().cloned());
+                    let mut r = exec::run_argv(s, &self.sem, "sudo", &args, &cwd, t, stdin).await?;
+                    if r["exit_code"] == 1 && r["stderr"].as_str().unwrap_or("").to_lowercase().contains("password") {
+                        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+                        let prog = platform::which(&argv[0]).unwrap_or_else(|| argv[0].clone());
+                        r["hint"] = json!(format!("sudo wants a password: add a sudoers rule such as '{user} ALL=(root) NOPASSWD: {prog} *' via visudo"));
+                    }
+                    r["sudo"] = json!(true);
+                    return Ok(ok(r));
+                }
                 exec::run_once(s, &self.sem, cmd, &cwd, t, stdin).await.map(ok)
             }
             "run_script" => {
@@ -897,6 +1133,29 @@ impl App {
                     atomic_write(&p, content.as_bytes())?;
                 }
                 Ok(json!({"status": "ok", "path": p, "bytes": content.len(), "backup": bak}))
+            }
+            "guarded_change" => self.guarded_change(a).await,
+            "guarded_confirm" => {
+                let sd = s.state_dir.clone();
+                let Some(id) = arg_str(a, "id").filter(|x| !x.is_empty()) else {
+                    return Ok(json!({"status": "ok", "guards": guard::list(&sd)}));
+                };
+                let dir = guard::find(&sd, id)?;
+                match arg_str(a, "action").unwrap_or("status") {
+                    "keep" => {
+                        guard::transition(&dir, "kept")?;
+                        Ok(json!({"status": "ok", "id": id, "kept": true}))
+                    }
+                    "rollback" => guard::rollback(dir, s.shell.clone(), "rolled back by guarded_confirm").await,
+                    "status" => {
+                        let m = guard::read_meta(&dir)?;
+                        let changed = guard::changed_files(&dir, &m);
+                        let left = if m["status"] == "pending" { json!(m["deadline"].as_u64().unwrap_or(0).saturating_sub(guard::now())) } else { Value::Null };
+                        Ok(json!({"status": "ok", "id": id, "state": m["status"], "command": m["command"], "seconds_left": left,
+                                  "changed_files": changed, "rollback": m.get("rollback").cloned().unwrap_or(Value::Null)}))
+                    }
+                    other => Err(format!("action must be keep, rollback or status, not {other}")),
+                }
             }
             "file_hash" => {
                 let p = self.policy.check_path(req_str(a, "path")?, false)?;
@@ -1068,7 +1327,7 @@ impl App {
                 tokio::task::spawn_blocking(move || crate::lan::http_request(&method, &url, &headers, body.as_deref(), timeout, insecure, max))
                     .await.map_err(|e| e.to_string())?
             }
-            #[cfg(feature = "admin")]
+            #[cfg(feature = "admin-lite")]
             "connection_info" => Ok(crate::admin::connection_info(s, false)),
             #[cfg(feature = "admin")]
             "cloudflare_setup" => crate::cf::tool(s, a).await,

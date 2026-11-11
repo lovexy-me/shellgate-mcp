@@ -24,7 +24,7 @@ tests/              共用的 MCP 一致性测试（Python 版与 Rust 二进制
 
 | feature | 含义 |
 |---|---|
-| `edition-openwrt` | 路由器版：只含通用工具 |
+| `edition-openwrt` | 路由器版：通用工具 + `admin-lite`（精简管理页，无 Cloudflare 向导、无 HTTPS 客户端） |
 | `edition-pe` | = `ventoy` + `download` + `desktop` |
 | `edition-linux` | = `ventoy` + `download`（U 盘上救援 Linux 用） |
 | 默认（不加参数） | 全部功能，用于测试 |
@@ -37,9 +37,23 @@ cargo zigbuild --release --no-default-features --features edition-pe --target x8
 
 `system_info` 与 MCP `initialize` 的返回里带 `edition` 字段，可确认跑的是哪个版本。
 
+## v0.4 新增工具（Rust 核心；带 * 的 Python 版也有）
+
+| 工具 | 作用 | 平台 |
+|---|---|---|
+| `file_hash`* / `read_binary`* / `write_binary`* | 分块（每块 ≤1 MB）传二进制文件，sha256 整体校验后才替换目标，可续传；文本文件只能走会脱敏的 `read_file` | 全部 |
+| `run_command sudo=true`* | 只允许 `SHELLGATE_SUDO_ALLOW` 里列出的命令（`;` 分隔前缀），`sudo -n` 无 shell 执行，sudoers 需免密 | Linux |
+| `run_command elevated=true` | 普通用户运行时，第一次弹一次 UAC，之后经管理员助手进程执行 | Windows |
+| `guarded_change` / `guarded_confirm` | 改配置自动回滚：先备份文件再执行，超时未确认就恢复文件并重载；ShellGate 重启或整机重启后仍会回滚。OpenWrt 默认备份 network/firewall/wireless/dhcp | 全部（为 OpenWrt 设计） |
+| `desktop_screenshot` / `desktop_input` / `desktop_windows` | Linux 桌面：grim/import/scrot 截图，xdotool（或 ydotool）键鼠，wmctrl 窗口；需 `SHELLGATE_DESKTOP=1` 和会话的 `DISPLAY` | Linux |
+| 服务态桌面 | ShellGate 以服务（session 0）运行时，桌面工具自动交给在用户会话里启动的副本执行 | Windows |
+| `android_screen` / `android_act` | 读屏幕控件树、截图（安卓 11+）、点按/滑动/输入、返回/主页等；需在系统无障碍里打开「ShellGate 屏幕控制」 | Android |
+
+确认码现在只看真正执行的命令：`grep reboot`、`cat /etc/passwd` 这类只读命令的参数不再触发；管道喂给 sh/ssh、`$(...)`、`xargs rm` 等照样拦。
+
 ## 发布
 
-每个版本单独打标签、单独发布：`openwrt-v0.3.0`、`pe-v0.3.0`（版本号取 `core/Cargo.toml`），`wsl-v0.2.5`（取 `editions/wsl/pyproject.toml` 与 `__init__.py`）。标签与版本号不一致时发布会失败。
+每个版本单独打标签、单独发布：`openwrt-v0.4.0`、`pe-v0.4.0`（版本号取 `core/Cargo.toml`），`wsl-v0.2.8`（取 `editions/wsl/pyproject.toml` 与 `__init__.py`）。标签与版本号不一致时发布会失败。
 
 ## 许可
 

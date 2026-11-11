@@ -11,11 +11,16 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- all-files access, granted by the user in Settings (Android 11+); older versions use the storage pair -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
     <application
         android:label="ShellGate"
         android:icon="@drawable/ic_launcher"
         android:allowBackup="false"
+        android:requestLegacyExternalStorage="true"
         android:extractNativeLibs="true"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
@@ -38,6 +43,20 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Remote administration server (MCP) reachable through a Cloudflare tunnel; must keep running in the background." />
+        </service>
+
+        <!-- screen control for the ShellGate binary; off until the user turns it on in Accessibility settings -->
+        <service
+            android:name=".SgA11yService"
+            android:exported="true"
+            android:label="ShellGate 屏幕控制"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/sg_a11y" />
         </service>
 
         <receiver

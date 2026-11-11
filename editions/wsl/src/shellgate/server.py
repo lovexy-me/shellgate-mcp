@@ -25,7 +25,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from . import __version__
 from .audit import AuditLog, client_ip
 from .config import Settings, load_settings
-from .policy import (ConfirmStore, allowlist_violations, check_path, feeds_interpreter,
+from .policy import (ConfirmStore, sudo_argv, allowlist_violations, check_path, feeds_interpreter,
                      referenced_scripts, text_danger_reasons)
 from .redact import Redactor, footer
 from .runner import JobManager, run_once, run_process
@@ -160,17 +160,26 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
     @mcp.tool()
     @audited
     async def run_command(command: str, cwd: str | None = None, timeout: int | None = None,
-                          stdin: str | None = None, confirm_code: str | None = None) -> dict:
+                          stdin: str | None = None, confirm_code: str | None = None, sudo: bool = False) -> dict:
         """Run a shell command (bash -lc) and wait for it. Returns exit_code, stdout, stderr.
 
         timeout is in seconds (default 60, max 600). For longer work use start_job.
         stdin (optional) is written to the command's standard input, e.g. command="ssh host bash -s"
         with the script body in stdin, which avoids nested quoting.
+        sudo=true runs it as root with `sudo -n` (no shell), only for commands listed in
+        SHELLGATE_SUDO_ALLOW, and only when sudoers lets this user run them without a password.
         """
         wd = resolve_cwd(cwd)
         check_stdin(stdin)
-        if (blocked := gate("run", command, wd, confirm_code, stdin=stdin)):
+        argv = sudo_argv(command, settings.sudo_allow) if sudo else None
+        if (blocked := gate("sudo" if sudo else "run", command, wd, confirm_code, stdin=stdin)):
             return blocked
+        if argv is not None:
+            r = await run_process(["sudo", "-n", "--", *argv], wd, clamp_timeout(timeout), settings, sem, stdin)
+            if r.get("exit_code") == 1 and "password" in (r.get("stderr") or "").lower():
+                r["hint"] = ("sudo wants a password: add a sudoers rule such as "
+                             f"'{os.environ.get('USER', 'user')} ALL=(root) NOPASSWD: {shutil.which(argv[0]) or argv[0]} *' via visudo")
+            return {"status": "ok", "sudo": True, **r}
         return {"status": "ok", **await run_once(command, wd, clamp_timeout(timeout), settings, sem, stdin)}
 
     @mcp.tool()

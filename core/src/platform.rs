@@ -9,6 +9,18 @@ use tokio::process::{Child, Command};
 
 // ---------------------------------------------------------------- paths and home
 
+/// Running with root / administrator rights.
+pub fn is_elevated() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        crate::agent_win::is_elevated()
+    }
+}
+
 pub fn home() -> String {
     #[cfg(unix)]
     {

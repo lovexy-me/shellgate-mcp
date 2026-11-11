@@ -316,3 +316,27 @@ def check_path(path: str, settings: Settings, *, write: bool = False) -> str:
                 "use run_command for system files or extend SHELLGATE_ALLOWED_DIRS"
             )
     return resolved
+
+
+# ---- allowlisted sudo (v0.2.7): run_command sudo=true runs `sudo -n -- <argv>` (no shell) only when
+# the command is one plain command whose words start with an entry of SHELLGATE_SUDO_ALLOW.
+# Same rules as sudo_argv in core/src/policy.rs; tests/sudo_corpus.tsv is shared.
+_SUDO_META = set(";|&`$<>\n(){}*?[]~!#")
+
+
+def sudo_argv(command: str, allow: list[str]) -> list[str]:
+    if not allow:
+        raise PermissionError("sudo is off: list the allowed commands in SHELLGATE_SUDO_ALLOW (\";\"-separated)")
+    if any(c in _SUDO_META for c in command):
+        raise PermissionError("a sudo command must be one plain command: no shell operators, variables or globs")
+    try:
+        argv = shlex.split(command)
+    except ValueError as e:
+        raise PermissionError(f"cannot parse the command: {e}") from None
+    if not argv:
+        raise PermissionError("empty command")
+    for entry in allow:
+        want = entry.split()
+        if want and argv[:len(want)] == want:
+            return argv
+    raise PermissionError(f"not in SHELLGATE_SUDO_ALLOW: {' '.join(argv[:3])}")

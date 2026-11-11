@@ -307,6 +307,29 @@ pub fn ipv6_is_global(addr: &str) -> Option<bool> {
     Some(ip.segments()[0] >> 13 == 0b001)
 }
 
+/// The redactor a running server uses: configured domains plus the public URL's host (always
+/// masked, even when SHELLGATE_REDACT_DOMAINS does not list it), its own tokens, the PII switch.
+pub fn for_settings(settings: &crate::config::Settings, enabled: bool) -> Redactor {
+    let mut domains = settings.redact_domains.clone();
+    if let Some(host) = settings.public_url.split("://").nth(1).and_then(|r| r.split(['/', ':']).next()) {
+        if host.contains('.') && host.parse::<std::net::IpAddr>().is_err() {
+            domains.push(host.to_string());
+        }
+    }
+    Redactor::new(enabled, &domains)
+        .with_secrets(&[settings.token.clone(), settings.tunnel_token.clone()])
+        .with_pii(settings.redact_pii)
+}
+
+/// cloudflared prints its remote ingress config (`"hostname":"x.example.com"`): mask those names
+/// even when the domain is not configured, so a pasted log does not give the tunnel away.
+#[allow(dead_code)]
+pub fn mask_ingress_hosts(line: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(\\?"hostname\\?"\s*:\s*\\?")[^"\\]+"#).unwrap())
+        .replace_all(line, "${1}<host>").into_owned()
+}
+
 pub struct Redactor {
     pub enabled: bool,
     domain: Option<Regex>,
@@ -677,6 +700,13 @@ impl Redactor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ingress_hosts_masked() {
+        let l = r#"INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"phone.example.net\", \"service\":\"http://localhost:8790\"}]}" version=1"#;
+        let m = super::mask_ingress_hosts(l);
+        assert!(!m.contains("phone.example.net") && m.contains("<host>") && m.contains("localhost:8790"), "{m}");
+    }
+
     use super::*;
 
     fn red(t: &str) -> (String, String) {

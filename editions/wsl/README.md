@@ -130,6 +130,12 @@ claude mcp add --transport http shellgate https://shell.example.com/mcp \
 
 `run_command` gains an optional `stdin`; the new `run_script` tool runs a script body from a private temp file that is always removed. The confirmation policy now scans every line of scripts, local script files a command executes, and stdin fed to an interpreter; confirm codes are bound to the exact script/args/stdin/cwd.
 
+## 二进制文件与 sudo（v0.2.8）
+
+- `file_hash`、`read_binary`、`write_binary`：按块（每块 ≤1 MB，base64）传文件，最后一块带整个文件的 sha256，校验通过才替换目标（旧文件留 .bak），中断可按 `next_offset` 续传。文本文件不能用 `read_binary` 读，必须走会脱敏的 `read_file`。
+- `run_command` 加 `sudo=true`：只允许 `SHELLGATE_SUDO_ALLOW` 里列的命令，不经 shell（不能带 `;`、`|`、`$` 等），以 `sudo -n` 运行；sudoers 要给这些命令免密。
+- 确认码只看真正执行的命令：`grep reboot`、`cat /etc/passwd` 不再要确认码。
+
 ## 配置
 
 见 [`deploy/env.example`](deploy/env.example)。常用项：

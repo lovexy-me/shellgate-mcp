@@ -39,7 +39,8 @@ def server(tmp_path_factory):
                SHELLGATE_ENV_FILE=str(tmp / "cfg" / "env"),
                SHELLGATE_STATE_DIR=str(tmp / "state"),
                SHELLGATE_ALLOWED_DIRS=str(work),
-               SHELLGATE_REDACT="1", SHELLGATE_REDACT_DOMAINS="example.org")
+               SHELLGATE_REDACT="1", SHELLGATE_REDACT_DOMAINS="example.org",
+               SHELLGATE_SUDO_ALLOW="id -u;systemctl status")
     cmd = [BIN] if BIN else [sys.executable, "-m", "shellgate"]
     proc = subprocess.Popen(cmd, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -297,3 +298,37 @@ async def test_write_binary_base64_with_newlines(server):
     r = await _call(url, "write_binary", path=str(work / "nl.bin"), data=enc,
                     sha256=hashlib.sha256(blob).hexdigest())
     assert r["status"] == "ok" and r["verified"] is True
+
+
+async def test_guarded_change_rollback(server):
+    url, work, _ = server
+    if not BIN:
+        pytest.skip("guarded_change is in the Rust build")
+    cfg = work / "fw.conf"
+    cfg.write_text("option input REJECT\n")
+    r = await _call(url, "guarded_change", command=f"echo 'option input ACCEPT' > {cfg}", files=[str(cfg)],
+                    reload=f"touch {work / 'reloaded'}", timeout=15)
+    assert r["status"] == "ok" and r["changed_files"] == [str(cfg)]
+    assert "ACCEPT" in cfg.read_text()
+    st = await _call(url, "guarded_confirm", id=r["id"])
+    assert st["state"] == "pending" and 0 < st["seconds_left"] <= 15
+    rb = await _call(url, "guarded_confirm", id=r["id"], action="rollback")
+    assert rb["status"] == "rolled_back"
+    assert cfg.read_text() == "option input REJECT\n" and (work / "reloaded").exists()
+    k = await _call(url, "guarded_change", command=f"echo x >> {cfg}", files=[str(cfg)], timeout=15)
+    assert (await _call(url, "guarded_confirm", id=k["id"], action="keep"))["kept"] is True
+    assert cfg.read_text().endswith("x\n")
+    lst = await _call(url, "guarded_confirm")
+    assert {g["id"] for g in lst["guards"]} >= {r["id"], k["id"]}
+
+
+async def test_sudo_allowlist(server):
+    url, work, _ = server
+    denied = await _call(url, "run_command", command="id -un", sudo=True)
+    assert denied["status"] == "error" and "SHELLGATE_SUDO_ALLOW" in denied["error"]
+    chained = await _call(url, "run_command", command="id -u; id", sudo=True)
+    assert chained["status"] == "error"
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+        pytest.skip("passwordless sudo not available here")
+    r = await _call(url, "run_command", command="id -u", sudo=True)
+    assert r["sudo"] is True and r["exit_code"] == 0 and r["stdout"].strip() == "0"

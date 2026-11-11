@@ -61,6 +61,21 @@ sh uninstall.sh            # 加 --purge 删除配置
 
 客户端配置：URL `https://<主机名>/mcp`，请求头 `Authorization: Bearer <令牌>`。
 
+## 改网络 / 防火墙时自动回滚（v0.4）
+
+通过隧道改路由器配置，最怕一改就把自己关在门外。用 `guarded_change`：
+
+1. 它先备份 `/etc/config/{network,firewall,wireless,dhcp}`（也可用 `files` 指定），再执行你的命令；
+2. 返回 `id` 和倒计时（默认 120 秒，15–900 可调）；
+3. 确认还能连上、功能正常后调用 `guarded_confirm id=… action=keep`；
+4. 没确认（比如连接已断）就自动恢复文件并重载 network、firewall、wifi、dnsmasq。ShellGate 被重启、甚至路由器重启后，开机也会补做回滚。
+
+只会断远程的操作（重启 network/firewall 等）在 `guarded_change` 里不再要确认码，因为有回滚兜底；其他危险命令照样要。
+
+## 精简管理页（v0.4）
+
+OpenWrt 版自带精简管理页（状态、网络模式、隧道令牌、日志），默认 `127.0.0.1:8791`，钥匙在状态目录的 `admin.key`。见 `env.example` 里的 `SHELLGATE_ADMIN_HOST`。没有 Cloudflare 一键向导（为了不带 HTTPS 客户端），隧道请在 CF 后台建好后把令牌贴进来。
+
 ## 自己编译
 
 ```sh

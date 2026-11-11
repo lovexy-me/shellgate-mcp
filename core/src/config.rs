@@ -69,6 +69,8 @@ pub struct Settings {
     pub redact_domains: Vec<String>,
     /// personal-data rules (email, CN mobile, IMEI, serial, SSID); SHELLGATE_REDACT_PII=0 turns them off
     pub redact_pii: bool,
+    /// commands run_command may run as root (sudo=true), ";"-separated prefixes; empty = off
+    pub sudo_allow: Vec<String>,
     // ---- rescue stick (v0.3.0)
     pub net: NetMode,
     pub tunnel_token: String,
@@ -98,7 +100,7 @@ impl Settings {
             extra_danger_patterns: vec![], audit_log: "/tmp/a".into(), audit_max_bytes: 1,
             default_timeout: 1, max_timeout: 1, max_output_bytes: 1, max_concurrent: 1, max_jobs: 1,
             confirm_ttl: 60, shell: platform::default_shell(), backup_on_write: true, env_file: String::new(),
-            redact: true, redact_domains: vec![], redact_pii: true, net: NetMode::Local, tunnel_token: String::new(),
+            redact: true, redact_domains: vec![], redact_pii: true, sudo_allow: vec![], net: NetMode::Local, tunnel_token: String::new(),
             cloudflared: String::new(), mdns: false, mdns_name: "ventoy-rescue".into(), ventoy_root: String::new(),
             state_dir: String::new(), pe_network: true, desktop: false, admin_port: 0, public_url: String::new(),
         }
@@ -380,7 +382,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
     protected.extend(split(&get("SHELLGATE_PROTECTED_PATHS", "")));
 
     #[cfg(unix)]
-    let default_dirs = if cfg!(target_os = "android") { h.clone() } else { format!("/tmp,{h},/etc/config") };
+    let default_dirs = if cfg!(target_os = "android") { format!("{h},/storage/emulated/0") } else { format!("/tmp,{h},/etc/config") };
     #[cfg(windows)]
     let default_dirs = {
         let mut d = vec![env::temp_dir().display().to_string(), h.clone()];
@@ -410,6 +412,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
         redact: !matches!(get("SHELLGATE_REDACT", "1").trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
         redact_domains: split(&get("SHELLGATE_REDACT_DOMAINS", "")),
         redact_pii: !matches!(get("SHELLGATE_REDACT_PII", "1").trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        sudo_allow: get("SHELLGATE_SUDO_ALLOW", "").split(';').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
         net,
         tunnel_token,
         cloudflared: get("SHELLGATE_CLOUDFLARED", ""),
@@ -419,7 +422,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
         state_dir: expand(&state_dir),
         pe_network: truthy(&get("SHELLGATE_PE_NETWORK", "1")),
         desktop: truthy(&get("SHELLGATE_DESKTOP", "0")),
-        admin_port: num("SHELLGATE_ADMIN_PORT", if cfg!(feature = "admin") { 8791 } else { 0 }),
+        admin_port: num("SHELLGATE_ADMIN_PORT", if cfg!(feature = "admin-lite") { 8791 } else { 0 }),
         public_url: get("SHELLGATE_PUBLIC_URL", "").trim_end_matches('/').to_string(),
     })
 }

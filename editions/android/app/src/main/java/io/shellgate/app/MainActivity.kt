@@ -105,6 +105,26 @@ class MainActivity : Activity() {
                 }
             }
         }
+        @JavascriptInterface fun a11yEnabled(): Boolean = SgA11yService.active
+        @JavascriptInterface fun openA11ySettings() {
+            ui.post { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+        }
+        @JavascriptInterface fun allFilesGranted(): Boolean =
+            if (Build.VERSION.SDK_INT >= 30) android.os.Environment.isExternalStorageManager()
+            else checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") == android.content.pm.PackageManager.PERMISSION_GRANTED
+        @JavascriptInterface fun requestAllFiles() {
+            ui.post {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+                    } catch (_: Exception) {
+                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    }
+                } else {
+                    requestPermissions(arrayOf("android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"), 2)
+                }
+            }
+        }
         @JavascriptInterface fun appVersion(): String = packageManager.getPackageInfo(packageName, 0).versionName ?: ""
     }
 }

@@ -120,16 +120,25 @@ async fn status(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap) -> Response {
     }
     let reveal = h.get("x-reveal").is_some();
     let mut v = connection_info(&ctx.s, reveal);
-    let ev: Vec<Value> = events::recent(60).into_iter().map(|(t, m)| json!({"t": t, "m": m})).collect();
+    // the page is local, but people copy its log into chats and issues: redact it like tool output
+    let red = crate::redact::for_settings(&ctx.s, true);
+    let mut c = crate::redact::Counts::default();
+    let ev: Vec<Value> = events::recent(60).into_iter().map(|(t, m)| json!({"t": t, "m": red.text(&m, &mut c)})).collect();
     v["events"] = json!(ev);
     let (_, _, tail) = crate::net::tunnel_log_state(&ctx.s.state_dir);
-    // the tunnel log is local, but strip the tunnel token / secrets if cloudflared ever prints one
-    let red = crate::redact::Redactor::new(true, &[]);
-    let mut c = crate::redact::Counts::default();
-    v["tunnel_log"] = json!(tail.iter().map(|l| red.text(l, &mut c)).collect::<Vec<_>>());
+    v["tunnel_log"] = json!(tail.iter().map(|l| red.text(&crate::redact::mask_ingress_hosts(l), &mut c)).collect::<Vec<_>>());
     j(StatusCode::OK, v)
 }
 
+#[cfg(not(feature = "admin"))]
+async fn cf(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, _body: Bytes) -> Response {
+    if !authorized(&ctx, &h) {
+        return j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+    }
+    j(StatusCode::OK, json!({"status": "error", "error": "this build has no Cloudflare wizard: create the tunnel in the Cloudflare dashboard and paste its token here"}))
+}
+
+#[cfg(feature = "admin")]
 async fn cf(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, body: Bytes) -> Response {
     if !authorized(&ctx, &h) {
         return j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
@@ -197,7 +206,9 @@ pub async fn serve(s: Settings) {
         return;
     }
     let key = ensure_key(&s);
-    let addr = format!("127.0.0.1:{}", s.admin_port);
+    // SHELLGATE_ADMIN_HOST: 127.0.0.1 by default; a router may set its LAN address (the admin key is still required)
+    let host = std::env::var("SHELLGATE_ADMIN_HOST").ok().filter(|h| !h.trim().is_empty()).unwrap_or_else(|| "127.0.0.1".into());
+    let addr = format!("{}:{}", host.trim(), s.admin_port);
     let ctx = Arc::new(AdminCtx { s, key });
     let router = Router::new()
         .route("/", get(page))

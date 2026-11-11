@@ -1,0 +1,17 @@
+# sudo allowlist corpus shared by tests/test_policy.py and core/src/policy.rs
+# allow entries (;-separated)<TAB>command<TAB>ok|deny
+systemctl restart cloudflared;apt-get update	systemctl restart cloudflared	ok
+systemctl restart cloudflared;apt-get update	systemctl  restart   cloudflared	ok
+systemctl restart cloudflared;apt-get update	apt-get update	ok
+systemctl restart cloudflared;apt-get update	apt-get install curl	deny
+systemctl restart cloudflared;apt-get update	systemctl restart cloudflared; reboot	deny
+systemctl restart cloudflared;apt-get update	systemctl restart cloudflared && id	deny
+systemctl restart cloudflared;apt-get update	systemctl restart cloudflared-evil	deny
+systemctl restart cloudflared;apt-get update	systemctl restart $(echo cloudflared)	deny
+systemctl restart cloudflared;apt-get update	/bin/systemctl restart cloudflared	deny
+systemctl restart	systemctl restart nginx	ok
+systemctl restart	systemctl restart nginx > /etc/x	deny
+systemctl restart	systemctl stop nginx	deny
+	systemctl restart nginx	deny
+wg show	wg show wg0	ok
+wg show	wg	deny

@@ -108,3 +108,22 @@ def test_danger_corpus(cmd, want):
     from shellgate.policy import text_danger_reasons
     got = "danger" if text_danger_reasons(cmd, S()) else "safe"
     assert got == want, cmd
+
+
+def _sudo_corpus():
+    from pathlib import Path
+    for line in (Path(__file__).with_name("sudo_corpus.tsv")).read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            allow, cmd, want = line.split("\t")
+            yield pytest.param([x for x in allow.split(";") if x.strip()], cmd, want, id=cmd[:40])
+
+
+@pytest.mark.parametrize("allow,cmd,want", list(_sudo_corpus()))
+def test_sudo_corpus(allow, cmd, want):
+    from shellgate.policy import sudo_argv
+    try:
+        sudo_argv(cmd, allow)
+        got = "ok"
+    except PermissionError:
+        got = "deny"
+    assert got == want, cmd

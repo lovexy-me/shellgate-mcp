@@ -3,16 +3,22 @@
 //! Implements the MCP Streamable HTTP transport in stateless JSON-response mode:
 //! every POST /mcp carries one JSON-RPC message (or a batch) and gets a JSON reply.
 
-#[cfg(feature = "admin")]
+#[cfg(feature = "admin-lite")]
 mod admin;
+mod agent;
+mod android;
+#[cfg(windows)]
+mod agent_win;
 mod audit;
 #[cfg(feature = "admin")]
 mod cf;
 mod config;
 mod desktop;
+mod desktop_linux;
 #[cfg(all(windows, feature = "desktop"))]
 mod desktop_win;
 mod events;
+mod guard;
 mod exec;
 #[cfg(feature = "net-tools")]
 mod lan;
@@ -256,9 +262,16 @@ fn init_config(path: &str) -> Result<(), String> {
 
 fn main() {
     let mut env_file: Option<String> = None;
+    let mut agent_args: Option<Vec<String>> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            // helper agent: --agent <kind> <secret> <port-file> <parent-pid> (see agent.rs)
+            "--agent" => {
+                let v: Vec<String> = (0..4).filter_map(|_| args.next()).collect();
+                if v.len() != 4 { usage() }
+                agent_args = Some(v);
+            }
             "--env-file" | "--config" => env_file = args.next(),
             "--version" | "-V" => { println!("{VERSION}"); return; }
             "--open" => {}
@@ -304,11 +317,38 @@ fn main() {
             std::process::exit(2)
         }
     };
+    if let Some(v) = agent_args {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        rt.block_on(run_agent(settings, v));
+        return;
+    }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(serve(settings, open_admin));
     drop(rt);
     if RESTART_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
         reexec();
+    }
+}
+
+/// Helper agent process: execute what the parent ShellGate hands over until the parent exits.
+async fn run_agent(settings: config::Settings, v: Vec<String>) {
+    let ppid: u32 = v[3].parse().unwrap_or(0);
+    let audit = audit::Audit::new(&settings.audit_log, settings.audit_max_bytes);
+    let redactor = redact::for_settings(&settings, settings.redact);
+    let sem = Semaphore::new(settings.max_concurrent.max(1));
+    let agent_settings = settings.clone();
+    let policy = match policy::Policy::new(settings) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{e}"); std::process::exit(2) }
+    };
+    let app = Arc::new(App { policy, audit, jobs: Mutex::new(Default::default()), sem, redactor,
+                             downloads: std::sync::Mutex::new(Default::default()), shot: std::sync::Mutex::new(None),
+                             agents: Mutex::new(Default::default()) });
+    let desk: agent::DesktopFn = { let app = app.clone(); Arc::new(move |n: &str, a: &serde_json::Value| app.desktop_local(n, a)) };
+    if let Err(e) = agent::serve(agent_settings, v[1].clone(), std::path::PathBuf::from(&v[2]), Some(desk),
+                                 move || agent::pid_alive(ppid)).await {
+        eprintln!("agent: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -336,16 +376,7 @@ async fn serve(settings: config::Settings, open_admin: bool) {
     let audit = audit::Audit::new(&settings.audit_log, settings.audit_max_bytes);
     let sem = Semaphore::new(settings.max_concurrent.max(1));
     let mode = if settings.mode_allowlist { "allowlist" } else { "full" };
-    // the public URL's host is always masked, even when SHELLGATE_REDACT_DOMAINS does not list it
-    let mut domains = settings.redact_domains.clone();
-    if let Some(host) = settings.public_url.split("://").nth(1).and_then(|r| r.split(['/', ':']).next()) {
-        if host.contains('.') && host.parse::<std::net::IpAddr>().is_err() {
-            domains.push(host.to_string());
-        }
-    }
-    let redactor = redact::Redactor::new(settings.redact, &domains)
-        .with_secrets(&[settings.token.clone(), settings.tunnel_token.clone()])
-        .with_pii(settings.redact_pii);
+    let redactor = redact::for_settings(&settings, settings.redact);
     let redact_state = if settings.redact { "on" } else { "OFF" };
     let audit_path = settings.audit_log.clone();
     let env_file = settings.env_file.clone();
@@ -355,7 +386,12 @@ async fn serve(settings: config::Settings, open_admin: bool) {
         Err(e) => { eprintln!("{e}"); platform::pause_if_double_clicked(); std::process::exit(2) }
     };
     let app = Arc::new(App { policy, audit, jobs: Mutex::new(Default::default()), sem, redactor,
-                             downloads: std::sync::Mutex::new(Default::default()), shot: std::sync::Mutex::new(None) });
+                             downloads: std::sync::Mutex::new(Default::default()), shot: std::sync::Mutex::new(None),
+                             agents: Mutex::new(Default::default()) });
+    let armed = guard::recover(&app.policy.settings.state_dir, &app.policy.settings.shell);
+    if armed > 0 {
+        eprintln!("guarded changes: {armed} pending rollback(s) re-armed");
+    }
     let ctx = Arc::new(Ctx { app, expected });
 
     let router = Router::new()
@@ -395,7 +431,7 @@ async fn serve(settings: config::Settings, open_admin: bool) {
         }
         config::NetMode::Local => {}
     }
-    #[cfg(feature = "admin")]
+    #[cfg(feature = "admin-lite")]
     if net_settings.admin_port != 0 {
         let key = admin::ensure_key(&net_settings);
         let url = format!("http://127.0.0.1:{}/#k={key}", net_settings.admin_port);

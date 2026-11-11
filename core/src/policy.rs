@@ -361,6 +361,30 @@ pub fn inert_view(cmd: &str) -> String {
     out
 }
 
+
+// ---- allowlisted sudo (v0.2.7): run_command sudo=true runs `sudo -n -- <argv>` (no shell) only when
+// the command is one plain command whose words start with an entry of SHELLGATE_SUDO_ALLOW.
+// Same rules as sudo_argv in shellgate/policy.py; tests/sudo_corpus.tsv is shared.
+pub fn sudo_argv(cmd: &str, allow: &[String]) -> Result<Vec<String>, String> {
+    if allow.is_empty() {
+        return Err("sudo is off: list the allowed commands in SHELLGATE_SUDO_ALLOW (\";\"-separated)".into());
+    }
+    if cmd.chars().any(|c| ";|&`$<>\n(){}*?[]~!#".contains(c)) {
+        return Err("a sudo command must be one plain command: no shell operators, variables or globs".into());
+    }
+    let argv = shlex::split(cmd).ok_or("cannot parse the command")?;
+    if argv.is_empty() {
+        return Err("empty command".into());
+    }
+    for e in allow {
+        let want: Vec<&str> = e.split_whitespace().collect();
+        if !want.is_empty() && argv.len() >= want.len() && argv.iter().zip(&want).all(|(a, b)| a == b) {
+            return Ok(argv);
+        }
+    }
+    Err(format!("not in SHELLGATE_SUDO_ALLOW: {}", argv.iter().take(3).cloned().collect::<Vec<_>>().join(" ")))
+}
+
 pub struct Policy {
     pub settings: Settings,
     extra: Vec<Regex>,
@@ -714,5 +738,21 @@ mod tests {
             n += 1;
         }
         assert!(n >= 25);
+    }
+
+    #[test]
+    fn sudo_corpus() {
+        let mut n = 0;
+        for line in include_str!("../../tests/sudo_corpus.tsv").lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            let allow: Vec<String> = f[0].split(';').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect();
+            let got = if sudo_argv(f[1], &allow).is_ok() { "ok" } else { "deny" };
+            assert_eq!(got, f[2], "{}", f[1]);
+            n += 1;
+        }
+        assert!(n >= 15);
     }
 }

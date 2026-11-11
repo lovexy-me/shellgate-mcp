@@ -55,6 +55,8 @@ class Settings:
     redact_domains: list[str] = field(default_factory=list)
     # personal data (email, CN mobile, IMEI, serial number, Wi-Fi SSID); SHELLGATE_REDACT_PII=0 turns it off
     redact_pii: bool = True
+    # commands run_command may run as root (sudo=true), ";"-separated prefixes; empty = sudo off
+    sudo_allow: list[str] = field(default_factory=list)
 
     @property
     def danger_regexes(self) -> list[re.Pattern[str]]:
@@ -117,4 +119,5 @@ def load_settings(env_file: str | None = None) -> Settings:
         redact=env("SHELLGATE_REDACT", "1").strip().lower() not in {"0", "false", "no", "off"},
         redact_domains=_split(env("SHELLGATE_REDACT_DOMAINS", "")),
         redact_pii=env("SHELLGATE_REDACT_PII", "1").strip().lower() not in {"0", "false", "no", "off"},
+        sudo_allow=[x.strip() for x in env("SHELLGATE_SUDO_ALLOW", "").split(";") if x.strip()],
     )

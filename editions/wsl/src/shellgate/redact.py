@@ -34,7 +34,9 @@ _IPV4 = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
 _IPV4_PREFIX = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){1,2}(?:\.[*xX]){0,2}\.?(?:/[0-9]{1,2})?")
 # identifier form: Allow_198_51_100_Net, from_203_0_113_7
 _IPV4_UNDERSCORE = re.compile(r"[0-9]{1,3}(?:_[0-9]{1,3}){2,3}")
-_VERSION_CTX = re.compile(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$")
+# "version 1.2.3.4", "fw: 1.2.3.4", user-agent style "Agent/1.2.3.4"
+_VERSION_CTX = re.compile(r"(?i)(?:\b(?:version|ver|release|build|kernel|firmware|fw|v|rev|revision|driver|bios)[ \t]*[:=]?[ \t]*|[ \t(][A-Za-z][A-Za-z0-9_.-]{1,30}/)$")
+_IP_HOST_SUFFIX = {"nip", "sslip", "xip"}
 _IPV6 = re.compile(r"[0-9A-Fa-f]{0,5}(?::[0-9A-Fa-f]{0,5}){2,8}(?:%[A-Za-z0-9_.-]+)?")
 _IPV6_PORT = re.compile(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$")
 # fail closed: anything that still looks like a global unicast address (2000::/3) is masked
@@ -120,6 +122,12 @@ def _rep(name: str, rep: str, v: str) -> str:
     if name == "ssid":
         return rep + v[len(v.rstrip()):]
     return rep
+
+
+def _ctx(t: str, i: int) -> str:
+    """Up to 40 chars before i; a leading space stands for the start of the text."""
+    st = max(0, i - 40)
+    return (" " if st == 0 else "") + t[st:i]
 
 
 def _before(text: str, i: int) -> str:
@@ -276,7 +284,14 @@ class Redactor:
             # version strings: 5.15.153.1-microsoft, "version 1.2.3.4", "ver: 1.0.0.12"
             if a == "-" and _after(t, m.end() + 1).isascii() and _after(t, m.end() + 1).isalpha():
                 return None
-            if _VERSION_CTX.search(t[max(0, m.start() - 24):m.start()]):
+            # file names: pkg-1.2.3.4.tar.gz, setup.10.0.1.2.exe (but 8.8.8.8.nip.io is an address)
+            if a == "." and _after(t, m.end() + 1).isascii() and _after(t, m.end() + 1).isalpha():
+                j = m.end() + 1
+                while j < len(t) and t[j].isascii() and t[j].isalnum():
+                    j += 1
+                if t[m.end() + 1:j].lower() not in _IP_HOST_SUFFIX:
+                    return None
+            if _VERSION_CTX.search(_ctx(t, m.start())):
                 return None
             return hit("ip", "<ip>") if ipv4_is_public(m.group()) else None
         text = _sub(_IPV4, text, ip4)
@@ -300,7 +315,7 @@ class Redactor:
             n = len(nums)
             if not ((n == 3 and (trailing or wild or cidr)) or (n == 2 and wild)):
                 return None
-            if _VERSION_CTX.search(t[max(0, m.start() - 24):m.start()]):
+            if _VERSION_CTX.search(_ctx(t, m.start())):
                 return None
             if not ipv4_is_public(".".join(nums + ["0"] * (4 - n))):
                 return None

@@ -42,7 +42,130 @@ DANGER_PATTERNS: list[tuple[str, str]] = [
 _COMPILED = [(re.compile(p, re.IGNORECASE), why) for p, why in DANGER_PATTERNS]
 
 
+# ---- read-only commands: their arguments are text, not actions (v0.2.7)
+# "grep shutdown log", "cat /etc/passwd", "journalctl | grep reboot" must not ask for a confirm code.
+# A segment run by one of these commands is scanned as just its name plus any redirection, unless
+# its output is piped into a command that is not read-only (echo reboot | sh, cat x | ssh host),
+# or it contains a command substitution. Same algorithm as inert_view in core/src/policy.rs.
+INERT_COMMANDS = {
+    "grep", "egrep", "fgrep", "zgrep", "rg", "ag", "cat", "zcat", "bzcat", "xzcat", "less", "more",
+    "head", "tail", "tac", "echo", "printf", "ls", "dir", "wc", "sort", "uniq", "cut", "tr", "column",
+    "nl", "journalctl", "logread", "dmesg", "man", "which", "whereis", "type", "file", "stat", "du",
+    "df", "free", "uptime", "ps", "pgrep", "pidof", "id", "whoami", "hostname", "date", "history",
+    "jq", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "basename", "dirname", "readlink",
+    "realpath", "strings", "hexdump", "od", "xxd", "rev", "find", "findstr", "where", "select-string",
+    "sls", "get-content", "gc", "write-output", "write-host", "get-childitem", "gci", "get-process",
+    "get-service", "get-winevent", "get-eventlog",
+}
+_WRAPPERS = {"sudo", "doas", "env", "nice", "nohup", "time", "command", "busybox"}
+_FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"}
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _segments(cmd: str) -> list[tuple[str, str]]:
+    """Split at unquoted | || && ; & ( ) and newlines: [(segment, separator after it)]."""
+    out: list[tuple[str, str]] = []
+    cur: list[str] = []
+    q = ""
+    i, n = 0, len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if q:
+            cur.append(ch)
+            if ch == "\\" and q == '"' and i + 1 < n:
+                cur.append(cmd[i + 1])
+                i += 1
+            elif ch == q:
+                q = ""
+        elif ch == "\\" and i + 1 < n:
+            cur.append(ch + cmd[i + 1])
+            i += 1
+        elif ch in "'\"":
+            q = ch
+            cur.append(ch)
+        elif ch in "|&;()\n":
+            sep = ch
+            if ch in "|&" and i + 1 < n and cmd[i + 1] == ch:
+                sep = ch * 2
+                i += 1
+            out.append(("".join(cur), sep))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    out.append(("".join(cur), ""))
+    return out
+
+
+def _words(seg: str) -> list[str] | None:
+    # backslashes doubled so Windows paths (C:\\Windows\\System32\\findstr.exe) survive the split
+    try:
+        return shlex.split(seg.replace("\\", "\\\\"), posix=True)
+    except ValueError:
+        return None
+
+
+def _cmd_word(words: list[str]) -> str | None:
+    i = 0
+    while i < len(words) and _ASSIGN.match(words[i]):
+        i += 1
+    while i < len(words) and words[i].lower() in _WRAPPERS:
+        i += 1
+        if i < len(words) and words[i].startswith("-"):
+            return None  # sudo -u x ... : do not guess
+        while i < len(words) and _ASSIGN.match(words[i]):
+            i += 1
+    if i >= len(words):
+        return None
+    w = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return w[:-4] if w.endswith(".exe") else w
+
+
+def _is_inert(seg: str) -> bool:
+    if "$(" in seg or "`" in seg or "<(" in seg or ">(" in seg:
+        return False
+    words = _words(seg)
+    if not words:
+        return False
+    w = _cmd_word(words)
+    if w not in INERT_COMMANDS:
+        return False
+    if w == "find" and any(x in _FIND_ACTIONS for x in words):
+        return False
+    return True
+
+
+def _redirect_part(seg: str) -> str:
+    q = ""
+    for i, ch in enumerate(seg):
+        if q:
+            if ch == q:
+                q = ""
+        elif ch in "'\"":
+            q = ch
+        elif ch == ">":
+            return seg[i:]
+    return ""
+
+
+def inert_view(cmd: str) -> str:
+    segs = _segments(cmd)
+    inert = [_is_inert(s) for s, _ in segs]
+    out: list[str] = []
+    for k, (seg, sep) in enumerate(segs):
+        feeds = sep == "|" and k + 1 < len(segs) and not inert[k + 1]
+        if inert[k] and not feeds:
+            words = _words(seg) or []
+            red = _redirect_part(seg)
+            out.append(f"{_cmd_word(words)} {red}".rstrip() + (" " if sep else ""))
+        else:
+            out.append(seg)
+        out.append(sep)
+    return "".join(out)
+
+
 def danger_reasons(command: str, settings: Settings) -> list[str]:
+    command = inert_view(command)
     reasons = [why for rx, why in _COMPILED if rx.search(command)]
     reasons += [f"custom pattern: {rx.pattern}" for rx in settings.danger_regexes if rx.search(command)]
     return reasons

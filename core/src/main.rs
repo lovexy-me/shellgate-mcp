@@ -22,6 +22,7 @@ mod policy;
 mod redact;
 mod tools;
 mod ventoy;
+mod xfer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -164,6 +164,203 @@ fn compiled() -> &'static Vec<(Regex, &'static str)> {
     })
 }
 
+
+// ---- read-only commands: their arguments are text, not actions (v0.2.7)
+// "grep shutdown log", "cat /etc/passwd", "journalctl | grep reboot" must not ask for a confirm code.
+// A segment run by one of these commands is scanned as just its name plus any redirection, unless
+// its output is piped into a command that is not read-only (echo reboot | sh, cat x | ssh host),
+// or it contains a command substitution. Same algorithm as inert_view in shellgate/policy.py;
+// tests/danger_corpus.tsv is shared.
+const INERT_COMMANDS: &[&str] = &[
+    "grep", "egrep", "fgrep", "zgrep", "rg", "ag", "cat", "zcat", "bzcat", "xzcat", "less", "more",
+    "head", "tail", "tac", "echo", "printf", "ls", "dir", "wc", "sort", "uniq", "cut", "tr", "column",
+    "nl", "journalctl", "logread", "dmesg", "man", "which", "whereis", "type", "file", "stat", "du",
+    "df", "free", "uptime", "ps", "pgrep", "pidof", "id", "whoami", "hostname", "date", "history",
+    "jq", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "basename", "dirname", "readlink",
+    "realpath", "strings", "hexdump", "od", "xxd", "rev", "find", "findstr", "where", "select-string",
+    "sls", "get-content", "gc", "write-output", "write-host", "get-childitem", "gci", "get-process",
+    "get-service", "get-winevent", "get-eventlog",
+];
+const WRAPPERS: &[&str] = &["sudo", "doas", "env", "nice", "nohup", "time", "command", "busybox"];
+const FIND_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"];
+
+fn is_assign(w: &str) -> bool {
+    let b = w.as_bytes();
+    if b.is_empty() || !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+        return false;
+    }
+    for &c in &b[1..] {
+        if c == b'=' {
+            return true;
+        }
+        if !(c.is_ascii_alphanumeric() || c == b'_') {
+            return false;
+        }
+    }
+    false
+}
+
+/// Split at unquoted | || && ; & ( ) and newlines: (segment, separator after it).
+fn segments(cmd: &str) -> Vec<(String, String)> {
+    let ch: Vec<char> = cmd.chars().collect();
+    let (mut out, mut cur, mut q) = (Vec::new(), String::new(), None::<char>);
+    let mut i = 0;
+    while i < ch.len() {
+        let c = ch[i];
+        if let Some(qc) = q {
+            cur.push(c);
+            if c == '\\' && qc == '"' && i + 1 < ch.len() {
+                cur.push(ch[i + 1]);
+                i += 1;
+            } else if c == qc {
+                q = None;
+            }
+        } else if c == '\\' && i + 1 < ch.len() {
+            cur.push(c);
+            cur.push(ch[i + 1]);
+            i += 1;
+        } else if c == '\'' || c == '"' {
+            q = Some(c);
+            cur.push(c);
+        } else if "|&;()\n".contains(c) {
+            let mut sep = c.to_string();
+            if (c == '|' || c == '&') && i + 1 < ch.len() && ch[i + 1] == c {
+                sep.push(c);
+                i += 1;
+            }
+            out.push((std::mem::take(&mut cur), sep));
+        } else {
+            cur.push(c);
+        }
+        i += 1;
+    }
+    out.push((cur, String::new()));
+    out
+}
+
+/// POSIX-style word split (like Python shlex.split); None on an unterminated quote.
+/// Backslashes are doubled first so Windows paths (C:\Windows\System32\findstr.exe) survive.
+fn words(seg: &str) -> Option<Vec<String>> {
+    let seg = seg.replace('\\', "\\\\");
+    let seg = seg.as_str();
+    let (mut out, mut cur, mut have) = (Vec::new(), String::new(), false);
+    let mut it = seg.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\'' => {
+                have = true;
+                loop {
+                    match it.next() {
+                        Some('\'') => break,
+                        Some(x) => cur.push(x),
+                        None => return None,
+                    }
+                }
+            }
+            '"' => {
+                have = true;
+                loop {
+                    match it.next() {
+                        Some('"') => break,
+                        Some('\\') => match it.next() {
+                            Some(x) if "\\\"$`\n".contains(x) => cur.push(x),
+                            Some(x) => { cur.push('\\'); cur.push(x); }
+                            None => return None,
+                        },
+                        Some(x) => cur.push(x),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => {
+                have = true;
+                match it.next() {
+                    Some('\n') => {}
+                    Some(x) => cur.push(x),
+                    None => return None,
+                }
+            }
+            c if c.is_whitespace() => {
+                if have {
+                    out.push(std::mem::take(&mut cur));
+                    have = false;
+                }
+            }
+            c => { have = true; cur.push(c); }
+        }
+    }
+    if have {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+fn cmd_word(w: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < w.len() && is_assign(&w[i]) {
+        i += 1;
+    }
+    while i < w.len() && WRAPPERS.contains(&w[i].to_lowercase().as_str()) {
+        i += 1;
+        if i < w.len() && w[i].starts_with('-') {
+            return None;
+        }
+        while i < w.len() && is_assign(&w[i]) {
+            i += 1;
+        }
+    }
+    let x = w.get(i)?.replace('\\', "/");
+    let x = x.rsplit('/').next().unwrap_or("").to_lowercase();
+    Some(x.strip_suffix(".exe").map(str::to_string).unwrap_or(x))
+}
+
+fn is_inert(seg: &str) -> bool {
+    if seg.contains("$(") || seg.contains('`') || seg.contains("<(") || seg.contains(">(") {
+        return false;
+    }
+    let Some(w) = words(seg).filter(|w| !w.is_empty()) else { return false };
+    let Some(c) = cmd_word(&w) else { return false };
+    if !INERT_COMMANDS.contains(&c.as_str()) {
+        return false;
+    }
+    !(c == "find" && w.iter().any(|x| FIND_ACTIONS.contains(&x.as_str())))
+}
+
+fn redirect_part(seg: &str) -> &str {
+    let mut q = None;
+    for (i, c) in seg.char_indices() {
+        match q {
+            Some(qc) => if c == qc { q = None },
+            None if c == '\'' || c == '"' => q = Some(c),
+            None if c == '>' => return &seg[i..],
+            None => {}
+        }
+    }
+    ""
+}
+
+pub fn inert_view(cmd: &str) -> String {
+    let segs = segments(cmd);
+    let inert: Vec<bool> = segs.iter().map(|(s, _)| is_inert(s)).collect();
+    let mut out = String::new();
+    for (k, (seg, sep)) in segs.iter().enumerate() {
+        let feeds = sep == "|" && k + 1 < segs.len() && !inert[k + 1];
+        if inert[k] && !feeds {
+            let w = words(seg).unwrap_or_default();
+            let mut v = format!("{} {}", cmd_word(&w).unwrap_or_default(), redirect_part(seg));
+            v.truncate(v.trim_end().len());
+            out.push_str(&v);
+            if !sep.is_empty() {
+                out.push(' ');
+            }
+        } else {
+            out.push_str(seg);
+        }
+        out.push_str(sep);
+    }
+    out
+}
+
 pub struct Policy {
     pub settings: Settings,
     extra: Vec<Regex>,
@@ -179,6 +376,8 @@ impl Policy {
     }
 
     pub fn danger_reasons(&self, cmd: &str) -> Vec<String> {
+        let view = inert_view(cmd);
+        let cmd = view.as_str();
         let mut r: Vec<String> = compiled().iter().filter(|(rx, _)| rx.is_match(cmd)).map(|(_, w)| w.to_string()).collect();
         r.extend(self.extra.iter().filter(|rx| rx.is_match(cmd)).map(|rx| format!("custom pattern: {}", rx.as_str())));
         r
@@ -498,5 +697,22 @@ mod tests {
         assert!(p.check_path("/tmp/sgt/new/file.txt", true).is_ok());
         assert!(p.check_path("rel", false).is_err());
         assert!(Policy::new(s(true)).unwrap().check_path("/etc/hosts", false).is_err());
+    }
+
+    #[test]
+    fn danger_corpus() {
+        let p = Policy::new(s(false)).unwrap();
+        let mut n = 0;
+        for line in include_str!("../../tests/danger_corpus.tsv").lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (cmd, want) = line.split_once('\t').unwrap();
+            let cmd = cmd.replace("\\n", "\n");
+            let got = if p.text_danger_reasons(&cmd).is_empty() { "safe" } else { "danger" };
+            assert_eq!(got, want, "{cmd}");
+            n += 1;
+        }
+        assert!(n >= 25);
     }
 }

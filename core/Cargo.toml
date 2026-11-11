@@ -14,7 +14,7 @@ regex = { version = "1", default-features = false, features = ["std", "unicode-c
 shlex = "1"
 getrandom = "0.2"
 socket2 = "0.6"
-sha2 = { version = "0.10", default-features = false, features = ["std"], optional = true }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }   # file_hash, read/write_binary, ventoy_add
 ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 # desktop tools: PNG deflate and JPEG (pure Rust, small)
@@ -32,7 +32,7 @@ windows = { version = "0.62", optional = true, features = ["Win32_UI_Accessibili
 [features]
 # Building blocks
 ventoy = []                              # ventoy_* tools (find / list / config the Ventoy partition)
-download = ["ventoy", "dep:ureq", "dep:sha2"]   # ventoy_add over https (rustls + webpki roots, ~1.3 MB)
+download = ["ventoy", "dep:ureq"]   # ventoy_add over https (rustls + webpki roots, ~1.3 MB)
 desktop = ["dep:windows"]                # Windows desktop tools (UIA, screenshot, SendInput); no-op elsewhere
 net-tools = ["dep:ureq", "dep:rustls"]   # lan_scan + http_request + the Cloudflare setup API
 admin = ["net-tools"]                    # local admin web page (status, connection info, Cloudflare wizard)

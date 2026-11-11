@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import asyncio
 import functools
 import hashlib
@@ -9,6 +11,7 @@ import hmac
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import tempfile
@@ -68,10 +71,17 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
         async def wrapper(*args, **kwargs):
             start = time.monotonic()
             # inputs run unmodified; only what is returned (and logged) is redacted
-            logged_args, _ = redactor.value(kwargs)
+            logged = dict(kwargs)
+            if isinstance(logged.get("data"), str):  # write_binary: log the size, not the payload
+                logged["data"] = f"<{len(logged['data'])} base64 chars>"
+            logged_args, _ = redactor.value(logged)
             try:
                 result = await fn(*args, **kwargs)
+                # read_binary: binary bytes bypass the text redactor (text files are refused there)
+                raw = result.pop("data", None) if fn.__name__ == "read_binary" and isinstance(result, dict) else None
                 result, counts = redactor.value(result)
+                if raw is not None:
+                    result["data"] = raw
                 status = result.get("status", "ok") if isinstance(result, dict) else "ok"
                 extra = {}
                 if isinstance(result, dict) and "exit_code" in result:
@@ -283,6 +293,105 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise
+
+    # ---- binary transfer in chunks (v0.2.7)
+    CHUNK_DEFAULT, CHUNK_MAX = 262_144, 1_048_576
+
+    def _sha256_file(p: str) -> str:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        return h.hexdigest()
+
+    def _looks_text(p: str) -> bool:
+        with open(p, "rb") as f:
+            head = f.read(8192)
+        if b"\0" in head:
+            return False
+        for cut in range(0, 4):  # a multi-byte character may be split at the 8 KB edge
+            try:
+                head[:len(head) - cut].decode("utf-8")
+                return True
+            except UnicodeDecodeError:
+                continue
+        return False
+
+    @mcp.tool()
+    @audited
+    async def file_hash(path: str) -> dict:
+        """SHA-256 and size of a file (to verify a transfer or a download)."""
+        p = check_path(path, settings)
+        return {"status": "ok", "path": p, "size": os.path.getsize(p), "sha256": _sha256_file(p)}
+
+    @mcp.tool()
+    @audited
+    async def read_binary(path: str, offset: int = 0, length: int = CHUNK_DEFAULT) -> dict:
+        """Read a binary file in chunks as base64 (length default 256 KB, max 1 MB). Loop with
+        offset += length until eof; the last chunk carries the whole file's sha256. Text files are
+        refused (use read_file, which redacts secrets): only binary content leaves unredacted."""
+        p = check_path(path, settings)
+        if not os.path.isfile(p):
+            raise FileNotFoundError(p)
+        if _looks_text(p):
+            raise ValueError("this is a text file: use read_file (its output is redacted)")
+        size = os.path.getsize(p)
+        offset = max(0, offset)
+        length = max(1, min(length, CHUNK_MAX))
+        with open(p, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(length)
+        eof = offset + len(chunk) >= size
+        out = {"status": "ok", "path": p, "size": size, "offset": offset, "length": len(chunk), "eof": eof,
+               "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
+               "data": base64.b64encode(chunk).decode("ascii")}
+        if eof:
+            out["sha256"] = _sha256_file(p)
+        return out
+
+    @mcp.tool()
+    @audited
+    async def write_binary(path: str, data: str, offset: int = 0, sha256: str | None = None) -> dict:
+        """Upload a file in base64 chunks (each up to 1 MB decoded). Chunks go to <path>.sgpart:
+        offset 0 starts it over, every other offset must equal the bytes already written (the
+        answer gives next_offset, so an interrupted upload can resume). Pass the whole file's
+        sha256 with the last chunk: it is verified, then the file replaces <path> (old one kept as
+        .bak). On mismatch the partial file is deleted."""
+        p = check_path(path, settings, write=True)
+        part = p + ".sgpart"
+        try:
+            chunk = base64.b64decode("".join(data.split()), validate=True)
+        except (ValueError, binascii.Error) as e:
+            raise ValueError(f"data is not valid base64: {e}") from None
+        if len(chunk) > CHUNK_MAX:
+            raise ValueError("chunk larger than 1 MB")
+        want = (sha256 or "").strip().lower()
+        if want and not re.fullmatch(r"[0-9a-f]{64}", want):
+            raise ValueError("sha256 must be 64 hex characters")
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        if offset == 0:
+            mode = "wb"
+        elif offset == have:
+            mode = "ab"
+        else:
+            return {"status": "error", "error": f"offset {offset} does not match the {have} bytes already written",
+                    "next_offset": have}
+        with open(part, mode) as f:
+            f.write(chunk)
+        written = offset + len(chunk)
+        if not want:
+            return {"status": "ok", "path": p, "partial": part, "next_offset": written}
+        got = _sha256_file(part)
+        if got != want:
+            os.unlink(part)
+            return {"status": "error", "error": "sha256 mismatch, partial file deleted", "expected": want,
+                    "actual": got, "size": written}
+        mode_bits = os.stat(p).st_mode & 0o7777 if os.path.exists(p) else 0o644
+        bak = _backup(p)
+        os.chmod(part, mode_bits)
+        os.replace(part, p)
+        return {"status": "ok", "path": p, "size": written, "sha256": got, "verified": True, "backup": bak}
 
     @mcp.tool()
     @audited

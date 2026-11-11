@@ -239,3 +239,61 @@ async def test_no_redaction_switch_in_tools(server):
     assert "run_script" in names
     rc = next(t for t in tools if t.name == "run_command")
     assert "stdin" in rc.inputSchema["properties"]
+
+
+async def test_binary_roundtrip_chunks(server):
+    import base64
+    import hashlib
+    url, work, _ = server
+    blob = bytes(range(256)) * 5000 + b"\x00tail"  # ~1.2 MB, needs two 1 MB chunks
+    want = hashlib.sha256(blob).hexdigest()
+    dst = str(work / "bin" / "blob.dat")
+    first, second = blob[:1_048_576], blob[1_048_576:]
+    r = await _call(url, "write_binary", path=dst, data=base64.b64encode(first).decode())
+    assert r["status"] == "ok" and r["next_offset"] == len(first)
+    bad = await _call(url, "write_binary", path=dst, data="AAAA", offset=5)
+    assert bad["status"] == "error" and bad["next_offset"] == len(first)
+    r = await _call(url, "write_binary", path=dst, data=base64.b64encode(second).decode(),
+                    offset=len(first), sha256=want)
+    assert r["status"] == "ok" and r["verified"] is True and r["sha256"] == want
+    h = await _call(url, "file_hash", path=dst)
+    assert h["sha256"] == want and h["size"] == len(blob)
+    got, off = b"", 0
+    while True:
+        c = await _call(url, "read_binary", path=dst, offset=off, length=1_048_576)
+        assert c["status"] == "ok"
+        got += base64.b64decode(c["data"])
+        off += c["length"]
+        if c["eof"]:
+            assert c["sha256"] == want
+            break
+    assert got == blob
+    mism = await _call(url, "write_binary", path=dst, data=base64.b64encode(b"\x00x").decode(), sha256="0" * 64)
+    assert mism["status"] == "error" and not (work / "bin" / "blob.dat.sgpart").exists()
+    assert hashlib.sha256((work / "bin" / "blob.dat").read_bytes()).hexdigest() == want
+
+
+async def test_read_binary_refuses_text(server):
+    url, work, _ = server
+    (work / "t.env").write_text("password=hunter22\n")
+    r = await _call(url, "read_binary", path=str(work / "t.env"))
+    assert r["status"] == "error" and "read_file" in r["error"]
+
+
+async def test_grep_power_words_need_no_confirm(server):
+    url, work, _ = server
+    (work / "log.txt").write_text("system reboot at 3am\n")
+    r = await _call(url, "run_command", command="grep -i reboot log.txt", cwd=str(work))
+    assert r.get("status") != "confirmation_required" and r["exit_code"] == 0
+
+
+async def test_write_binary_base64_with_newlines(server):
+    import base64
+    import hashlib
+    url, work, _ = server
+    blob = b"\x00\x01" * 100
+    enc = base64.encodebytes(blob).decode()  # wrapped at 76 chars, like `base64` CLI output
+    assert "\n" in enc
+    r = await _call(url, "write_binary", path=str(work / "nl.bin"), data=enc,
+                    sha256=hashlib.sha256(blob).hexdigest())
+    assert r["status"] == "ok" and r["verified"] is True

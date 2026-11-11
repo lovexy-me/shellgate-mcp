@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::xfer;
 use crate::audit::Audit;
 use crate::exec::{self, Jobs};
 use crate::platform;
@@ -235,6 +236,12 @@ pub fn definitions() -> Value {
          "inputSchema": obj(json!({"path": s("Absolute path"), "offset": i("First line, default 1"), "limit": i("Lines, default 500")}), &["path"])},
         {"name": "write_file", "description": "Create, overwrite or append to a file in an allowed directory. Overwrites keep a .bak copy.",
          "inputSchema": obj(json!({"path": s("Absolute path"), "content": s("File content"), "append": b("Append instead of overwrite")}), &["path", "content"])},
+        {"name": "file_hash", "description": "SHA-256 and size of a file (to verify a transfer or a download).",
+         "inputSchema": obj(json!({"path": s("Absolute path")}), &["path"])},
+        {"name": "read_binary", "description": "Read a binary file in chunks as base64 (length default 256 KB, max 1 MB). Loop with offset += length until eof; the last chunk carries the whole file's sha256. Text files are refused (use read_file, which redacts secrets): only binary content leaves unredacted.",
+         "inputSchema": obj(json!({"path": s("Absolute path"), "offset": i("Byte offset, default 0"), "length": i("Bytes, default 262144, max 1048576")}), &["path"])},
+        {"name": "write_binary", "description": "Upload a file in base64 chunks (each up to 1 MB decoded). Chunks go to <path>.sgpart: offset 0 starts it over, every other offset must equal the bytes already written (the answer gives next_offset, so an interrupted upload can resume). Pass the whole file's sha256 with the last chunk: it is verified, then the file replaces <path> (old one kept as .bak). On mismatch the partial file is deleted.",
+         "inputSchema": obj(json!({"path": s("Absolute path"), "data": s("Base64 chunk"), "offset": i("Byte offset of this chunk, default 0"), "sha256": s("Whole file's SHA-256, with the last chunk")}), &["path", "data"])},
         {"name": "edit_file", "description": "Replace exact text in a file. old_string must be unique unless replace_all. Keeps a .bak copy.",
          "inputSchema": obj(json!({"path": s("Absolute path"), "old_string": s("Exact text to find"), "new_string": s("Replacement"), "replace_all": b("Replace every match")}), &["path", "old_string", "new_string"])},
         {"name": "list_dir", "description": "List a directory: name, type, size, modified time.",
@@ -525,8 +532,13 @@ impl App {
         let mut res = self.dispatch(name, args).await;
         // screenshots bypass the text redactor (base64 is not text) and are re-attached afterwards
         let image = match &mut res { Ok(Value::Object(m)) => m.remove("_image"), _ => None };
+        // read_binary: binary bytes bypass the text redactor (text files are refused there)
+        let raw = match &mut res { Ok(Value::Object(m)) if name == "read_binary" => m.remove("data"), _ => None };
         let ms = start.elapsed().as_millis() as u64;
         let mut logged_args = args.clone();
+        if let Some(Value::String(d)) = logged_args.get("data").filter(|_| name == "write_binary") {
+            logged_args["data"] = json!(format!("<{} base64 chars>", d.len()));
+        }
         self.redactor.value(&mut logged_args, &mut Counts::default());
         let mut counts = Counts::default();
         match res {
@@ -542,6 +554,11 @@ impl App {
                         m.insert("redacted".into(), json!(counts.footer()));
                     }
                     extra.insert("redacted".into(), json!(counts.footer()));
+                }
+                if let Some(d) = raw {
+                    if let Value::Object(m) = &mut v {
+                        m.insert("data".into(), d);
+                    }
                 }
                 if let Some(img) = image {
                     extra.insert("image_bytes".into(), json!(img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0)));
@@ -880,6 +897,84 @@ impl App {
                     atomic_write(&p, content.as_bytes())?;
                 }
                 Ok(json!({"status": "ok", "path": p, "bytes": content.len(), "backup": bak}))
+            }
+            "file_hash" => {
+                let p = self.policy.check_path(req_str(a, "path")?, false)?;
+                let size = fs::metadata(&p).map_err(|e| format!("{p}: {e}"))?.len();
+                Ok(json!({"status": "ok", "path": p, "size": size, "sha256": xfer::sha256_file(&p)?}))
+            }
+            "read_binary" => {
+                use std::io::{Read, Seek, SeekFrom};
+                let p = self.policy.check_path(req_str(a, "path")?, false)?;
+                if !Path::new(&p).is_file() {
+                    return Err(format!("{p}: not a file"));
+                }
+                if xfer::looks_text(&p)? {
+                    return Err("this is a text file: use read_file (its output is redacted)".into());
+                }
+                let size = fs::metadata(&p).map_err(|e| e.to_string())?.len();
+                let offset = arg_i64(a, "offset", 0).max(0) as u64;
+                let length = (arg_i64(a, "length", xfer::CHUNK_DEFAULT as i64).max(1) as u64).min(xfer::CHUNK_MAX);
+                let mut f = fs::File::open(&p).map_err(|e| e.to_string())?;
+                f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+                let mut chunk = Vec::with_capacity(length as usize);
+                f.take(length).read_to_end(&mut chunk).map_err(|e| e.to_string())?;
+                let eof = offset + chunk.len() as u64 >= size;
+                let mut v = json!({"status": "ok", "path": p, "size": size, "offset": offset, "length": chunk.len(), "eof": eof,
+                                   "chunk_sha256": xfer::sha256_hex(&chunk), "data": xfer::b64_encode(&chunk)});
+                if eof {
+                    v["sha256"] = json!(xfer::sha256_file(&p)?);
+                }
+                Ok(v)
+            }
+            "write_binary" => {
+                use std::io::Write;
+                let p = self.policy.check_path(req_str(a, "path")?, true)?;
+                let part = format!("{p}.sgpart");
+                let chunk = xfer::b64_decode(req_str(a, "data")?)?;
+                if chunk.len() as u64 > xfer::CHUNK_MAX {
+                    return Err("chunk larger than 1 MB".into());
+                }
+                let want = arg_str(a, "sha256").map(|x| x.trim().to_lowercase()).unwrap_or_default();
+                if !want.is_empty() && !(want.len() == 64 && want.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    return Err("sha256 must be 64 hex characters".into());
+                }
+                if let Some(dir) = Path::new(&p).parent() {
+                    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                let have = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                let offset = arg_i64(a, "offset", 0).max(0) as u64;
+                let mut f = if offset == 0 {
+                    fs::File::create(&part)
+                } else if offset == have {
+                    fs::OpenOptions::new().append(true).open(&part)
+                } else {
+                    return Ok(json!({"status": "error", "error": format!("offset {offset} does not match the {have} bytes already written"),
+                                     "next_offset": have}));
+                }.map_err(|e| format!("{part}: {e}"))?;
+                f.write_all(&chunk).map_err(|e| e.to_string())?;
+                drop(f);
+                let written = offset + chunk.len() as u64;
+                if want.is_empty() {
+                    return Ok(json!({"status": "ok", "path": p, "partial": part, "next_offset": written}));
+                }
+                let got = xfer::sha256_file(&part)?;
+                if got != want {
+                    let _ = fs::remove_file(&part);
+                    return Ok(json!({"status": "error", "error": "sha256 mismatch, partial file deleted",
+                                     "expected": want, "actual": got, "size": written}));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = fs::metadata(&p).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644);
+                    let _ = fs::set_permissions(&part, fs::Permissions::from_mode(mode));
+                }
+                let bak = self.backup(&p);
+                #[cfg(windows)]
+                let _ = fs::remove_file(&p);
+                fs::rename(&part, &p).map_err(|e| format!("{p}: {e}"))?;
+                Ok(json!({"status": "ok", "path": p, "size": written, "sha256": got, "verified": true, "backup": bak}))
             }
             "edit_file" => {
                 let p = self.policy.check_path(req_str(a, "path")?, true)?;

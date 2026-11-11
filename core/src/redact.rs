@@ -71,7 +71,7 @@ fn rx() -> &'static Rx {
         ipv4_prefix: Regex::new(r"[0-9]{1,3}(?:\.[0-9]{1,3}){1,2}(?:\.[*xX]){0,2}\.?(?:/[0-9]{1,2})?").unwrap(),
         // identifier form: Allow_198_51_100_Net, from_203_0_113_7
         ipv4_underscore: Regex::new(r"[0-9]{1,3}(?:_[0-9]{1,3}){2,3}").unwrap(),
-        version_ctx: Regex::new(r"(?i)\b(?:version|ver|release|build|kernel|firmware|fw|v)[ \t]*[:=]?[ \t]*$").unwrap(),
+        version_ctx: Regex::new(r"(?i)(?:\b(?:version|ver|release|build|kernel|firmware|fw|v|rev|revision|driver|bios)[ \t]*[:=]?[ \t]*|[ \t(][A-Za-z][A-Za-z0-9_.-]{1,30}/)$").unwrap(),
         ipv6: Regex::new(r"[0-9A-Fa-f]{0,5}(?::[0-9A-Fa-f]{0,5}){2,8}(?:%[A-Za-z0-9_.-]+)?").unwrap(),
         ipv6_port: Regex::new(r"^(.*[0-9A-Fa-f:]):([0-9]{1,5})$").unwrap(),
         ipv6_looks_global: Regex::new(r"(?:^|:)[23][0-9A-Fa-f]{3}(?::[0-9A-Fa-f]{0,5}){3,}").unwrap(),
@@ -186,6 +186,13 @@ fn extra_rep(name: &str, rep: &str, v: &str) -> String {
         return format!("{rep}{}", &v[v.trim_end().len()..]);
     }
     rep.to_string()
+}
+
+/// Up to 40 chars before i; a leading space stands for the start of the text.
+fn ctx(t: &str, i: usize) -> String {
+    let mut st = i.saturating_sub(40);
+    while !t.is_char_boundary(st) { st += 1; }
+    format!("{}{}", if st == 0 { " " } else { "" }, &t[st..i])
 }
 
 fn before(t: &str, i: usize) -> Option<char> {
@@ -467,9 +474,15 @@ impl Redactor {
             if a == Some('-') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
                 return None;
             }
-            let mut st = m0.start().saturating_sub(24);
-            while !s.is_char_boundary(st) { st += 1; }
-            if r.version_ctx.is_match(&s[st..m0.start()]) {
+            // file names: pkg-1.2.3.4.tar.gz, setup.10.0.1.2.exe (but 8.8.8.8.nip.io is an address)
+            if a == Some('.') && after(s, m0.end() + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+                let rest = &s[m0.end() + 1..];
+                let word: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+                if !["nip", "sslip", "xip"].contains(&word.as_str()) {
+                    return None;
+                }
+            }
+            if r.version_ctx.is_match(&ctx(s, m0.start())) {
                 return None;
             }
             if ipv4_is_public(m0.as_str()) == Some(true) {
@@ -513,9 +526,7 @@ impl Redactor {
             if !((n == 3 && (trailing || wild > 0 || cidr.is_some())) || (n == 2 && wild > 0)) {
                 return None;
             }
-            let mut st = m0.start().saturating_sub(24);
-            while !s.is_char_boundary(st) { st += 1; }
-            if r.version_ctx.is_match(&s[st..m0.start()]) {
+            if r.version_ctx.is_match(&ctx(s, m0.start())) {
                 return None;
             }
             let mut full: Vec<&str> = parts[..n].to_vec();

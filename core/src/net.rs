@@ -94,6 +94,29 @@ pub async fn supervise_cloudflared(s: Settings) {
     }
 }
 
+/// Stop the supervised cloudflared (on stop / restart), so it does not outlive ShellGate and keep
+/// the tunnel up, or pile up one extra copy per restart.
+pub fn stop_tunnel() {
+    let pid = crate::events::TUNNEL_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let mut c = std::process::Command::new("taskkill");
+        c.args(["/F", "/T", "/PID", &pid.to_string()]);
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let _ = c.status();
+    }
+}
+
 /// True where Go programs cannot find a DNS server on their own (Android: no /etc/resolv.conf).
 fn no_system_resolv_conf() -> bool {
     cfg!(target_os = "android") || (cfg!(unix) && !Path::new("/etc/resolv.conf").exists())

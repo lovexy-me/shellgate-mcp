@@ -172,7 +172,12 @@ class SgService : Service() {
 
     override fun onDestroy() {
         wanted = false
-        proc?.destroy()
+        val p = proc
+        p?.destroy()
+        // ShellGate stops cloudflared and exits within a few seconds of SIGTERM; make sure it does
+        if (p != null) Thread {
+            try { if (Build.VERSION.SDK_INT >= 26 && !p.waitFor(6, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly() } catch (_: Exception) {}
+        }.start()
         worker?.interrupt()
         running = false
         releaseLocks()

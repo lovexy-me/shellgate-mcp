@@ -23,6 +23,7 @@
   .logo { width:34px; height:34px; border-radius:10px; background:var(--b); color:#fff; display:grid; place-items:center; font-weight:700; font-size:17px; }
   header .t { font-weight:650; font-size:18px; line-height:1.2; }
   header .s { color:var(--mut); font-size:12px; }
+  header .hbtns { margin-left:auto; display:flex; gap:8px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; }
   .sec-t { font-size:13px; color:var(--mut); margin:20px 4px 6px; font-weight:600; }
   /* status hero */
@@ -88,6 +89,10 @@
 <header>
   <div class="logo">S</div>
   <div><div class="t">ShellGate</div><div class="s" id="ver">加载中…</div></div>
+  <div class="hbtns">
+    <button class="ghost sm" onclick="doRestart()">重启</button>
+    <button class="danger sm" id="stop-btn" hidden onclick="doStop()">停止</button>
+  </div>
 </header>
 
 <div id="need-key" class="card" hidden><b class="err">需要管理密钥</b><div class="hint">请从 app 打开，或用带 #k= 的链接。</div></div>
@@ -180,10 +185,6 @@
     <pre class="mono" id="events">（暂无）</pre>
     <div class="btns"><button class="ghost sm" onclick="copyText($('events').textContent,'日志已复制（不含令牌）')">复制日志</button></div>
   </details>
-  <div class="btns full">
-    <button class="ghost" onclick="doRestart()">重启服务</button>
-    <button class="danger" id="stop-btn" hidden onclick="if(confirm('停止 ShellGate？停止后远程就连不上了。')) SGApp.stop()">停止服务</button>
-  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -332,7 +333,12 @@ async function restartNow(){
   try { await api('/api/restart',{method:'POST'}); } catch(e) {}
   setTimeout(load,2500);
 }
-async function doRestart(){ flash('s-out','正在重启…'); await restartNow(); }
+// the app asks with a native dialog (WebView confirm() is unreliable); the page then shows "stopped"
+function doStop(){
+  if (SGApp.confirmStop) { SGApp.confirmStop(); return; }
+  if (confirm('停止 ShellGate？停止后远程就连不上了。')) SGApp.stop();
+}
+async function doRestart(){ toast('正在重启…'); flash('s-out','正在重启…'); await restartNow(); }
 async function newToken(){
   if(!confirm('换一个新的访问令牌？旧令牌立刻作废，所有 AI 客户端都要换成新配置。')) return;
   const d = await api('/api/settings',{method:'POST',body:JSON.stringify({new_token:true})});

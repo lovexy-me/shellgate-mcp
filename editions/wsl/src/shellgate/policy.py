@@ -337,6 +337,8 @@ def sudo_argv(command: str, allow: list[str]) -> list[str]:
         raise PermissionError("empty command")
     for entry in allow:
         want = entry.split()
+        if want == ["*"]:  # any single command (full root, still one plain command + confirm codes)
+            return argv
         if want and argv[:len(want)] == want:
             return argv
     raise PermissionError(f"not in SHELLGATE_SUDO_ALLOW: {' '.join(argv[:3])}")

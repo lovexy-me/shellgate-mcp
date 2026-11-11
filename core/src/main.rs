@@ -325,6 +325,7 @@ fn main() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(serve(settings, open_admin));
     drop(rt);
+    net::stop_tunnel();
     if RESTART_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
         reexec();
     }
@@ -446,6 +447,16 @@ async fn serve(settings: config::Settings, open_admin: bool) {
             _ = platform::shutdown_signal() => {}
             _ = RESTART.notified() => { events::ev("restarting with the new config"); }
         }
+        net::stop_tunnel();
+        // open keep-alive connections (MCP clients, the admin page) can hold a graceful shutdown
+        // forever: give them a few seconds, then stop or restart anyway
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            if RESTART_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
+                reexec();
+            }
+            std::process::exit(0);
+        });
     };
     if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
         eprintln!("server error: {e}");

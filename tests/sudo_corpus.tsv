@@ -15,3 +15,7 @@ systemctl restart	systemctl stop nginx	deny
 	systemctl restart nginx	deny
 wg show	wg show wg0	ok
 wg show	wg	deny
+*	apt-get dist-upgrade -y	ok
+*	bash /home/u/fix.sh	ok
+*	reboot; id	deny
+*	bash -c 'id | tee x'	deny

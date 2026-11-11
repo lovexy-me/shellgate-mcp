@@ -24,6 +24,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
 from .audit import AuditLog, client_ip
+from . import guard
 from .config import Settings, load_settings
 from .policy import (ConfirmStore, sudo_argv, allowlist_violations, check_path, feeds_interpreter,
                      referenced_scripts, text_danger_reasons)
@@ -219,6 +220,55 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         return {"status": "ok", "interpreter": interpreter, **result}
+
+    state_dir = str(Path(settings.audit_log).parent)
+
+    @mcp.tool()
+    @audited
+    async def guarded_change(command: str, files: list[str], reload: str = "", timeout: int = guard.DEFAULT_TIMEOUT,
+                             cwd: str | None = None, confirm_code: str | None = None) -> dict:
+        """Make a risky config change with automatic rollback: copies the listed files, runs the
+        command, and unless guarded_confirm keeps it within timeout seconds (15-900, default 120),
+        puts the files back and runs the reload command (e.g. "systemctl --user restart x").
+        The pending rollback survives a ShellGate restart. Dangerous commands still need a confirm code."""
+        wd = resolve_cwd(cwd)
+        checked = [check_path(f, settings, write=True) for f in files]
+        if (blocked := gate("guarded", command, wd, confirm_code, extra=(tuple(checked), reload))):
+            return blocked
+        if reload and (r := text_danger_reasons(reload, settings)):
+            fp = confirms.fingerprint("guarded-reload", command, reload)
+            if not confirms.redeem(confirm_code, fp):
+                return {"status": "confirmation_required", "reasons": [f"{w} (in reload)" for w in r],
+                        "confirm_code": confirms.issue(fp), "expires_in_s": settings.confirm_ttl,
+                        "next": "Ask the user. Only if they explicitly agree, call again with this confirm_code."}
+        t = max(guard.MIN_TIMEOUT, min(int(timeout or guard.DEFAULT_TIMEOUT), guard.MAX_TIMEOUT))
+        gid, d, meta = guard.snapshot(state_dir, checked, command, reload, t)
+        guard.arm(d, settings.shell, meta["deadline"])  # armed before running: a cut-off still rolls back
+        out = await run_once(command, wd, max(5, min(settings.default_timeout, t - 5)), settings, sem, None)
+        return {"status": "ok", "id": gid, "result": out, "changed_files": guard.changed_files(d, meta),
+                "rollback_in_s": t,
+                "next": f"Check the host still works as intended, then call guarded_confirm id={gid} action=keep. "
+                        f"Without it, the files are restored and the reload runs in {t} s."}
+
+    @mcp.tool()
+    @audited
+    async def guarded_confirm(id: str | None = None, action: str = "status") -> dict:
+        """Keep or undo a guarded_change: action=keep makes it permanent, action=rollback undoes it now,
+        action=status (default) shows it; with no id, lists recent guarded changes."""
+        if not id:
+            return {"status": "ok", "guards": guard.listing(state_dir)}
+        d = guard.find(state_dir, id)
+        if action == "keep":
+            guard.transition(d, "kept")
+            return {"status": "ok", "id": id, "kept": True}
+        if action == "rollback":
+            return await guard.rollback(d, settings.shell, "rolled back by guarded_confirm")
+        if action == "status":
+            m = guard.read_meta(d)
+            return {"status": "ok", "id": id, "state": m.get("status"), "command": m.get("command"),
+                    "seconds_left": max(0, m["deadline"] - guard.now()) if m.get("status") == "pending" else None,
+                    "changed_files": guard.changed_files(d, m), "rollback": m.get("rollback")}
+        raise ValueError(f"action must be keep, rollback or status, not {action}")
 
     @mcp.tool()
     @audited
@@ -583,8 +633,17 @@ class BearerAuth:
     def __init__(self, app, token: str) -> None:
         self.app = app
         self.expected = f"Bearer {token}".encode()
+        self.on_start = None
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan" and self.on_start is not None:
+            cb, self.on_start = self.on_start, None
+            try:
+                n = cb()
+                if n:
+                    print(f"guarded changes: {n} pending rollback(s) re-armed")
+            except Exception as e:  # noqa: BLE001
+                print(f"guard recovery failed: {e}")
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         headers = dict(scope.get("headers") or [])
@@ -609,7 +668,9 @@ class BearerAuth:
 
 def create_app(settings: Settings):
     mcp, _ = build_server(settings)
-    return BearerAuth(mcp.streamable_http_app(), settings.token)
+    app = BearerAuth(mcp.streamable_http_app(), settings.token)
+    app.on_start = lambda: guard.recover(str(Path(settings.audit_log).parent), settings.shell)
+    return app
 
 
 def main() -> None:

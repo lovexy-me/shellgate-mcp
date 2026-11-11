@@ -302,8 +302,6 @@ async def test_write_binary_base64_with_newlines(server):
 
 async def test_guarded_change_rollback(server):
     url, work, _ = server
-    if not BIN:
-        pytest.skip("guarded_change is in the Rust build")
     cfg = work / "fw.conf"
     cfg.write_text("option input REJECT\n")
     r = await _call(url, "guarded_change", command=f"echo 'option input ACCEPT' > {cfg}", files=[str(cfg)],

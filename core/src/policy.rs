@@ -378,6 +378,10 @@ pub fn sudo_argv(cmd: &str, allow: &[String]) -> Result<Vec<String>, String> {
     }
     for e in allow {
         let want: Vec<&str> = e.split_whitespace().collect();
+        if want == ["*"] {
+            // any single command (full root; still one plain command, still confirm codes)
+            return Ok(argv);
+        }
         if !want.is_empty() && argv.len() >= want.len() && argv.iter().zip(&want).all(|(a, b)| a == b) {
             return Ok(argv);
         }

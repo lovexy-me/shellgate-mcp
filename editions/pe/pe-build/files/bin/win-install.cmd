@@ -4,7 +4,7 @@ rem win-install.cmd -- 在 ShellGate PE 里安装 Windows XP ~ Windows 11 (x86/x64)
 rem
 rem   （分区和写引导是破坏性操作，放在 win-disk.cmd：layout / boot / fixboot）
 rem   win-install.cmd apply   <source> <target:> [--drivers DIR] [--unattend FILE] [--index N]
-rem        Vista+ : wim/esd/swm 用 dism 释放（dism 不行时退回 wimlib-imagex），iso 自动挂载取 install.wim
+rem        Vista+ : wim/esd/swm 用 dism 释放（dism 不行时退回 wimlib-imagex），iso 自动挂载取 install.wim（挂载不可用时 7za 解出）
 rem                 gho 需要 ghost（不可再分发，不内置）
 rem        XP/2003: 源目录里的 I386/AMD64 整体拷到 C:\，写 winnt.sif，准备 $WIN_NT$.~BT 引导
 rem   win-install.cmd drivers <target:> <driverDir>      Vista+ dism /Add-Driver /Recurse
@@ -49,12 +49,22 @@ if exist "%SRC%\I386\" goto xp
 if exist "%SRC%\AMD64\" goto xp
 if exist "%SRC%\i386\" goto xp
 
-rem ---- ISO: 挂载后找 sources\install.*
-for %%F in ("%SRC%") do if /i "%%~xF"==".iso" (
-  echo [i] ISO 需先挂载：PE 下用 "imdisk" 或把 ISO 解包到目录后再传目录。
-  echo     ShellGate 里通常直接传 Ventoy 盘上已解包的目录，或用 7za x 解到临时盘。
-  exit /b 2
-)
+rem ---- ISO: 先用 PowerShell Mount-DiskImage 挂载；PE 不支持时用 7za 只解出 install.wim/esd 到目标盘临时目录
+set "ISOTMP="
+for %%F in ("%SRC%") do if /i "%%~xF"==".iso" goto iso
+goto noiso
+:iso
+set "ISODRV="
+if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "try{$i=Mount-DiskImage -ImagePath '%SRC%' -PassThru -ErrorAction Stop;($i|Get-Volume).DriveLetter}catch{}"`) do set "ISODRV=%%D:"
+if defined ISODRV if exist "!ISODRV!\sources\" (echo [i] ISO 已挂载到 !ISODRV!& set "SRC=!ISODRV!" & goto noiso)
+set "SZ=X:\Program Files\ShellGatePE\7zip\7za.exe"
+if not exist "!SZ!" for /f "delims=" %%Z in ('dir /b /s "X:\Program Files\ShellGatePE\7za.exe" 2^>nul') do set "SZ=%%Z"
+if not exist "!SZ!" echo [x] 无法挂载 ISO，也没有 7za；请把 ISO 解包到目录后传目录 & exit /b 2
+set "ISOTMP=%TGT%\$sg_iso"
+echo [i] 挂载不可用，用 7za 解出 install 镜像到 !ISOTMP!
+"!SZ!" e -y -o"!ISOTMP!" "%SRC%" sources\install.wim sources\install.esd >nul
+if exist "!ISOTMP!\install.wim" (set "SRC=!ISOTMP!\install.wim") else if exist "!ISOTMP!\install.esd" (set "SRC=!ISOTMP!\install.esd") else (echo [x] ISO 里没有 sources\install.wim/esd & rd /s /q "!ISOTMP!" 2>nul & exit /b 2)
+:noiso
 set "WIM=%SRC%"
 if exist "%SRC%\sources\install.wim" set "WIM=%SRC%\sources\install.wim"
 if exist "%SRC%\sources\install.esd" set "WIM=%SRC%\sources\install.esd"
@@ -71,6 +81,7 @@ if errorlevel 1 (
   if not exist "%WIMLIB%" echo 没有 wimlib-imagex & exit /b 1
   "%WIMLIB%" apply "%WIM%" %IDX% %TGT%\ || exit /b 1
 )
+if defined ISOTMP rd /s /q "%ISOTMP%" 2>nul
 if defined DRV (
   echo [2/3] 注入驱动 %DRV%
   dism /Image:%TGT%\ /Add-Driver /Driver:"%DRV%" /Recurse /ForceUnsigned

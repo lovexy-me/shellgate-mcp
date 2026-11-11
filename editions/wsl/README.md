@@ -109,11 +109,18 @@ claude mcp add --transport http shellgate https://shell.example.com/mcp \
 | JWT、≥60 字符的 base64 令牌 | `<token>` | 路径和纯十六进制摘要不算 |
 | UUID | `<uuid>` | |
 | `password=`、`token:`、`api_key`、`private_key`、`preshared_key`、`Authorization: Bearer …`、UCI `option key '…'` 等 | 值改为 `<x>` | 名字保留 |
-| `SHELLGATE_REDACT_DOMAINS` 里的域名及其子域 | `<domain>` | 逗号分隔，按后缀匹配 |
+| `SHELLGATE_REDACT_DOMAINS` 里的域名及其子域 | `<domain>` | 逗号分隔，按后缀匹配；Rust 版还会自动加入 `SHELLGATE_PUBLIC_URL` 的主机名 |
+| 本机自己的访问令牌、隧道令牌原文 | `<x>` | 出现在任何输出里都遮（≥12 字符） |
+| 带前缀的云服务令牌：`ghp_`/`github_pat_`、`glpat-`、`sk-`、`gsk_`、`xox?-`、`AKIA`/`ASIA`、`AIza`、`hf_`、`npm_`、`pypi-` 等 | `<token>` | 同一行出现 aws/AKIA 时，40 位 AWS secret 也遮为 `<x>` |
+| 网址里的 `用户:密码@`、ss/trojan/hysteria/tuic 链接的用户段、整段 `vmess://` | 密码改为 `<x>` | 用户名保留（ss 等的 base64 用户段整体遮） |
+| 命令行密码：`mysql -p…`、`sshpass -p`、`-u 用户:密码`、`smbclient -U 用户%密码`、`--password`/`--token`/`--pass`/`--secret`/`--api-key`/`--cookie` 等 | `<x>` | `-u 1000:1000`（uid:gid）不算 |
+| 无线密码：MediaTek dat 的 `WPAPSK1=`、`PSK_KEYS=`、`RADIUS_Key`、`WEP` 键，hostapd `wpa_passphrase`/`sae_password`，`netsh wlan` 的 Key Content/关键内容 | `<x>` | |
+| `Cookie:`/`Set-Cookie:` 头、crypt 哈希（`$6$…`）、chap/pap-secrets 的密码列、紧跟 key/token/secret 字样的 32–128 位十六进制 | `<x>` | `sha256sum` 输出、git 提交号不受影响 |
+| 个人信息（`SHELLGATE_REDACT_PII=1`，默认开）：邮箱、中国大陆手机号、IMEI/MEID、序列号（`ro.serialno`、Serial Number）、Wi-Fi SSID | `<email>` `<phone>` `<imei>` `<serial>` `<ssid>` | `git@`、`.local`/`.lan` 等内网主机名不算邮箱 |
 
 有替换时，结果里会多一个字段 `"redacted": "[redacted: ip=3 mac=1]"`。占位符不是真实值，不要把它写回配置文件。
 
-**English**: Redaction is on by default (`SHELLGATE_REDACT=1`) and can only be turned off in the server environment, never per call. It applies to every string a tool returns (including errors and `audit_tail`); tool inputs are executed unmodified, and the audit log stores redacted arguments/results only (the raw client IP stays in the on-device log for forensics, but is masked in `audit_tail` output). Public IPv4 → `<ip>` (decided per address; private/CGNAT/link-local/loopback kept; CIDR suffix kept; partial public prefixes such as `198.51.100.`, `198.51.100.x`, `198.51.*.*`, `198.51.100/24` and identifier forms like `Allow_198_51_100_Net` are masked too), global IPv6 → `<ipv6>`, MAC → `<mac>` (also after a label such as `Sta:` and inside bridge ids like `8000.0242ac110002`), WireGuard/PEM keys → `<key>`, JWT and long base64 → `<token>`, UUID → `<uuid>`, secret `key=value` / `key: value` → `<x>`, domains under `SHELLGATE_REDACT_DOMAINS` → `<domain>`. A `"redacted"` field summarises the counts when anything was replaced.
+**English**: Redaction is on by default (`SHELLGATE_REDACT=1`) and can only be turned off in the server environment, never per call. It applies to every string a tool returns (including errors and `audit_tail`); tool inputs are executed unmodified, and the audit log stores redacted arguments/results only (the raw client IP stays in the on-device log for forensics, but is masked in `audit_tail` output). Public IPv4 → `<ip>` (decided per address; private/CGNAT/link-local/loopback kept; CIDR suffix kept; partial public prefixes such as `198.51.100.`, `198.51.100.x`, `198.51.*.*`, `198.51.100/24` and identifier forms like `Allow_198_51_100_Net` are masked too), global IPv6 → `<ipv6>`, MAC → `<mac>` (also after a label such as `Sta:` and inside bridge ids like `8000.0242ac110002`), WireGuard/PEM keys → `<key>`, JWT and long base64 → `<token>`, UUID → `<uuid>`, secret `key=value` / `key: value` → `<x>`, domains under `SHELLGATE_REDACT_DOMAINS` → `<domain>`. Since v0.2.7 also: the server's own access/tunnel token anywhere, prefixed cloud tokens (`ghp_`, `sk-`, `gsk_`, `AKIA`, `xox?-`, `glpat-`, ...) → `<token>`, URL `user:password@` and proxy-link userinfo, command-line passwords (`mysql -p`, `sshpass -p`, `-u user:pass`, `--password`/`--token` ...), MediaTek/hostapd/netsh Wi-Fi keys, cookies, crypt hashes, chap-secrets and hex secrets next to a key word → `<x>`; with `SHELLGATE_REDACT_PII=1` (default) e-mail, CN mobile numbers, IMEI, serial numbers and SSIDs → `<email>` `<phone>` `<imei>` `<serial>` `<ssid>`. The shared test corpus is `tests/redact_corpus.tsv`. A `"redacted"` field summarises the counts when anything was replaced.
 
 ### `run_script` 与 `stdin`
 
@@ -137,6 +144,7 @@ claude mcp add --transport http shellgate https://shell.example.com/mcp \
 | `SHELLGATE_PORT` | `8790` | 监听端口 |
 | `SHELLGATE_REDACT` | `1` | 输出脱敏；`0` 关闭（不建议） |
 | `SHELLGATE_REDACT_DOMAINS` | 空 | 需要脱敏的域名后缀，逗号分隔（`example.org` 也匹配 `a.example.org`） |
+| `SHELLGATE_REDACT_PII` | `1` | 遮邮箱、手机号、IMEI、序列号、SSID；`0` 关闭 |
 
 ## 安全须知
 

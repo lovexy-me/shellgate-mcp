@@ -1,7 +1,8 @@
 //! Output redaction, identical in behaviour to src/shellgate/redact.py.
 //!
 //! Every rule is "candidate regex + boundary/validity check in code" (the regex crate has no
-//! look-around). Placeholders: <ip> <ipv6> <mac> <key> <token> <uuid> <x> <domain>.
+//! look-around). Placeholders: <ip> <ipv6> <mac> <key> <token> <uuid> <x> <domain>, and with pii on
+//! <email> <phone> <imei> <serial> <ssid>. tests/redact_corpus.tsv is shared with the Python build.
 
 use std::collections::BTreeMap;
 use std::net::Ipv6Addr;
@@ -10,7 +11,7 @@ use std::sync::OnceLock;
 use regex::{Captures, Regex};
 use serde_json::Value;
 
-pub const ORDER: &[&str] = &["ip", "ipv6", "mac", "key", "token", "uuid", "secret", "domain"];
+pub const ORDER: &[&str] = &["ip", "ipv6", "mac", "key", "token", "uuid", "secret", "domain", "pii"];
 const SECRET_NAMES: &str = "password|passwd|passphrase|secret|token|api[_-]?key|apikey|private[_-]?key\
 |preshared[_-]?key|psk|authorization|bearer|key";
 const NEED_SEP: &[&str] = &["key", "token", "psk", "secret", "bearer"];
@@ -79,6 +80,112 @@ fn rx() -> &'static Rx {
         bridge_id: Regex::new(r"[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{12}").unwrap(),
         run: Regex::new(r"[A-Za-z0-9+/_-]+={0,2}").unwrap(),
     })
+}
+
+// ---------------------------------------------------------------- extra rules (v0.2.7)
+// Same table as _EXTRA_SPEC in redact.py: (name, pattern, group (0 = whole), replacement, kind,
+// left, right, pii). left/right: None = no check; Some(set) = the neighbouring char must not be an
+// ASCII letter/digit/underscore nor in set. Replacement "=" keeps quotes (<x>).
+type ExtraSpec = (&'static str, &'static str, usize, &'static str, &'static str, Option<&'static str>, Option<&'static str>, bool);
+const EXTRA_SPEC: &[ExtraSpec] = &[
+    ("crypt", r"\$(?:1|2[abxy]|5|6|y|gy|7|apr1)\$[./A-Za-z0-9$=,+-]{8,}", 0, "<x>", "secret", Some("$"), None, false),
+    ("aws_secret", r"[A-Za-z0-9/+]{40}", 0, "<x>", "secret", Some("/+="), Some("/+="), false),
+    ("prefixed", concat!(r"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20,}",
+        r"|sk-(?:proj-|ant-(?:api[0-9]+-)?|or-v1-|svcacct-)?[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9]{40,}",
+        r"|xox[abprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}",
+        r"|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{50,}|dop_v1_[a-f0-9]{64}",
+        r"|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})"), 0, "<token>", "token", Some("-"), Some(""), false),
+    ("url_userinfo", r"([A-Za-z][A-Za-z0-9+.-]{1,15}://)([^\s/@:<>]*):([^\s/@<>]+)@", 3, "<x>", "secret", None, None, false),
+    ("proxy_userinfo", r"(?i)(?:^|[^A-Za-z0-9+.-])((?:ss|ssr|trojan|hysteria2?|hy2|tuic|anytls|socks5?h?)://)([^\s@/:<>]+)@", 2, "<x>", "secret", Some(""), None, false),
+    ("vmess", r"(?:^|[^A-Za-z0-9+.-])(vmess://)([A-Za-z0-9+/=_-]{16,})", 2, "<x>", "secret", Some(""), None, false),
+    ("mysql_p", r#"\b(?:mysql\w*|mariadb[\w-]*)[^\n]*?[ \t]-p([^\s'"<]\S*|'[^'\n]*'|"[^"\n]*")"#, 1, "=", "secret", None, None, false),
+    ("sshpass_p", r#"\bsshpass\b[^\n]*?[ \t]-p[ \t]*([^\s'"<]\S*|'[^'\n]*'|"[^"\n]*")"#, 1, "=", "secret", None, None, false),
+    ("user_pass_flag", r#"(?m)(?:^|[ \t])(?:-u|--user|--proxy-user|--http-user)(?:[ \t]+|=)['"]?([^\s:'"<]+):([^\s'"]+)"#, 2, "<x>", "secret", None, None, false),
+    ("smb_user_pass", r#"(?m)(?:^|[ \t])-U[ \t]*['"]?([^\s%'"]+)%([^\s'"]+)"#, 2, "<x>", "secret", None, None, false),
+    ("secret_flag", concat!(r"(?im)(?:^|[ \t])--?(?:password|passwd|pass|pwd|token|secret|api-?key|auth-?key|access-?token",
+        r"|psk|cookie|http-password|ftp-password|proxy-password|tunnel-token)(?:[ \t]+|=)",
+        r#"([^\s'"<-][^\s'"]*|'[^'\n]*'|"[^"\n]*")"#), 1, "=", "secret", None, None, false),
+    ("wifi_conf", concat!(r"(?im)^([ \t]*(?:WPAPSK[0-9]*|WPA_PSK[0-9]*|PSK_KEYS|RADIUS_Key[0-9]*|WEP_?KEY[0-9_]*",
+        r"|Key[1-4]Str[0-9]*|sae_password|wpa_passphrase|wpa_psk)[ \t]*=[ \t]*)([^\r\n]+)"), 2, "<x>", "secret", None, None, false),
+    ("netsh_key", r"(?im)^([ \t]*(?:Key Content|关键内容|密钥内容)[ \t]*:[ \t]*)([^\r\n]+)", 2, "<x>", "secret", None, None, false),
+    ("cookie_header", r"(?im)^([ \t<>]*(?:set-cookie|cookie)[ \t]*:[ \t]*)([^\r\n]+)", 2, "<x>", "secret", None, None, false),
+    ("cookie_quoted", r#"(?i)(["'](?:set-)?cookie["'][ \t]*:[ \t]*)("[^"\n]*"|'[^'\n]*')"#, 2, "=", "secret", None, None, false),
+    ("chap_secrets", r#"(?m)^([ \t]*"[^"\n]+"[ \t]+(?:\*|"[^"\n]*"|[^\s"]+)[ \t]+)("[^"\n]+")"#, 2, "=", "secret", None, None, false),
+    ("hex_in_key_ctx", r"(?i)\b(?:key|token|secret|password|passwd|psk|hmac|apikey)\b[^\n]{0,24}?([0-9a-fA-F]{32,128})", 1, "<x>", "secret", Some(""), Some(""), false),
+    ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.([A-Za-z]{2,})", 0, "<email>", "pii", Some(".%+-"), Some(""), true),
+    ("cn_mobile", r"(?:\+?86[- ]?)?1[3-9][0-9](?:[- ]?[0-9]{4}){2}", 0, "<phone>", "pii", Some("._+/:-"), Some("._"), true),
+    ("imei", r"(?i)\b(?:imei|meid)[0-9]?[^\n0-9<]{0,12}([0-9]{14,17})", 1, "<imei>", "pii", Some(""), Some(""), true),
+    ("serial", r#"(?i)(ro\.(?:boot\.)?serialno|\bserial[ _]?(?:number|no)?)([\]"']?[ \t]*[:=][ \t]*[\["']?)([A-Za-z0-9][A-Za-z0-9._-]{5,})"#, 3, "<serial>", "pii", None, Some(""), true),
+    ("ssid", r#"(?im)(^[ \t]*|[ \t,{;"'])(e?ssid[ \t]*[0-9]*)(["']?[ \t]*[:=][ \t]*|[ \t]+)("[^"\n]*"|'[^'\n]*'|[^\r\n,;}"'<]+)"#, 4, "<ssid>", "pii", None, None, true),
+];
+const LOCAL_TLDS: &[&str] = &["local", "lan", "home", "internal", "localdomain", "arpa", "localhost", "intranet"];
+
+struct Extra {
+    name: &'static str,
+    re: Regex,
+    group: usize,
+    rep: &'static str,
+    kind: &'static str,
+    left: Option<&'static str>,
+    right: Option<&'static str>,
+    pii: bool,
+}
+
+fn extras() -> &'static Vec<Extra> {
+    static E: OnceLock<Vec<Extra>> = OnceLock::new();
+    E.get_or_init(|| EXTRA_SPEC.iter().map(|&(name, p, group, rep, kind, left, right, pii)| Extra {
+        name, re: Regex::new(p).unwrap_or_else(|e| panic!("extra rule {name}: {e}")), group, rep, kind, left, right, pii,
+    }).collect())
+}
+
+fn blocked(c: Option<char>, set: Option<&str>) -> bool {
+    set.is_some_and(|s| is_word(c) || is_in(c, s))
+}
+
+fn extra_ok(name: &str, m: &Captures, g: usize, t: &str) -> bool {
+    let mg = m.get(g).unwrap();
+    let v = mg.as_str();
+    match name {
+        "aws_secret" => {
+            if !(v.bytes().any(|b| b.is_ascii_uppercase()) && v.bytes().any(|b| b.is_ascii_lowercase())
+                && v.bytes().any(|b| b.is_ascii_digit()) && (v.contains('/') || v.contains('+'))) {
+                return false;
+            }
+            let m0 = m.get(0).unwrap();
+            let ls = t[..m0.start()].rfind('\n').map_or(0, |i| i + 1);
+            let le = t[m0.end()..].find('\n').map_or(t.len(), |i| m0.end() + i);
+            let line = t[ls..le].to_lowercase();
+            line.contains("aws") || line.contains("akia") || line.contains("asia")
+        }
+        "email" => {
+            let local = v.split('@').next().unwrap_or("");
+            let tld = m.get(1).unwrap().as_str().to_lowercase();
+            !local.eq_ignore_ascii_case("git") && !LOCAL_TLDS.contains(&tld.as_str())
+        }
+        "user_pass_flag" => {
+            let user = m.get(1).unwrap().as_str();
+            let digits = |x: &str| !x.is_empty() && x.chars().all(|c| c.is_ascii_digit());
+            !(digits(user) && digits(v))
+        }
+        "ssid" => !v.trim().trim_matches(|c| c == '\'' || c == '"').trim().is_empty(),
+        _ => true,
+    }
+}
+
+fn extra_rep(name: &str, rep: &str, v: &str) -> String {
+    if rep == "=" {
+        return mask_value(v);
+    }
+    let q = v.chars().next();
+    if let Some(q) = q.filter(|c| *c == '\'' || *c == '"') {
+        if v.len() >= 2 && v.ends_with(q) && (name == "ssid" || name == "serial") {
+            return format!("{q}{rep}{q}");
+        }
+    }
+    if name == "ssid" {
+        return format!("{rep}{}", &v[v.trim_end().len()..]);
+    }
+    rep.to_string()
 }
 
 fn before(t: &str, i: usize) -> Option<char> {
@@ -196,6 +303,10 @@ pub fn ipv6_is_global(addr: &str) -> Option<bool> {
 pub struct Redactor {
     pub enabled: bool,
     domain: Option<Regex>,
+    /// exact secret values this server knows (its own access token, tunnel token): always masked
+    secrets: Vec<String>,
+    /// personal data rules (email, CN mobile, IMEI, serial, SSID); SHELLGATE_REDACT_PII=0 turns them off
+    pii: bool,
 }
 
 impl Redactor {
@@ -211,7 +322,47 @@ impl Redactor {
             let alts: Vec<String> = suffixes.iter().map(|s| regex::escape(s)).collect();
             Regex::new(&format!(r"(?i)(?:[A-Za-z0-9-]+\.)*(?:{})", alts.join("|"))).unwrap()
         });
-        Self { enabled, domain }
+        Self { enabled, domain, secrets: Vec::new(), pii: true }
+    }
+
+    pub fn with_secrets(mut self, secrets: &[String]) -> Self {
+        let mut v: Vec<String> = secrets.iter().filter(|x| x.len() >= 12).cloned().collect();
+        v.sort();
+        v.dedup();
+        v.sort_by(|a, b| b.len().cmp(&a.len()));
+        self.secrets = v;
+        self
+    }
+
+    pub fn with_pii(mut self, on: bool) -> Self {
+        self.pii = on;
+        self
+    }
+
+    fn extra(&self, text: String, c: &mut Counts) -> String {
+        let mut t = text;
+        for e in extras() {
+            if e.pii && !self.pii {
+                continue;
+            }
+            t = sub(&e.re, &t, |m, s| {
+                let mg = m.get(e.group)?;
+                let v = mg.as_str();
+                if v.is_empty() || is_placeholder(v) {
+                    return None;
+                }
+                if blocked(before(s, mg.start()), e.left) || blocked(after(s, mg.end()), e.right) {
+                    return None;
+                }
+                if !extra_ok(e.name, m, e.group, s) {
+                    return None;
+                }
+                c.hit(e.kind);
+                let m0 = m.get(0).unwrap();
+                Some(format!("{}{}{}", &s[m0.start()..mg.start()], extra_rep(e.name, e.rep, v), &s[mg.end()..m0.end()]))
+            });
+        }
+        t
     }
 
     pub fn text(&self, text: &str, c: &mut Counts) -> String {
@@ -220,6 +371,14 @@ impl Redactor {
         }
         let r = rx();
         let mut t = sub(&r.pem, text, |_, _| { c.hit("key"); Some("<key>".into()) });
+        for sec in &self.secrets {
+            let n = t.matches(sec.as_str()).count();
+            if n > 0 {
+                for _ in 0..n { c.hit("secret"); }
+                t = t.replace(sec.as_str(), "<x>");
+            }
+        }
+        t = self.extra(t, c);
 
         t = sub(&r.kv, &t, |m, s| {
             let (prefix, value) = (m.get(1).unwrap().as_str(), m.get(4).unwrap().as_str());
@@ -618,8 +777,8 @@ mod tests {
     #[test]
     fn domains() {
         let (o, f) = red("https://a.b.example.org/x user@Example.ORG host.example.net notexample.org example.org.cn");
-        assert_eq!(o, "https://<domain>/x user@<domain> <domain> notexample.org example.org.cn");
-        assert_eq!(f, "[redacted: domain=3]");
+        assert_eq!(o, "https://<domain>/x <email> <domain> notexample.org example.org.cn");
+        assert_eq!(f, "[redacted: domain=2 pii=1]");
         let mut c = Counts::default();
         assert_eq!(Redactor::new(true, &[]).text("a.example.org", &mut c), "a.example.org");
     }
@@ -657,5 +816,30 @@ mod tests {
         assert_eq!(c.footer(), "[redacted: ip=1 mac=1]");
         let off = Redactor::new(false, &["example.org".into()]);
         assert_eq!(off.text("203.0.113.1 a.example.org", &mut Counts::default()), "203.0.113.1 a.example.org");
+    }
+
+    #[test]
+    fn shared_corpus() {
+        let r = Redactor::new(true, &["example.com".to_string()]).with_secrets(&["known-secret-value-123456".to_string()]);
+        let unesc = |x: &str| x.replace("\\n", "\n").replace("\\t", "\t");
+        let mut n = 0;
+        for line in include_str!("../../tests/redact_corpus.tsv").lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 3, "bad corpus line: {line}");
+            let mut c = Counts::default();
+            assert_eq!(r.text(&unesc(f[1]), &mut c), unesc(f[2]), "corpus case {}", f[0]);
+            n += 1;
+        }
+        assert!(n >= 80);
+    }
+
+    #[test]
+    fn pii_off_and_short_secret() {
+        let r = Redactor::new(true, &[]).with_pii(false).with_secrets(&["short".to_string()]);
+        let s = "mail alice@gmail.com tel 13812345678 SSID: Home-5G a short word";
+        assert_eq!(r.text(s, &mut Counts::default()), s);
     }
 }

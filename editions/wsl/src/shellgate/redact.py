@@ -3,7 +3,8 @@
 Every rule is "candidate regex + boundary/validity check in code" (no look-around), so the
 Rust build in core/src/redact.rs can implement exactly the same behaviour.
 
-Placeholders: <ip> <ipv6> <mac> <key> <token> <uuid> <x> (secret values) <domain>.
+Placeholders: <ip> <ipv6> <mac> <key> <token> <uuid> <x> (secret values) <domain>,
+and with pii on: <email> <phone> <imei> <serial> <ssid>.
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import re
 from collections import Counter
 from typing import Any, Callable
 
-ORDER = ("ip", "ipv6", "mac", "key", "token", "uuid", "secret", "domain")
+ORDER = ("ip", "ipv6", "mac", "key", "token", "uuid", "secret", "domain", "pii")
 
 _SECRET_NAMES = (r"password|passwd|passphrase|secret|token|api[_-]?key|apikey|private[_-]?key"
                  r"|preshared[_-]?key|psk|authorization|bearer|key")
@@ -47,6 +48,78 @@ _B64 = re.compile(r"[A-Za-z0-9+/]{43}=")
 
 _ALNUM = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 _WORD = _ALNUM | {"_"}
+
+# ---------------------------------------------------------------- extra rules (v0.2.7)
+# (name, pattern, group to replace (0 = whole match), replacement, kind, left, right, pii)
+# left/right: None = no boundary check; a string = the neighbouring char must not be an ASCII
+# letter/digit/underscore nor any char in the string. Replacement "=" keeps quotes (<x>).
+_EXTRA_SPEC = [
+    ("crypt", r"\$(?:1|2[abxy]|5|6|y|gy|7|apr1)\$[./A-Za-z0-9$=,+-]{8,}", 0, "<x>", "secret", "$", None, False),
+    ("aws_secret", r"[A-Za-z0-9/+]{40}", 0, "<x>", "secret", "/+=", "/+=", False),
+    ("prefixed", r"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20,}"
+                 r"|sk-(?:proj-|ant-(?:api[0-9]+-)?|or-v1-|svcacct-)?[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9]{40,}"
+                 r"|xox[abprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}"
+                 r"|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{50,}|dop_v1_[a-f0-9]{64}"
+                 r"|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})", 0, "<token>", "token", "-", "", False),
+    ("url_userinfo", r"([A-Za-z][A-Za-z0-9+.-]{1,15}://)([^\s/@:<>]*):([^\s/@<>]+)@", 3, "<x>", "secret", None, None, False),
+    ("proxy_userinfo", r"(?i)(?:^|[^A-Za-z0-9+.-])((?:ss|ssr|trojan|hysteria2?|hy2|tuic|anytls|socks5?h?)://)([^\s@/:<>]+)@", 2, "<x>", "secret", "", None, False),
+    ("vmess", r"(?:^|[^A-Za-z0-9+.-])(vmess://)([A-Za-z0-9+/=_-]{16,})", 2, "<x>", "secret", "", None, False),
+    ("mysql_p", r"\b(?:mysql\w*|mariadb[\w-]*)[^\n]*?[ \t]-p([^\s'\"<]\S*|'[^'\n]*'|\"[^\"\n]*\")", 1, "=", "secret", None, None, False),
+    ("sshpass_p", r"\bsshpass\b[^\n]*?[ \t]-p[ \t]*([^\s'\"<]\S*|'[^'\n]*'|\"[^\"\n]*\")", 1, "=", "secret", None, None, False),
+    ("user_pass_flag", r"(?m)(?:^|[ \t])(?:-u|--user|--proxy-user|--http-user)(?:[ \t]+|=)['\"]?([^\s:'\"<]+):([^\s'\"]+)", 2, "<x>", "secret", None, None, False),
+    ("smb_user_pass", r"(?m)(?:^|[ \t])-U[ \t]*['\"]?([^\s%'\"]+)%([^\s'\"]+)", 2, "<x>", "secret", None, None, False),
+    ("secret_flag", r"(?im)(?:^|[ \t])--?(?:password|passwd|pass|pwd|token|secret|api-?key|auth-?key|access-?token"
+                    r"|psk|cookie|http-password|ftp-password|proxy-password|tunnel-token)(?:[ \t]+|=)"
+                    r"([^\s'\"<-][^\s'\"]*|'[^'\n]*'|\"[^\"\n]*\")", 1, "=", "secret", None, None, False),
+    ("wifi_conf", r"(?im)^([ \t]*(?:WPAPSK[0-9]*|WPA_PSK[0-9]*|PSK_KEYS|RADIUS_Key[0-9]*|WEP_?KEY[0-9_]*"
+                  r"|Key[1-4]Str[0-9]*|sae_password|wpa_passphrase|wpa_psk)[ \t]*=[ \t]*)([^\r\n]+)", 2, "<x>", "secret", None, None, False),
+    ("netsh_key", r"(?im)^([ \t]*(?:Key Content|关键内容|密钥内容)[ \t]*:[ \t]*)([^\r\n]+)", 2, "<x>", "secret", None, None, False),
+    ("cookie_header", r"(?im)^([ \t<>]*(?:set-cookie|cookie)[ \t]*:[ \t]*)([^\r\n]+)", 2, "<x>", "secret", None, None, False),
+    ("cookie_quoted", r"(?i)([\"'](?:set-)?cookie[\"'][ \t]*:[ \t]*)(\"[^\"\n]*\"|'[^'\n]*')", 2, "=", "secret", None, None, False),
+    ("chap_secrets", r"(?m)^([ \t]*\"[^\"\n]+\"[ \t]+(?:\*|\"[^\"\n]*\"|[^\s\"]+)[ \t]+)(\"[^\"\n]+\")", 2, "=", "secret", None, None, False),
+    ("hex_in_key_ctx", r"(?i)\b(?:key|token|secret|password|passwd|psk|hmac|apikey)\b[^\n]{0,24}?([0-9a-fA-F]{32,128})", 1, "<x>", "secret", "", "", False),
+    ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.([A-Za-z]{2,})", 0, "<email>", "pii", ".%+-", "", True),
+    ("cn_mobile", r"(?:\+?86[- ]?)?1[3-9][0-9](?:[- ]?[0-9]{4}){2}", 0, "<phone>", "pii", "._+/:-", "._", True),
+    ("imei", r"(?i)\b(?:imei|meid)[0-9]?[^\n0-9<]{0,12}([0-9]{14,17})", 1, "<imei>", "pii", "", "", True),
+    ("serial", r"(?i)(ro\.(?:boot\.)?serialno|\bserial[ _]?(?:number|no)?)([\]\"']?[ \t]*[:=][ \t]*[\[\"']?)([A-Za-z0-9][A-Za-z0-9._-]{5,})", 3, "<serial>", "pii", None, "", True),
+    ("ssid", r"(?im)(^[ \t]*|[ \t,{;\"'])(e?ssid[ \t]*[0-9]*)([\"']?[ \t]*[:=][ \t]*|[ \t]+)(\"[^\"\n]*\"|'[^'\n]*'|[^\r\n,;}\"'<]+)", 4, "<ssid>", "pii", None, None, True),
+]
+_EXTRA = [(n, re.compile(p), g, r, k, lb, rb, pii) for n, p, g, r, k, lb, rb, pii in _EXTRA_SPEC]
+_LOCAL_TLDS = {"local", "lan", "home", "internal", "localdomain", "arpa", "localhost", "intranet"}
+
+
+def _blocked(ch: str, extra: str | None) -> bool:
+    return extra is not None and ch != "" and (ch in _WORD or ch in extra)
+
+
+def _extra_ok(name: str, m: re.Match[str], g: int, t: str) -> bool:
+    v = m.group(g)
+    if name == "aws_secret":
+        if not (any(ch.isupper() for ch in v) and any(ch.islower() for ch in v)
+                and any(ch.isdigit() for ch in v) and ("/" in v or "+" in v)):
+            return False
+        ls = t.rfind("\n", 0, m.start()) + 1
+        le = t.find("\n", m.end())
+        line = t[ls:le if le >= 0 else len(t)].lower()
+        return "aws" in line or "akia" in line or "asia" in line
+    if name == "email":
+        local = v.split("@", 1)[0]
+        return local.lower() != "git" and m.group(1).lower() not in _LOCAL_TLDS
+    if name == "user_pass_flag":
+        return not (m.group(1).isdigit() and v.isdigit())  # -u 1000:1000 is uid:gid
+    if name == "ssid":
+        return v.strip().strip("'\"").strip() != ""
+    return True
+
+
+def _rep(name: str, rep: str, v: str) -> str:
+    if rep == "=":
+        return _mask_value(v)
+    if v[:1] in "'\"" and len(v) >= 2 and v[-1] == v[0] and name in {"ssid", "serial"}:
+        return f"{v[0]}{rep}{v[0]}"
+    if name == "ssid":
+        return rep + v[len(v.rstrip()):]
+    return rep
 
 
 def _before(text: str, i: int) -> str:
@@ -115,8 +188,12 @@ def ipv6_is_global(addr: str) -> bool | None:
 
 
 class Redactor:
-    def __init__(self, enabled: bool = True, domains: list[str] | None = None) -> None:
+    def __init__(self, enabled: bool = True, domains: list[str] | None = None,
+                 secrets: list[str] | None = None, pii: bool = True) -> None:
         self.enabled = enabled
+        self.pii = pii
+        # exact secret values this server knows (its own access token, tunnel token): always masked
+        self._secrets = sorted({x for x in (secrets or []) if len(x) >= 12}, key=len, reverse=True)
         suffixes = sorted({d.strip().strip(".").lower() for d in (domains or []) if d.strip().strip(".")},
                           key=len, reverse=True)
         self._domain = (re.compile(r"(?i)(?:[A-Za-z0-9-]+\.)*(?:" + "|".join(map(re.escape, suffixes)) + ")")
@@ -133,6 +210,11 @@ class Redactor:
             return rep
 
         text = _sub(_PEM, text, lambda m, t: hit("key", "<key>"))
+        for sec in self._secrets:
+            if sec in text:
+                c["secret"] += text.count(sec)
+                text = text.replace(sec, "<x>")
+        text = self._extra(text, c)
 
         def kv(m: re.Match[str], t: str) -> str | None:
             prefix, name, value = m.group(1), m.group(2).lower(), m.group(4)
@@ -308,6 +390,24 @@ class Redactor:
             return None
         text = _sub(_RUN, text, run)
         return text, c
+
+    def _extra(self, text: str, c: Counter) -> str:
+        for name, rx, g, rep, kind, lb, rb, pii in _EXTRA:
+            if pii and not self.pii:
+                continue
+
+            def fn(m: re.Match[str], t: str, name=name, g=g, rep=rep, kind=kind, lb=lb, rb=rb) -> str | None:
+                v = m.group(g)
+                if not v or _is_placeholder(v):
+                    return None
+                if _blocked(_before(t, m.start(g)), lb) or _blocked(_after(t, m.end(g)), rb):
+                    return None
+                if not _extra_ok(name, m, g, t):
+                    return None
+                c[kind] += 1
+                return t[m.start():m.start(g)] + _rep(name, rep, v) + t[m.end(g):m.end()]
+            text = _sub(rx, text, fn)
+        return text
 
     # --------------------------------------------------------------- objects
     def value(self, obj: Any, counts: Counter | None = None) -> tuple[Any, Counter]:

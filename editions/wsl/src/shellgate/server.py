@@ -49,7 +49,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
     confirms = ConfirmStore(settings.confirm_ttl)
     jobs = JobManager(settings)
     sem = asyncio.Semaphore(settings.max_concurrent)
-    redactor = Redactor(settings.redact, settings.redact_domains)
+    redactor = Redactor(settings.redact, settings.redact_domains, secrets=[settings.token], pii=settings.redact_pii)
     home = str(Path.home())
 
     mcp = FastMCP(

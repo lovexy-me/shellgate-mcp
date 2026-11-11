@@ -1,0 +1,93 @@
+# ShellGate redaction corpus, shared by tests/test_redact.py and core/src/redact.rs.
+# name<TAB>input<TAB>expected; \n and \t are escapes. Redactor(domains=[example.com], secrets=[known-secret-value-123456], pii=on)
+pub ipv4	ssh from 8.8.8.8 port 22	ssh from <ip> port 22
+private	lan 192.168.1.2 and 10.0.0.1	lan 192.168.1.2 and 10.0.0.1
+ipv6	addr 240e:3b7:1234:5678::1/64	addr <ipv6>/64
+mac	ether 00:11:22:33:44:55	ether <mac>
+wg privkey	PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=	PrivateKey = <x>
+wg peer pub	peer: xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=	peer: <key>
+bare base64 44	xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=	<key>
+wg showconf psk	PresharedKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=	PresharedKey = <x>
+jwt	eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U	<token>
+cf token arg	cloudflared tunnel run --token eyJ0IjoiYWJjZGVmIiwidCI6IjEyMyJ9	cloudflared tunnel run --token <x>
+cf token ps	/usr/bin/cloudflared tunnel run eyJ0IjoiYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoiLCJ0IjoiMTIzNDU2Nzg5MCJ9	/usr/bin/cloudflared tunnel run <token>
+github pat	export GH=ghp_1234567890abcdefghijABCDEFGHIJ123456	export GH=<token>
+gh pat bare	ghp_1234567890abcdefghijABCDEFGHIJ123456	<token>
+aws	AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY	<token> <x>
+url creds	https://user:hunter2@git.internal.lan/repo.git	https://user:<x>@git.internal.lan/repo.git
+mysql -p	mysql -uroot -pS3cretPw dbname	mysql -uroot -p<x> dbname
+curl -u	curl -u admin:hunter2 http://192.168.1.1/	curl -u admin:<x> http://192.168.1.1/
+pppoe uci	option password 'mypass123'	option password '<x>'
+pppoe user	option username '051012345678'	option username '051012345678'
+chap-secrets	"user01" * "s3cr3tpw" *	"user01" * "<x>" *
+shadow	root:$6$abcd$Kx9.qQ7uJ0aBcDeFgH:19000:0:99999:7:::	root:<x>:19000:0:99999:7:::
+wifi dat	WPAPSK1=MyWifiPass2024	WPAPSK1=<x>
+wpa_supp	psk="homewifi88"	psk="<x>"
+nmcli psk	802-11-wireless-security.psk:           homewifi88	802-11-wireless-security.psk:           <x>
+netsh wlan	    Key Content            : homewifi88	    Key Content            : <x>
+domain cfg	curl https://phone.example.com/mcp	curl https://<domain>/mcp
+domain other	https://t7-mcp.example.org/mcp	https://t7-mcp.example.org/mcp
+cn mobile	手机 13812345678	手机 <phone>
+imei	IMEI 861234567890123	IMEI <imei>
+email	mail alice@gmail.com	mail <email>
+ssh pubkey	ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGx1234567890abcdefghijklmnopqrstuv user@host	ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGx1234567890abcdefghijklmnopqrstuv user@host
+vless	vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?type=ws	vless://<uuid>@<ip>:443?type=ws
+ss link	ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388	ss://<x>@<ip>:8388
+cookie	Cookie: sessionid=abcdef1234567890abcdef	Cookie: <x>
+set-cookie	Set-Cookie: SID=31d4d96e407aad42; Path=/	Set-Cookie: <x>
+pub ip:port	1.2.3.4:51820	<ip>:51820
+admin key hex	admin.key 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08	admin.key <x>
+android serial	ro.serialno=R5CT1234ABC	ro.serialno=<serial>
+win prodkey	Product key: VK7JG-NPHTM-C97JM-9MPGT-3V66T	Product key: <x>
+ssid	SSID: Home-5G	SSID: <ssid>
+ip hex	inet 0x08080808	inet 0x08080808
+ipv4 mapped	::ffff:8.8.8.8	::ffff:<ip>
+dotted cgnat	100.64.1.2	100.64.1.2
+version	OpenWrt 23.05.3 r23809	OpenWrt 23.05.3 r23809
+iptables	-A INPUT -s 203.0.113.0/24 -j DROP	-A INPUT -s <ip>/24 -j DROP
+json key	{"api_key": "sk-abcdef1234567890abcdef"}	{"api_key": "<token>"}
+openai bare	sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD	<token>
+ps env	HERMES_API_KEY=abc123def456 python app.py	HERMES_API_KEY=<x> python app.py
+docker inspect	"Env": ["POSTGRES_PASSWORD=pgsecret99"]	"Env": ["POSTGRES_PASSWORD=<x>"]
+url query	https://api.x.com/v1?access_token=abcdef1234567890&x=1	https://api.x.com/v1?access_token=<x>
+groq key	gsk_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN	<token>
+known secret	SHELLGATE_TOKEN in log: known-secret-value-123456 end	SHELLGATE_TOKEN in log: <x> end
+vmess	vmess://eyJhZGQiOiIxLjIuMy40IiwicG9ydCI6NDQzfQ==	vmess://<x>
+trojan	trojan://p4ssw0rd@example.net:443	trojan://<x>@example.net:443
+sshpass	sshpass -p 'Hunter22' ssh root@192.168.1.2	sshpass -p '<x>' ssh root@192.168.1.2
+smbclient	smbclient //nas/share -U user%Hunter22	smbclient //nas/share -U user%<x>
+dat psk_keys	PSK_KEYS=abc12345;def67890	PSK_KEYS=<x>
+netsh cn	    关键内容            : homewifi88	    关键内容            : <x>
+curl cookie	> Cookie: a=1; b=2	> Cookie: <x>
+hostapd	wpa_passphrase=homewifi88	wpa_passphrase=<x>
+uci ssid	option ssid 'Home-5G'	option ssid '<ssid>'
+getprop serial	[ro.serialno]: [R5CT1234ABC]	[ro.serialno]: [<serial>]
+phone +86	tel +86 138-0000-0000 / +8613800000000	tel <phone> / <phone>
+aws ctx	aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY	aws_secret_access_key <x>
+openssl pass	openssl enc -pass pass:Hunter22 -in a	openssl enc -pass <x> -in a
+sha256sum	9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08  shellgate-x86_64.gz	9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08  shellgate-x86_64.gz
+git log	commit 8855ba3c1f0e9a7b6d5c4e3f2a1b0c9d8e7f6a5b	commit 8855ba3c1f0e9a7b6d5c4e3f2a1b0c9d8e7f6a5b
+git remote	origin\tgit@github.com:someuser/repo.git (fetch)	origin\tgit@github.com:someuser/repo.git (fetch)
+docker run	docker run -d -u 1000:1000 -p 8080:80 nginx	docker run -d -u 1000:1000 -p 8080:80 nginx
+docker mysql	docker run -p 3306:3306 -e MYSQL_ROOT_PASSWORD_FILE=/run/s mysql:8	docker run -p 3306:3306 -e MYSQL_ROOT_PASSWORD_FILE=/run/s mysql:8
+mysql port	mysql -h 192.168.1.5 -P 3306 -u root -p	mysql -h 192.168.1.5 -P 3306 -u root -p
+ssh	ssh -p 2212 -i ~/.ssh/key root@172.16.0.1	ssh -p 2212 -i ~/.ssh/key root@172.16.0.1
+iptables	iptables -A INPUT -p tcp --dport 22 -j ACCEPT	iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+curl user nopass	curl -u admin http://192.168.1.1/	curl -u admin http://192.168.1.1/
+ip -s	    RX: bytes  packets  errors\n    1234567890 12345678 0	    RX: bytes  packets  errors\n    1234567890 12345678 0
+rx bytes 10d	rx_bytes 4294967295	rx_bytes 4294967295
+ts ms	ts=1731234567890	ts=1731234567890
+uptime	up 4 days, 12:31	up 4 days, 12:31
+version	shellgate 0.2.6 version 7.6.7.3	shellgate 0.2.6 version 7.6.7.3
+uuid ok	Disk identifier: 0x1234abcd	Disk identifier: 0x1234abcd
+npm scope	npm i @scope/pkg@1.2.3	npm i @scope/pkg@1.2.3
+docker digest	nginx@sha256:abcdef	nginx@sha256:abcdef
+ps	root  1234  0.0  python3 -m http.server 18999	root  1234  0.0  python3 -m http.server 18999
+url noauth	https://github.com/user/repo/releases/download/v1/a.gz	https://github.com/user/repo/releases/download/v1/a.gz
+kubectl	kubectl get secret my-secret -o yaml	kubectl get secret my-secret -o yaml
+mac zero	00:00:00:00:00:00	00:00:00:00:00:00
+email local	alice@DESKTOP-ABC.local	alice@DESKTOP-ABC.local
+dmesg	[    1.234567] usb 1-1: SerialNumber: 0	[    1.234567] usb 1-1: SerialNumber: 0
+bssid	BSSID 1                 : aa:bb:cc:dd:ee:ff	BSSID 1                 : <mac>
+shell var	echo $1 $2 $HOME	echo $1 $2 $HOME
+ip route	default via 192.168.1.1 dev eth0 proto dhcp metric 100	default via 192.168.1.1 dev eth0 proto dhcp metric 100

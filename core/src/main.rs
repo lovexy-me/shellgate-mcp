@@ -335,7 +335,16 @@ async fn serve(settings: config::Settings, open_admin: bool) {
     let audit = audit::Audit::new(&settings.audit_log, settings.audit_max_bytes);
     let sem = Semaphore::new(settings.max_concurrent.max(1));
     let mode = if settings.mode_allowlist { "allowlist" } else { "full" };
-    let redactor = redact::Redactor::new(settings.redact, &settings.redact_domains);
+    // the public URL's host is always masked, even when SHELLGATE_REDACT_DOMAINS does not list it
+    let mut domains = settings.redact_domains.clone();
+    if let Some(host) = settings.public_url.split("://").nth(1).and_then(|r| r.split(['/', ':']).next()) {
+        if host.contains('.') && host.parse::<std::net::IpAddr>().is_err() {
+            domains.push(host.to_string());
+        }
+    }
+    let redactor = redact::Redactor::new(settings.redact, &domains)
+        .with_secrets(&[settings.token.clone(), settings.tunnel_token.clone()])
+        .with_pii(settings.redact_pii);
     let redact_state = if settings.redact { "on" } else { "OFF" };
     let audit_path = settings.audit_log.clone();
     let env_file = settings.env_file.clone();

@@ -62,8 +62,8 @@ def test_uuid():
 
 def test_domain_suffix():
     out, f = red("https://a.b.example.org/x user@Example.ORG host.example.net notexample.org example.org.cn")
-    assert out == "https://<domain>/x user@<domain> <domain> notexample.org example.org.cn"
-    assert f == "[redacted: domain=3]"
+    assert out == "https://<domain>/x <email> <domain> notexample.org example.org.cn"
+    assert f == "[redacted: domain=2 pii=1]"
     assert Redactor(True, []).text("a.example.org")[0] == "a.example.org"
 
 

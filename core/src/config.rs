@@ -67,6 +67,8 @@ pub struct Settings {
     pub env_file: String,
     pub redact: bool,
     pub redact_domains: Vec<String>,
+    /// personal-data rules (email, CN mobile, IMEI, serial, SSID); SHELLGATE_REDACT_PII=0 turns them off
+    pub redact_pii: bool,
     // ---- rescue stick (v0.3.0)
     pub net: NetMode,
     pub tunnel_token: String,
@@ -96,7 +98,7 @@ impl Settings {
             extra_danger_patterns: vec![], audit_log: "/tmp/a".into(), audit_max_bytes: 1,
             default_timeout: 1, max_timeout: 1, max_output_bytes: 1, max_concurrent: 1, max_jobs: 1,
             confirm_ttl: 60, shell: platform::default_shell(), backup_on_write: true, env_file: String::new(),
-            redact: true, redact_domains: vec![], net: NetMode::Local, tunnel_token: String::new(),
+            redact: true, redact_domains: vec![], redact_pii: true, net: NetMode::Local, tunnel_token: String::new(),
             cloudflared: String::new(), mdns: false, mdns_name: "ventoy-rescue".into(), ventoy_root: String::new(),
             state_dir: String::new(), pe_network: true, desktop: false, admin_port: 0, public_url: String::new(),
         }
@@ -407,6 +409,7 @@ pub fn load(env_file: Option<String>) -> Result<Settings, String> {
         env_file: path.to_string_lossy().to_string(),
         redact: !matches!(get("SHELLGATE_REDACT", "1").trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
         redact_domains: split(&get("SHELLGATE_REDACT_DOMAINS", "")),
+        redact_pii: !matches!(get("SHELLGATE_REDACT_PII", "1").trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
         net,
         tunnel_token,
         cloudflared: get("SHELLGATE_CLOUDFLARED", ""),

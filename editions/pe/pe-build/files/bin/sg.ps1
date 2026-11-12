@@ -55,7 +55,8 @@ function Show-Status {
     switch ($m) {
         'local'  { Write-Host "连接地址: http://127.0.0.1:$port/mcp （仅本机）" }
         'lan'    { foreach ($ip in $ips) { Write-Host "连接地址: http://${ip}:$port/mcp" }
-                   $n = if ($c['mdns_name']) { $c['mdns_name'] } else { 'ventoy-rescue' }; Write-Host "          http://$($n -replace '\.local$','').local:$port/mcp （mDNS）" }
+                   $n = if ($c['mdns_name']) { $c['mdns_name'] } else { 'ventoy-rescue' }; Write-Host "          http://$($n -replace '\.local$','').local:$port/mcp （mDNS）"
+                   foreach ($ip in $ips) { Write-Host "网页管理: http://${ip}:$port/admin （局域网里的手机或电脑用浏览器打开，用访问令牌登录）" -ForegroundColor Cyan } }
         'tunnel' {
             $cf = Get-Process cloudflared
             Write-Host ("cloudflared: {0}" -f $(if ($cf) { "运行中 PID $($cf.Id -join ',')" } else { '未运行' }))
@@ -68,11 +69,12 @@ function Show-Status {
                 for ($i = $from; $i -lt $lines.Count; $i++) {
                     if ($lines[$i] -match 'Registered tunnel connection') { $n++ }
                     if ($lines[$i] -match 'Unregistered tunnel connection|Connection terminated') { $n-- }
-                    if ($lines[$i] -match ' ERR ') { $err = $lines[$i] }
+                    if ($lines[$i] -match ' ERR |not valid|failed to|error') { $err = $lines[$i] }
                 }
                 if ($n -lt 0) { $n = 0 }
                 Write-Host "隧道连接: $n" -ForegroundColor $(if ($n -gt 0) { 'Green' } else { 'Yellow' })
-                if ($err) { Write-Host ("最近错误: " + ($err -replace 'https?://\S+', '<url>')) -ForegroundColor Yellow }
+                if ($err) { if ($err -match 'token is not valid|Unauthorized') { $err = '隧道令牌无效，请用「模式: 隧道」重新填写（先删掉 shellgate.env 里的 tunnel_token= 行）' }
+                    Write-Host ("最近错误: " + ($err -replace 'https?://\S+', '<url>')) -ForegroundColor Yellow }
             } else { Write-Host '隧道连接: 还没有 cloudflared.log' -ForegroundColor Yellow }
             if (-not $c['tunnel_token']) { Write-Host '缺少 tunnel_token：用「模式→隧道」按钮填写' -ForegroundColor Red }
         }
@@ -84,6 +86,9 @@ function Restart-SG {
     if (-not $envf) { Write-Host '没找到 U 盘 \shellgate\shellgate.env，无法启动' -ForegroundColor Red; return }
     if (-not (Test-Path -LiteralPath $SG)) { Write-Host "找不到 $SG" -ForegroundColor Red; return }
     Get-Process shellgate, cloudflared | Stop-Process -Force
+    # Menu windows inherit a shorter PATH than the boot script; ShellGate looks for cloudflared on PATH.
+    $pd = 'X:\Program Files\ShellGatePE'
+    foreach ($t in 'cloudflared','bin','7zip','wimlib','aria2','dufs') { $d = Join-Path $pd $t; if ((Test-Path $d) -and ($env:PATH -notlike "*$d*")) { $env:PATH = "$env:PATH;$d" } }
     Start-Sleep 1
     $logd = Join-Path (Split-Path $envf) 'logs'; New-Item -ItemType Directory -Force $logd | Out-Null
     $log = Join-Path $logd ('pe-' + (Get-Date -Format yyyyMMdd) + '.log')

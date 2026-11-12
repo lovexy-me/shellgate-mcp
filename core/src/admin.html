@@ -95,7 +95,9 @@
   </div>
 </header>
 
-<div id="need-key" class="card" hidden><b class="err">需要管理密钥</b><div class="hint">请从 app 打开，或用带 #k= 的链接。</div></div>
+<div id="need-key" class="card" hidden><b>登录</b><div class="hint">输入这台设备 ShellGate 的访问令牌（在本机的配置文件或状态窗口里，令牌只保存在本次浏览器会话）。</div>
+  <div class="in"><input id="login-tok" type="password" autocomplete="off" placeholder="访问令牌"><button class="plain sm" onclick="peek('login-tok',this)">显示</button></div>
+  <div class="btns"><button onclick="login()">登录</button></div><div class="msg" id="login-out"></div></div>
 
 <!-- status -->
 <div class="card">
@@ -194,15 +196,22 @@ let KEY = new URLSearchParams(location.hash.slice(1)).get('k') || sessionStorage
 if (KEY) { sessionStorage.setItem('sgk', KEY); history.replaceState(null,'',location.pathname); }
 let CFG = null, TOK = '', URLV = '', CUR = 'local', SEL = null, NET_DIRTY = false, RESTART_AT = 0, TOK_SHOWN = false;
 const $ = id => document.getElementById(id);
-function hdr(extra) { const h = {'content-type':'application/json'}; if (KEY) h['x-admin-key'] = KEY; return Object.assign(h, extra||{}); }
-async function api(path, opt) { const r = await fetch(path, Object.assign({headers: hdr(opt&&opt.reveal?{'x-reveal':'1'}:{})}, opt||{})); return r.json(); }
+let LTOK = sessionStorage.getItem('sgt') || '';
+const BASE = location.pathname.replace(/\/+$/, '');   // '' on the local admin port, '/admin' on the LAN page
+const REMOTE = !/^(127\.0\.0\.1|localhost|\[::1\])$/.test(location.hostname);
+function hdr(extra) { const h = {'content-type':'application/json'}; if (KEY) h['x-admin-key'] = KEY; if (LTOK) h['authorization'] = 'Bearer '+LTOK; return Object.assign(h, extra||{}); }
+async function login(){ const t=$('login-tok').value.trim(); if(!t){ flash('login-out','请输入访问令牌','err'); return; }
+  LTOK=t; flash('login-out','登录中…'); let d; try { d = await api('/api/status'); } catch(e){ flash('login-out','连不上服务','err'); return; }
+  if (d.error) { LTOK=''; flash('login-out','令牌不对','err'); return; }
+  sessionStorage.setItem('sgt', t); $('login-tok').value=''; flash('login-out',''); load(); }
+async function api(path, opt) { const r = await fetch(BASE+path, Object.assign({headers: hdr(opt&&opt.reveal?{'x-reveal':'1'}:{})}, opt||{})); return r.json(); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 // Turn cloudflared's last error into one plain sentence.
 function why(e){
   if(!e) return '';
   if(/\[::1\]:53|127\.0\.0\.1:53|lookup .*(refused|no such host)|DNS/i.test(e)) return '查不到 Cloudflare 的地址（DNS 不通）。检查网络，或更新到最新版。';
-  if(/Unauthorized|invalid.*token|token.*invalid|not.*valid.*tunnel/i.test(e)) return '隧道令牌无效，请重新复制粘贴。';
+  if(/Unauthorized|invalid.*token|token.*invalid|token is not valid|not.*valid.*tunnel/i.test(e)) return '隧道令牌无效，请重新复制粘贴。';
   if(/timeout|i\/o timeout|deadline/i.test(e)) return '连 Cloudflare 超时，网络可能拦了 7844 端口。';
   return e.length > 140 ? e.slice(0,140)+'…' : e;
 }
@@ -228,7 +237,7 @@ async function load() {
   let d;
   try { d = await api('/api/status', {reveal:true}); }
   catch(e){ $('st-title').textContent = RESTART_AT ? '重启中…' : '连不上服务'; $('dot').className='dot '+(RESTART_AT?'warn':'bad'); return; }
-  if (d.error) { $('need-key').hidden=false; return; }
+  if (d.error) { if (LTOK) { LTOK=''; sessionStorage.removeItem('sgt'); } $('need-key').hidden=false; return; }
   $('need-key').hidden=true;
   $('ver').textContent = 'v'+d.version+' · '+d.edition+' · '+d.os+'/'+d.arch;
   CUR = d.net; status(d);
@@ -318,6 +327,7 @@ async function cf(action){
   await restartNow();
 }
 async function saveNet(){
+  if (REMOTE && SEL!=='lan' && !confirm('切换到「'+modeName(SEL)+'」后，局域网里的设备（包括这台）就打不开这个页面了，只能在那台机器上改回来。继续？')) return;
   const b = {net:SEL};
   if (SEL==='tunnel') { const t=$('s-tt').value.trim(), u=$('s-pu').value.trim();
     if(t && !/^eyJ/.test(t)){ flash('s-out','隧道令牌应以 eyJ 开头，请检查','err'); return; }
@@ -343,6 +353,7 @@ async function newToken(){
   if(!confirm('换一个新的访问令牌？旧令牌立刻作废，所有 AI 客户端都要换成新配置。')) return;
   const d = await api('/api/settings',{method:'POST',body:JSON.stringify({new_token:true})});
   if(d.error||d.status==='error'){ flash('s-out',d.error||'失败','err'); return; }
+  if (d.token && LTOK) { LTOK=d.token; sessionStorage.setItem('sgt', LTOK); }
   TOK_SHOWN=false; flash('s-out','已换新令牌，正在重启…重启后重新复制配置','good'); await restartNow();
 }
 function peek(id,b){ const e=$(id); const show=e.type==='password'; e.type=show?'text':'password'; b.textContent=show?'隐藏':'显示'; }
@@ -350,6 +361,7 @@ document.querySelectorAll('.mode').forEach(e => e.addEventListener('click', () =
 $('s-pu').addEventListener('input',()=>{ $('s-pu').dataset.dirty='1'; pick(SEL); });
 $('s-tt').addEventListener('input',()=>pick(SEL));
 ['cf-token','cf-host'].forEach(id => $(id).addEventListener('input', () => { if ($('cf-out').classList.contains('err')) flash('cf-out',''); }));
+$('login-tok').addEventListener('keydown', e => { if (e.key==='Enter') login(); });
 load(); appSec(); setInterval(()=>{load(); appSec();}, 5000);
 </script>
 </body>

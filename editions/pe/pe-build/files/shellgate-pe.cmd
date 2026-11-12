@@ -68,5 +68,5 @@ if defined STICK (
   echo [shellgate] start, config !STICK!\shellgate\shellgate.env >> "!LOG!"
   start "ShellGate" /min cmd /c ""%SG%" --env-file "!STICK!\shellgate\shellgate.env" >> "!LOG!" 2>&1"
 )
-endlocal & set "PATH=%PATH%;X:\Program Files\ShellGatePE\bin;X:\Program Files\ShellGatePE\7zip;X:\Program Files\ShellGatePE\wimlib;X:\Program Files\ShellGatePE\testdisk;X:\Program Files\ShellGatePE\explorerpp;X:\Program Files\ShellGatePE\notepadpp"
+endlocal & set "PATH=%PATH%;X:\Program Files\ShellGatePE\bin;X:\Program Files\ShellGatePE\cloudflared;X:\Program Files\ShellGatePE\aria2;X:\Program Files\ShellGatePE\dufs;X:\Program Files\ShellGatePE\smartmontools;X:\Program Files\ShellGatePE\7zip;X:\Program Files\ShellGatePE\wimlib;X:\Program Files\ShellGatePE\testdisk;X:\Program Files\ShellGatePE\explorerpp;X:\Program Files\ShellGatePE\notepadpp"
 exit /b 0

@@ -153,7 +153,7 @@ pub fn tunnel_log_state(state_dir: &str) -> (u32, Option<String>, Vec<String>) {
     for l in &lines[from..] {
         if l.contains("Registered tunnel connection") { conns += 1; }
         if l.contains("Unregistered tunnel connection") || l.contains("Connection terminated") { conns -= 1; }
-        if l.contains(" ERR ") { last_err = Some(l.to_string()); }
+        if l.contains(" ERR ") || l.contains("token is not valid") { last_err = Some(l.to_string()); }
     }
     let tail = lines.iter().rev().take(40).rev().map(|l| l.to_string()).collect();
     (conns.max(0) as u32, last_err, tail)

@@ -401,6 +401,12 @@ async fn serve(settings: config::Settings, open_admin: bool) {
         .route("/mcp", axum::routing::post(mcp_post).get(mcp_other).delete(mcp_other))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024))
         .with_state(ctx);
+    // LAN devices can open the admin page at http://<ip>:<port>/admin (access token login); lan mode only,
+    // so it is never reachable through a Cloudflare tunnel.
+    #[cfg(feature = "admin-lite")]
+    let router = if net_settings.net == config::NetMode::Lan {
+        router.nest_service("/admin", admin::lan_router(&net_settings))
+    } else { router };
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -416,7 +422,11 @@ async fn serve(settings: config::Settings, open_admin: bool) {
         config::NetMode::Lan => {
             let port = net_settings.port;
             match net::primary_ipv4() {
-                Some(ip) => eprintln!("lan mode: connect from the same LAN to http://{ip}:{port}/mcp (Bearer token required)"),
+                Some(ip) => {
+                    eprintln!("lan mode: connect from the same LAN to http://{ip}:{port}/mcp (Bearer token required)");
+                    #[cfg(feature = "admin-lite")]
+                    eprintln!("lan mode: admin page for LAN devices at http://{ip}:{port}/admin (log in with the access token)");
+                }
                 None => eprintln!("lan mode: no LAN address detected yet; listening on {addr}"),
             }
             if net_settings.mdns {

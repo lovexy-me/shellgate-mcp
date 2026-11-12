@@ -60,6 +60,12 @@ fn authorized(ctx: &AdminCtx, h: &HeaderMap) -> bool {
     policy::ct_eq(b, format!("Bearer {}", ctx.s.token).as_bytes())
 }
 
+/// Failed login: answer slowly so a LAN guesser gets about one try per second per connection.
+async fn unauth() -> Response {
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}))
+}
+
 fn j(status: StatusCode, v: Value) -> Response {
     (status, [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")], v.to_string()).into_response()
 }
@@ -116,7 +122,7 @@ async fn page() -> Response {
 
 async fn status(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap) -> Response {
     if !authorized(&ctx, &h) {
-        return j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+        return unauth().await;
     }
     let reveal = h.get("x-reveal").is_some();
     let mut v = connection_info(&ctx.s, reveal);
@@ -133,7 +139,7 @@ async fn status(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap) -> Response {
 #[cfg(not(feature = "admin"))]
 async fn cf(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, _body: Bytes) -> Response {
     if !authorized(&ctx, &h) {
-        return j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+        return unauth().await;
     }
     j(StatusCode::OK, json!({"status": "error", "error": "this build has no Cloudflare wizard: create the tunnel in the Cloudflare dashboard and paste its token here"}))
 }
@@ -141,7 +147,7 @@ async fn cf(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, _body: Bytes) -> Res
 #[cfg(feature = "admin")]
 async fn cf(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, body: Bytes) -> Response {
     if !authorized(&ctx, &h) {
-        return j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+        return unauth().await;
     }
     let a: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
     match crate::cf::tool(&ctx.s, &a).await {
@@ -155,7 +161,7 @@ async fn cf(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, body: Bytes) -> Resp
 
 async fn settings_post(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, body: Bytes) -> Response {
     if !authorized(&ctx, &h) {
-        return j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+        return unauth().await;
     }
     let a: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
     let path = PathBuf::from(&ctx.s.env_file);
@@ -177,8 +183,11 @@ async fn settings_post(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, body: Byt
         }
         changes.push(("public_url", if u.is_empty() { None } else { Some(u.to_string()) }));
     }
+    let mut new_tok = None;
     if a.get("new_token").and_then(Value::as_bool) == Some(true) {
-        changes.push(("token", Some(policy::random_hex(24))));
+        let t = policy::random_hex(24);
+        new_tok = Some(t.clone());
+        changes.push(("token", Some(t)));
     }
     if changes.is_empty() {
         return j(StatusCode::OK, json!({"status": "error", "error": "nothing to change"}));
@@ -186,7 +195,10 @@ async fn settings_post(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, body: Byt
     match crate::config::set_keys(&path, &changes) {
         Ok(()) => {
             events::ev(format!("admin: settings changed ({})", changes.iter().map(|c| c.0).collect::<Vec<_>>().join(", ")));
-            j(StatusCode::OK, json!({"status": "ok", "restart_required": true}))
+            let mut v = json!({"status": "ok", "restart_required": true});
+            // the caller is already authenticated; a LAN page needs the new token to stay logged in
+            if let Some(t) = new_tok { v["token"] = json!(t); }
+            j(StatusCode::OK, v)
         }
         Err(e) => j(StatusCode::OK, json!({"status": "error", "error": e})),
     }
@@ -194,11 +206,30 @@ async fn settings_post(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap, body: Byt
 
 async fn restart(State(ctx): State<Arc<AdminCtx>>, h: HeaderMap) -> Response {
     if !authorized(&ctx, &h) {
-        return j(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+        return unauth().await;
     }
     events::ev("admin: restart requested");
     crate::request_restart();
     j(StatusCode::OK, json!({"status": "ok", "restarting": true}))
+}
+
+fn routes(s: Settings, key: String) -> Router {
+    let ctx = Arc::new(AdminCtx { s, key });
+    Router::new()
+        .route("/", get(page))
+        .route("/api/status", get(status))
+        .route("/api/cloudflare", post(cf))
+        .route("/api/settings", post(settings_post))
+        .route("/api/restart", post(restart))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+        .with_state(ctx)
+}
+
+/// The same page and API under `/admin` on the main port, for other devices on the LAN (net=lan only).
+/// Login is the ShellGate access token (Bearer); the local admin key is accepted too.
+pub fn lan_router(s: &Settings) -> Router {
+    let key = ensure_key(s);
+    routes(s.clone(), key)
 }
 
 pub async fn serve(s: Settings) {
@@ -209,15 +240,7 @@ pub async fn serve(s: Settings) {
     // SHELLGATE_ADMIN_HOST: 127.0.0.1 by default; a router may set its LAN address (the admin key is still required)
     let host = std::env::var("SHELLGATE_ADMIN_HOST").ok().filter(|h| !h.trim().is_empty()).unwrap_or_else(|| "127.0.0.1".into());
     let addr = format!("{}:{}", host.trim(), s.admin_port);
-    let ctx = Arc::new(AdminCtx { s, key });
-    let router = Router::new()
-        .route("/", get(page))
-        .route("/api/status", get(status))
-        .route("/api/cloudflare", post(cf))
-        .route("/api/settings", post(settings_post))
-        .route("/api/restart", post(restart))
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
-        .with_state(ctx);
+    let router = routes(s, key);
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => {
             events::ev(format!("admin page on http://{addr}/ (key in admin.key)"));

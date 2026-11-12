@@ -1,0 +1,135 @@
+name: Android
+# Builds the ShellGate Android app (editions/android): the Rust binary and cloudflared are
+# cross-compiled with the NDK and packed as lib*.so, then the APK is built and tested in an
+# emulator (server starts, MCP answers, cloudflared reaches Cloudflare through a quick tunnel).
+# Tag android-v<cargo version> publishes the APK as a release.
+on:
+  push:
+    branches: ["**"]
+    tags: ["android-v*"]
+    paths: ["core/**", "editions/android/**", ".github/workflows/android.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  API: "24"
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { abi: arm64-v8a, rust: aarch64-linux-android, goarch: arm64, clang: aarch64-linux-android }
+          - { abi: x86_64,    rust: x86_64-linux-android,  goarch: amd64, clang: x86_64-linux-android }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      - name: NDK toolchain
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ls "$BIN/${{ matrix.clang }}${API}-clang"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "NDKCC=$BIN/${{ matrix.clang }}${API}-clang" >> "$GITHUB_ENV"
+      - name: shellgate (Rust)
+        working-directory: core
+        run: |
+          T=${{ matrix.rust }}; U=$(echo "$T" | tr 'a-z-' 'A-Z_')
+          export CARGO_TARGET_${U}_LINKER="$NDKCC"
+          export CC_${T//-/_}="$NDKCC" AR_${T//-/_}="$BIN/llvm-ar"
+          cargo build --release --no-default-features --features edition-android --target $T
+          mkdir -p ../out && cp target/$T/release/shellgate ../out/libshellgate.so
+      - name: cloudflared (latest release, built for Android)
+        run: |
+          TAG=$(curl -fsSL https://api.github.com/repos/cloudflare/cloudflared/releases/latest | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])')
+          echo "cloudflared $TAG"
+          git clone -q --depth 1 --branch "$TAG" https://github.com/cloudflare/cloudflared.git cfd
+          echo "CFD_TAG=$TAG" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cfd/go.mod
+          cache: false
+      - run: |
+          cd cfd
+          CGO_ENABLED=1 GOOS=android GOARCH=${{ matrix.goarch }} CC="$NDKCC" \
+            go build -trimpath -ldflags "-s -w -X main.Version=$CFD_TAG -X main.BuildTime=$(date -u +%F)" \
+            -o ../out/libcloudflared.so ./cmd/cloudflared
+          file ../out/*.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jni-${{ matrix.abi }}
+          path: out/*.so
+
+  apk:
+    needs: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: jni-arm64-v8a, path: editions/android/app/src/main/jniLibs/arm64-v8a }
+      - uses: actions/download-artifact@v4
+        with: { name: jni-x86_64, path: editions/android/app/src/main/jniLibs/x86_64 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.10.2" }
+      - name: build
+        working-directory: editions/android
+        run: |
+          # release signing only when a keystore secret exists; otherwise debug-signed
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > $RUNNER_TEMP/sg.jks
+            export SG_KEYSTORE=$RUNNER_TEMP/sg.jks SG_KEYSTORE_PASS="${{ secrets.ANDROID_KEYSTORE_PASS }}"
+          fi
+          gradle --no-daemon -q assembleRelease assembleDebug
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../core/Cargo.toml | head -1)
+          mkdir -p ../../dist
+          cp app/build/outputs/apk/release/app-release.apk ../../dist/shellgate-android-$V.apk
+          cp app/build/outputs/apk/debug/app-debug.apk ../../dist/test-debug.apk
+          # unsigned copy for personal builds (preset config added, then signed locally)
+          ls -la ../../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dist/*.apk
+
+  emulator-test:
+    needs: apk
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: apk, path: dist }
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: bash editions/android/ci-emulator-test.sh
+
+  release:
+    needs: [apk, emulator-test]
+    if: startsWith(github.ref, 'refs/tags/android-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' core/Cargo.toml | head -1)
+          [ "${GITHUB_REF_NAME#android-v}" = "$V" ] || { echo "tag != Cargo version $V"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with: { name: apk, path: dist }
+      - run: rm dist/test-debug.apk && cd dist && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          prerelease: true
+          files: dist/*

@@ -64,8 +64,8 @@ def test_uuid():
 
 def test_domain_suffix():
     out, f = red("https://a.b.example.org/x user@Example.ORG host.example.net notexample.org example.org.cn")
-    assert out == "https://<domain>/x user@<domain> <domain> notexample.org example.org.cn"
-    assert f == "[redacted: domain=3]"
+    assert out == "https://<domain>/x <email> <domain> notexample.org example.org.cn"
+    assert f == "[redacted: domain=2 pii=1]"
     assert Redactor(True, []).text("a.example.org")[0] == "a.example.org"
 
 
@@ -170,8 +170,8 @@ def test_mac_label_kept(keep):
 
 
 def test_mtk_psk_and_mac_tag():
-    assert red("WPAPSK1=abcdefgh123 WPAPSK=xy PSK_KEYS=zzzzzz11 wpa_passphrase=hello1")[0] == \
-        "WPAPSK1=<x> WPAPSK=<x> PSK_KEYS=<x> wpa_passphrase=<x>"
+    assert red("WPAPSK1=abcdefgh123\nWPAPSK=xy\nPSK_KEYS=zzzzzz11\nwpa_passphrase=hello1")[0] == \
+        "WPAPSK1=<x>\nWPAPSK=<x>\nPSK_KEYS=<x>\nwpa_passphrase=<x>"
     o, _ = R.text("a 02:11:22:33:44:55 b 02:11:22:33:44:55 c 02:11:22:33:44:56")
     tags = re.findall(r"<mac:[0-9a-f]{6}>", o)
     assert len(tags) == 3 and tags[0] == tags[1] != tags[2]

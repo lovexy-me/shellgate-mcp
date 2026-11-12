@@ -1,0 +1,54 @@
+[package]
+name = "shellgate"
+version = "0.4.0"
+edition = "2021"
+description = "ShellGate MCP server for OpenWrt / embedded Linux / Windows (Ventoy rescue stick): a single static binary"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "1", features = ["rt", "net", "process", "io-util", "time", "sync", "macros", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = { version = "1", default-features = false, features = ["std", "unicode-case", "unicode-perl", "perf-literal"] }
+shlex = "1"
+getrandom = "0.2"
+socket2 = "0.6"
+sha2 = { version = "0.10", default-features = false, features = ["std"] }   # file_hash, read/write_binary, ventoy_add
+ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+# desktop tools: PNG deflate and JPEG (pure Rust, small)
+miniz_oxide = "0.8"
+jpeg-encoder = { version = "0.6", default-features = false, features = ["std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_System_RemoteDesktop", "Win32_Security", "Win32_System_Environment", "Win32_UI_Shell"] }
+# UI Automation (COM) for the desktop tools
+windows = { version = "0.62", optional = true, features = ["Win32_UI_Accessibility", "Win32_System_Com", "Win32_Foundation", "Win32_System_Variant", "Win32_System_Ole"] }
+
+[features]
+# Building blocks
+ventoy = []                              # ventoy_* tools (find / list / config the Ventoy partition)
+download = ["ventoy", "dep:ureq"]   # ventoy_add over https (rustls + webpki roots, ~1.3 MB)
+desktop = ["dep:windows"]                # Windows desktop tools (UIA, screenshot, SendInput); no-op elsewhere
+net-tools = ["dep:ureq", "dep:rustls"]   # lan_scan + http_request + the Cloudflare setup API
+admin-lite = []                          # local admin web page: status, settings, logs (no Cloudflare wizard, no https client)
+admin = ["admin-lite", "net-tools"]      # admin page plus the Cloudflare wizard
+# Editions: one per scenario, each with its own config, docs and release tag (see editions/*/README.md)
+edition-openwrt = ["admin-lite"]                       # routers: small, no ventoy/desktop/https; lite admin page
+edition-pe = ["ventoy", "download", "desktop", "admin"] # WinPE / Windows rescue stick
+edition-linux = ["ventoy", "download", "admin"]        # WSL2 / Linux hosts, rescue Linux on the stick
+edition-android = ["admin"]                            # Android phone jump box: tunnel + admin + lan tools
+edition-portable = ["ventoy", "download", "desktop", "admin"] # self-configuring PC build (Windows/Linux zip)
+# `cargo build` with no flags builds everything (used by the tests)
+default = ["ventoy", "download", "desktop", "admin"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

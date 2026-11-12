@@ -1,0 +1,273 @@
+{
+  "comment": [
+    "Third-party tools for ShellGate PE. NOTHING here ships in this repository: every entry is",
+    "downloaded from its official address at build time and checked against sha256.",
+    "license: the licence of the downloaded file. 'redistributable' says whether a ready-made PE",
+    "image containing it may be handed to someone else; 'false' means build it on your own machine",
+    "and do not publish the image. Entries with optional=true are skipped when the download fails.",
+    "sha256 of a null value means: not pinned (the publisher ships no stable archive); the build",
+    "prints the hash it got and continues only with -AllowUnpinned."
+  ],
+  "tools": [
+    {
+      "id": "7zip",
+      "name": "7-Zip",
+      "category": "压缩/文件",
+      "arch": ["amd64", "x86"],
+      "url": "https://github.com/ip7z/7zip/releases/download/26.05/7z2605-extra.7z",
+      "sha256": "f27a8f103c84785026edcba1f67faf1357225df9d19ddb0b7760d55947141bc7",
+      "license": "LGPL-2.1 + unRAR restriction",
+      "redistributable": true,
+      "extract": "7z",
+      "files": {"amd64": ["x64/7za.exe", "x64/7za.dll"], "x86": ["7za.exe", "7za.dll"]},
+      "note": "console 7za plus the DLL; the GUI 7zFM is in the full installer which the build also fetches when -Full"
+    },
+    {
+      "id": "7zip-full",
+      "name": "7-Zip (GUI 7zFM)",
+      "category": "压缩/文件",
+      "arch": ["amd64"],
+      "url": "https://github.com/ip7z/7zip/releases/download/26.05/7z2605-x64.exe",
+      "sha256": "fd99e86f57d8f429ef5ed045bf98315af962e2309b0f1ba87a147a44c71647d0",
+      "license": "LGPL-2.1 + unRAR restriction",
+      "redistributable": true,
+      "extract": "7z",
+      "files": {"amd64": ["7zFM.exe", "7z.exe", "7z.dll", "7zG.exe", "Lang/zh-cn.txt"]},
+      "optional": true
+    },
+    {
+      "id": "7zip-x86",
+      "name": "7-Zip (x86 GUI)",
+      "category": "压缩/文件",
+      "arch": ["x86"],
+      "url": "https://github.com/ip7z/7zip/releases/download/26.05/7z2605.exe",
+      "sha256": "6435a470fe7c4769962dbed8a60c641ee21401c833ced06077c80e33e7845a5e",
+      "license": "LGPL-2.1 + unRAR restriction",
+      "redistributable": true,
+      "extract": "7z",
+      "files": {"x86": ["7zFM.exe", "7z.exe", "7z.dll", "7zG.exe", "Lang/zh-cn.txt"]},
+      "optional": true
+    },
+    {
+      "id": "wimlib",
+      "name": "wimlib-imagex",
+      "category": "备份还原/装机",
+      "arch": ["amd64", "x86"],
+      "url": {
+        "amd64": "https://wimlib.net/downloads/wimlib-1.14.4-windows-x86_64-bin.zip",
+        "x86": "https://wimlib.net/downloads/wimlib-1.14.4-windows-i686-bin.zip"
+      },
+      "sha256": {
+        "amd64": "6d99e242bfbc6d36fc987d433d63772180551b7f2d8de43e9561535a3e2c16d8",
+        "x86": "9f2c938b5cc7770eb2fb9c8e769eae05506d4ccd4f82a4677371d8877d0f32b1"
+      },
+      "license": "GPL-3.0 / LGPL-3.0",
+      "redistributable": true,
+      "extract": "zip",
+      "files": {"*": ["wimlib-imagex.exe", "libwim-15.dll"]},
+      "note": "applies/captures WIM and ESD, and splits SWM; the fallback when dism is missing a format"
+    },
+    {
+      "id": "testdisk",
+      "name": "TestDisk / PhotoRec",
+      "category": "数据恢复/分区恢复",
+      "arch": ["amd64", "x86"],
+      "url": {
+        "amd64": "https://www.cgsecurity.org/testdisk-7.2.win64.zip",
+        "x86": "https://www.cgsecurity.org/testdisk-7.2.win.zip"
+      },
+      "sha256": {
+        "amd64": "e97e203ce77b6b1a3a37d01beccf069dc6c4632b579ffbb82ae739cdda229f38",
+        "x86": "0718a4529611e5f8b6d5fcb873279d23a0b212b18bcf72291f3b47351bfc7126"
+      },
+      "license": "GPL-2.0+",
+      "redistributable": true,
+      "extract": "zip",
+      "files": {"*": ["testdisk-7.2/*"]},
+      "note": "qphotorec_win.exe is the Qt GUI; testdisk_win.exe is the console partition-table repair"
+    },
+    {
+      "id": "explorerpp",
+      "name": "Explorer++",
+      "category": "文件管理器",
+      "arch": ["amd64", "x86"],
+      "url": {
+        "amd64": "https://github.com/derceg/explorerplusplus/releases/download/version-1.4.0/explorerpp_x64.zip",
+        "x86": "https://github.com/derceg/explorerplusplus/releases/download/version-1.4.0/explorerpp_x86.zip"
+      },
+      "sha256": {
+        "amd64": "81ec54586dfef888b886d409afa22e31f22d4f6ba35d52d93074b4ee64b79b0c",
+        "x86": "39e70f86895568138ab509d5965e104cbca56dda05ac1925fd7e65a57da7bc40"
+      },
+      "license": "GPL-3.0",
+      "redistributable": true,
+      "extract": "zip",
+      "files": {"*": ["Explorer++.exe"]},
+      "note": "the file manager; WinPE has no explorer shell"
+    },
+    {
+      "id": "notepadpp",
+      "name": "Notepad++ (portable)",
+      "category": "编辑器",
+      "arch": ["amd64", "x86"],
+      "url": {
+        "amd64": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.9/npp.8.9.9.portable.minimalist.x64.7z",
+        "x86": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.9/npp.8.9.9.portable.7z"
+      },
+      "sha256": {
+        "amd64": "46e5b77f95ae375d0346c8f2db74553029c9e8a2848c70c61381050680330900",
+        "x86": "5a14c227848973cc077c26c7855eb02c1147c0d88bac119227a0bb456ea578f9"
+      },
+      "license": "GPL-3.0",
+      "redistributable": true,
+      "extract": "7z",
+      "files": {"*": ["*"]},
+      "note": "WinPE's notepad.exe exists but cannot handle UTF-8/大文件; this is the real editor"
+    },
+    {
+      "id": "aria2",
+      "name": "aria2c",
+      "category": "网络/下载",
+      "arch": ["amd64", "x86"],
+      "url": {
+        "amd64": "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip",
+        "x86": "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-32bit-build1.zip"
+      },
+      "sha256": {
+        "amd64": "67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288",
+        "x86": "35f6514cc5dd7e98a87b3c4c2d25a0754b9b063dbe59bc0f22d483464f61e5b6"
+      },
+      "license": "GPL-2.0+ with OpenSSL exception",
+      "redistributable": true,
+      "extract": "zip",
+      "files": {"*": ["*/aria2c.exe"]},
+      "note": "resumable multi-connection download of an image over a bad line"
+    },
+    {
+      "id": "dufs",
+      "name": "dufs",
+      "category": "网络/共享",
+      "arch": ["amd64"],
+      "url": "https://github.com/sigoden/dufs/releases/download/v0.47.0/dufs-v0.47.0-x86_64-pc-windows-msvc.zip",
+      "sha256": "39a000b70de423b7200f17099fa734cb6e154d8c6ef6a7d4ec9b2961cb66d0f1",
+      "license": "MIT / Apache-2.0",
+      "redistributable": true,
+      "extract": "zip",
+      "files": {"amd64": ["dufs.exe"]},
+      "note": "one-command HTTP file server: pull data off the broken machine from a phone"
+    },
+    {
+      "id": "cloudflared",
+      "name": "cloudflared",
+      "category": "网络/隧道",
+      "arch": ["amd64", "x86"],
+      "url": {
+        "amd64": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-windows-amd64.exe",
+        "x86": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-windows-386.exe"
+      },
+      "sha256": {
+        "amd64": "2493dbc168923bb3e59e5e7716f71deced92992eea9acd6e9d74f84ac7751343",
+        "x86": "88c6b972b410db0e26745f593510d772c825a13c5a2374819e3f13a05b333082"
+      },
+      "license": "Apache-2.0",
+      "redistributable": true,
+      "extract": "raw",
+      "files": {"*": ["cloudflared.exe"]},
+      "note": "only used when the stick config says net=tunnel; no token is ever in the image"
+    },
+    {
+      "id": "smartmontools",
+      "name": "smartctl (smartmontools)",
+      "category": "硬件检测",
+      "arch": ["amd64", "x86"],
+      "url": "https://sourceforge.net/projects/smartmontools/files/smartmontools/7.5/smartmontools-7.5-1.win32-setup.exe/download",
+      "sha256": null,
+      "license": "GPL-2.0+",
+      "redistributable": true,
+      "extract": "7z",
+      "files": {"*": ["bin/smartctl.exe", "bin/smartd.exe", "bin/drivedb.h"]},
+      "optional": true,
+      "note": "SourceForge has no stable per-file hash; pin it yourself with -PinHashes or accept the printed one"
+    },
+    {
+      "id": "cpuz",
+      "name": "CPU-Z",
+      "category": "硬件检测",
+      "arch": ["amd64", "x86"],
+      "url": "https://download.cpuid.com/cpu-z/cpu-z_2.17-en.zip",
+      "sha256": "aa4d68627d441804ce5b6abe23ae630aee9e0492a69140aeec79da62c45c5215",
+      "license": "proprietary freeware (CPUID EULA: no redistribution of a modified bundle)",
+      "redistributable": false,
+      "extract": "zip",
+      "files": {"amd64": ["cpuz_x64.exe", "cpuz.ini"], "x86": ["cpuz_x32.exe", "cpuz.ini"]},
+      "optional": true
+    },
+    {
+      "id": "everything",
+      "name": "Everything",
+      "category": "文件搜索",
+      "arch": ["amd64", "x86"],
+      "url": {
+        "amd64": "https://www.voidtools.com/Everything-1.4.1.1032.x64.zip",
+        "x86": "https://www.voidtools.com/Everything-1.4.1.1032.x86.zip"
+      },
+      "sha256": {
+        "amd64": "698df475ec44e638f66f1b6a32d28fea613cec78d3b6310e6abe53431eeb940c",
+        "x86": "156db5beb747d69470518a7b9b55af11efc4d3285ddb7cc013c0cc13ced5f237"
+      },
+      "license": "proprietary freeware (voidtools: free to use, redistribution not granted)",
+      "redistributable": false,
+      "extract": "zip",
+      "files": {"*": ["everything.exe", "Everything.lng"]},
+      "optional": true
+    },
+    {
+      "id": "diskgenius",
+      "name": "DiskGenius",
+      "category": "分区/数据恢复",
+      "arch": ["amd64"],
+      "url": null,
+      "sha256": null,
+      "license": "proprietary (free edition; no redistribution)",
+      "redistributable": false,
+      "extract": "zip",
+      "files": {"amd64": ["*"]},
+      "optional": true,
+      "note": "缺口：eassos 的下载地址在中国大陆以外常不可达，且不允许再分发。把官方下载的 DiskGenius 便携包放进 drivers/../extras/diskgenius/，构建时会原样复制。"
+    },
+    {
+      "id": "virtio",
+      "name": "virtio-win 驱动 (viostor, vioscsi, NetKVM, qxldod)",
+      "category": "驱动",
+      "arch": ["amd64", "x86"],
+      "url": "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.285-1/virtio-win-0.1.285.iso",
+      "sha256": "e14cf2b94492c3e925f0070ba7fdfedeb2048c91eea9c5a5afb30232a3976331",
+      "license": "GPL-2.0 / BSD (Red Hat virtio-win)",
+      "redistributable": true,
+      "extract": "driver-iso",
+      "files": {"*": ["viostor", "vioscsi", "NetKVM", "qxldod", "Balloon"]},
+      "optional": true,
+      "note": "for QEMU/KVM and Proxmox VMs; harmless on real hardware. fedorapeople.org serves a bot-check page (~4 KB) to GitHub Actions runners, so on CI this is skipped; local builds get it. Without it, put the virtio-win drivers in the stick's drivers folder (loaded at boot)."
+    }
+  ],
+  "driver_sources": [
+    {
+      "id": "intel-rst-vmd",
+      "name": "Intel RST / VMD F6 驱动 (新笔记本识别 NVMe 必需)",
+      "url": "https://www.intel.com/content/www/us/en/download/720755/intel-rapid-storage-technology-driver-installation-software-with-intel-optane-memory-11th-and-up-intel-core-processor-platforms.html",
+      "license": "Intel Software License (no redistribution of the package)",
+      "redistributable": false,
+      "manual": true,
+      "note": "downloadmirror.intel.com 对脚本 UA 返回 403，必须人工在浏览器下载 SetupRST.exe，放到 drivers/<arch>/ 下（或先 SetupRST.exe -extractdrivers X）。没有它，11 代以后开了 VMD 的笔记本在 PE 里看不到 NVMe 硬盘。"
+    },
+    {
+      "id": "oem-nic",
+      "name": "有线/无线网卡驱动",
+      "url": null,
+      "license": "各厂商自有",
+      "redistributable": false,
+      "manual": true,
+      "note": "WinPE 自带常见 Intel/Realtek 有线网卡；无线请用 WinRE 底座（-Base winre）并把厂商 Wi-Fi 驱动放 drivers/<arch>/。"
+    }
+  ]
+}

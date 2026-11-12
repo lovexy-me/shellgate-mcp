@@ -1,7 +1,8 @@
 name: CI
 on: [push, pull_request]
 jobs:
-  test:
+  # WSL2 / Linux edition (Python): unit tests + the shared MCP conformance suite
+  wsl:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -11,9 +12,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e ".[dev]"
-      - run: pytest -q
-  rust:
+      - run: pip install -e "editions/wsl[dev]"
+      - run: pytest -q tests
+
+  # Shared Rust core: unit tests with every feature, then the same conformance suite against the binary
+  core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +24,69 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - working-directory: openwrt
+      - working-directory: core
         run: cargo test --release && cargo build --release
-      - run: pip install -e ".[dev]"
-      - run: SHELLGATE_BIN=$PWD/openwrt/target/release/shellgate pytest -q tests/test_e2e.py
+      - run: pip install -e "editions/wsl[dev]"
+      - run: SHELLGATE_BIN=$PWD/core/target/release/shellgate pytest -q tests/test_e2e.py tests/test_ventoy_e2e.py
+
+  # OpenWrt edition: router targets, smallest feature set
+  openwrt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl
+      - run: pip install ziglang cargo-zigbuild
+      - working-directory: core
+        run: |
+          cargo test --release --no-default-features --features edition-openwrt
+          for t in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            cargo zigbuild --release --no-default-features --features edition-openwrt --target $t
+            ls -l target/$t/release/shellgate
+          done
+      - run: sh -n editions/openwrt/files/install.sh && sh -n editions/openwrt/files/shellgate.init
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - working-directory: core
+        run: cargo build --release --no-default-features --features edition-openwrt
+      - run: pip install -e "editions/wsl[dev]"
+      - name: e2e against the OpenWrt edition (no ventoy tools)
+        run: |
+          SHELLGATE_BIN=$PWD/core/target/release/shellgate pytest -q tests/test_e2e.py
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, os, socket
+          s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+          import tempfile; d = tempfile.mkdtemp()
+          env = dict(os.environ, SHELLGATE_TOKEN="ci-" + os.urandom(20).hex(), SHELLGATE_PORT=str(port), SHELLGATE_ENV_FILE=d + "/env", SHELLGATE_STATE_DIR=d + "/state")
+          p = subprocess.Popen(["core/target/release/shellgate"], env=env)
+          try:
+              time.sleep(1.5)
+              req = urllib.request.Request(f"http://127.0.0.1:{port}/mcp", method="POST",
+                  data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(),
+                  headers={"Authorization": "Bearer " + env["SHELLGATE_TOKEN"], "Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              names = [t["name"] for t in json.load(op.open(req))["result"]["tools"]]
+              assert not any(n.startswith(("ventoy_", "desktop_")) for n in names), names
+              print("openwrt edition tools:", names)
+          finally:
+              p.terminate()
+          PY
+
+  # PE edition: Windows x64 + x86 (WinPE / rescue stick), plus the rescue-stick Linux binary
+  pe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,i686-pc-windows-gnu,x86_64-unknown-linux-musl
+      - run: pip install ziglang cargo-zigbuild
+      - working-directory: core
+        run: |
+          cargo zigbuild --release --no-default-features --features edition-pe --target x86_64-pc-windows-gnu
+          cargo zigbuild --release --no-default-features --features edition-pe --target i686-pc-windows-gnu
+          cargo zigbuild --release --no-default-features --features edition-linux --target x86_64-unknown-linux-musl
+          ls -l target/*/release/shellgate target/*/release/shellgate.exe
+      - run: python3 -c "import json; json.load(open('editions/pe/pe-build/tools.json', encoding='utf-8'))"

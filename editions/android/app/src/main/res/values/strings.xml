@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="a11y_desc">让 ShellGate 远程读取屏幕上的控件、点按、滑动、输入文字和截图。只有你在这里打开时才生效，随时可以关掉。所有操作都经过 ShellGate 的访问令牌和审计日志。</string>
+</resources>

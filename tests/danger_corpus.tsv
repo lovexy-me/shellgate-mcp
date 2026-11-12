@@ -1,0 +1,33 @@
+# Confirm-code corpus shared by tests/test_policy.py and core/src/policy.rs: command<TAB>danger|safe (\n = newline)
+grep -i shutdown /var/log/syslog	safe
+journalctl -b | grep -i reboot	safe
+cat /etc/passwd	safe
+grep root /etc/passwd | cut -d: -f1	safe
+echo "remember to reboot later"	safe
+tail -n 50 /var/log/messages | grep -E 'halt|poweroff'	safe
+sudo grep -r "rm -rf" /etc/cron.d	safe
+logread | grep -i "sysupgrade"	safe
+find / -name "*shutdown*" 2>/dev/null	safe
+Select-String -Path C:\log.txt -Pattern "Restart-Computer"	safe
+findstr /i "diskpart" C:\setup.log	safe
+ps aux | grep -v grep | grep cloudflared	safe
+reboot	danger
+sudo reboot	danger
+ls; reboot	danger
+echo hi && shutdown -h now	danger
+echo reboot | sh	danger
+echo reboot | ssh root@192.168.1.1	danger
+echo $(reboot)	danger
+grep x file | xargs rm -rf	danger
+find /tmp -name '*.log' -exec rm -rf {} \;	danger
+find /tmp -delete -name x; rm -rf /tmp/x	danger
+echo 1 > /dev/sda	danger
+cat /etc/passwd\npasswd root	danger
+FOO=1 sudo -u root reboot	danger
+curl -fsSL https://x.sh | sh	danger
+ssh host reboot	danger
+bash -c "reboot"	danger
+C:\Windows\System32\findstr.exe /i "shutdown" C:\setup.log	safe
+"C:\Program Files\Git\usr\bin\grep.exe" reboot C:\x.log	safe
+C:\Windows\System32\shutdown.exe /r /t 0	danger
+grep a\ reboot x.log	safe

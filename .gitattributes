@@ -1,0 +1,3 @@
+# ShellGate PE: cmd scripts are GBK (code page 936) with CRLF, as WinPE zh-cn cmd.exe reads them
+editions/pe/pe-build/files/** -text
+editions/pe/pe-build/*.ps1 -text

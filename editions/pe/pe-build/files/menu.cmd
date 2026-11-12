@@ -11,7 +11,8 @@ echo   3 磁盘列表 (diskpart list)       4 分区恢复 (TestDisk)
 echo   5 文件恢复 (QPhotoRec)           6 装系统 / 引导修复 (win-install)
 echo   7 离线改密码 / 注册表 (win-offline)  8 硬件信息 (smartctl, systeminfo)
 echo   9 网络: 初始化 / 关防火墙 / ipconfig
-echo   S ShellGate 状态                 P PowerShell
+echo   S ShellGate 状态                 M ShellGate 模式 (本机/局域网/隧道)
+echo   P PowerShell
 echo   C 命令行                         R 重启    Q 关机
 echo  =========================================================
 set "c="
@@ -25,9 +26,15 @@ if /i "%c%"=="6" start "win-install" cmd /k "%PEDIR%\bin\win-install.cmd" help
 if /i "%c%"=="7" start "win-offline" cmd /k "%PEDIR%\bin\win-offline.cmd" help
 if /i "%c%"=="8" (if exist "%PEDIR%\smartmontools\smartctl.exe" ("%PEDIR%\smartmontools\smartctl.exe" --scan) & wmic cpu get name & wmic memorychip get capacity & wmic diskdrive get model,size,interfacetype)
 if /i "%c%"=="9" (wpeutil InitializeNetwork & wpeutil DisableFirewall & ipconfig)
-if /i "%c%"=="S" (tasklist /fi "imagename eq shellgate.exe" & netstat -ano | find ":8790")
+if /i "%c%"=="S" call "%PEDIR%\bin\sg.cmd" status
+if /i "%c%"=="M" goto setmode
 if /i "%c%"=="P" start "PowerShell" powershell -NoLogo
 if /i "%c%"=="C" start "cmd" cmd /k
 if /i "%c%"=="R" wpeutil reboot
 if /i "%c%"=="Q" wpeutil shutdown
+goto menu
+:setmode
+set "mm="
+set /p mm=模式 local=本机 lan=局域网 tunnel=隧道: 
+call "%PEDIR%\bin\sg.cmd" mode %mm%
 goto menu

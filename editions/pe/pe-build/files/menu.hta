@@ -9,7 +9,7 @@ button:hover{background:#3e4c59} #st{font-size:12px;color:#9aa5b1;margin-top:8px
 </style>
 <script language="VBScript">
 Sub Window_OnLoad
-  window.resizeTo 560, 460
+  window.resizeTo 560, 600
 End Sub
 </script>
 <script language="JScript">
@@ -29,7 +29,11 @@ function q(s){ return '"' + s + '"'; }
 <button onclick="run(q(P+'7zip-full\\7zFM.exe'))">7-Zip</button>
 <button onclick="run('powershell -NoLogo')">PowerShell</button>
 <button onclick="run('cmd /k wpeutil InitializeNetwork ^& ipconfig')">联网 / IP</button>
-<button onclick="run('cmd /k tasklist /fi &quot;imagename eq shellgate.exe&quot;')">ShellGate 状态</button>
+<button onclick="run('powershell -NoLogo -NoExit -ExecutionPolicy Bypass -File '+q(P+'bin\\sg.ps1')+' status')">ShellGate 状态</button>
+<button onclick="run('powershell -NoLogo -NoExit -ExecutionPolicy Bypass -File '+q(P+'bin\\sg.ps1')+' restart')">ShellGate 重启</button>
+<button onclick="run('powershell -NoLogo -NoExit -ExecutionPolicy Bypass -File '+q(P+'bin\\sg.ps1')+' mode local')">模式: 本机</button>
+<button onclick="run('powershell -NoLogo -NoExit -ExecutionPolicy Bypass -File '+q(P+'bin\\sg.ps1')+' mode lan')">模式: 局域网</button>
+<button onclick="run('powershell -NoLogo -NoExit -ExecutionPolicy Bypass -File '+q(P+'bin\\sg.ps1')+' mode tunnel')">模式: 隧道</button>
 <button onclick="run('wpeutil reboot')">重启</button>
 <button onclick="run('wpeutil shutdown')">关机</button>
 </div><div id="st">远程: ShellGate 在后台运行（令牌在 U 盘 \shellgate\shellgate.env，镜像内没有）。</div>

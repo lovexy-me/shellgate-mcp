@@ -5,6 +5,7 @@
 # The access token and tunnel token are never printed.
 param([string]$Cmd = 'status', [string]$Arg = '')
 $ErrorActionPreference = 'SilentlyContinue'
+$script:rc = 0
 $SG = 'X:\Program Files\ShellGate\shellgate.exe'
 
 function Find-Env {
@@ -110,9 +111,23 @@ function Set-Mode([string]$m) {
     $newTok = $null
     if ($m -eq 'tunnel' -and -not $c['tunnel_token']) {
         Write-Host '隧道模式需要 Cloudflare 隧道令牌（Zero Trust → Tunnels → 安装命令里 --token 后面那串）。'
-        $s = Read-Host '粘贴隧道令牌（不回显）' -AsSecureString
-        $newTok = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
-        if (-not $newTok -or $newTok.Length -lt 20) { Write-Host '令牌为空或太短，未修改' -ForegroundColor Red; return }
+        if ($env:SG_TUNNEL_TOKEN) { $newTok = $env:SG_TUNNEL_TOKEN.Trim() }
+        elseif ([Console]::IsInputRedirected) {
+            Write-Host '没有可输入的控制台：请在菜单里操作，或设置环境变量 SG_TUNNEL_TOKEN 后再运行。未修改' -ForegroundColor Red; $script:rc = 2; return
+        } else {
+            Write-Host -NoNewline '粘贴隧道令牌（不回显，回车结束，5 分钟内无输入自动取消）: '
+            $sb = New-Object Text.StringBuilder; $deadline = (Get-Date).AddMinutes(5)
+            while ($true) {
+                if ((Get-Date) -gt $deadline) { Write-Host ''; Write-Host '超时未输入，未修改' -ForegroundColor Red; $script:rc = 2; return }
+                if (-not [Console]::KeyAvailable) { Start-Sleep -Milliseconds 100; continue }
+                $k = [Console]::ReadKey($true)
+                if ($k.Key -eq 'Enter') { break }
+                if ($k.Key -eq 'Backspace') { if ($sb.Length) { [void]$sb.Remove($sb.Length - 1, 1) }; continue }
+                if ($k.KeyChar -ge ' ') { [void]$sb.Append($k.KeyChar); $deadline = (Get-Date).AddMinutes(5) }
+            }
+            Write-Host ''; $newTok = $sb.ToString().Trim()
+        }
+        if (-not $newTok -or $newTok.Length -lt 20) { Write-Host '令牌为空或太短，未修改' -ForegroundColor Red; $script:rc = 2; return }
     }
     Copy-Item -LiteralPath $envf "$envf.bak" -Force
     $out = New-Object System.Collections.Generic.List[string]; $done = $false
@@ -141,3 +156,4 @@ switch ($Cmd.ToLower()) {
     'restart' { Restart-SG; Show-Status }
     default   { Write-Host '用法: sg.ps1 status | mode local|lan|tunnel | restart' }
 }
+exit $script:rc

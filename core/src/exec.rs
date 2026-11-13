@@ -90,6 +90,8 @@ pub async fn run_cmd(s: &Settings, sem: &Semaphore, mut cmd: Command, timeout: u
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let pid = child.id();
+    platform::track(&child, false);
     let writer = match (stdin, child.stdin.take()) {
         (Some(data), Some(mut pipe)) => {
             let data = data.as_bytes().to_vec();
@@ -113,6 +115,7 @@ pub async fn run_cmd(s: &Settings, sem: &Semaphore, mut cmd: Command, timeout: u
             child.wait().await.ok()
         }
     };
+    platform::untrack(pid);
     if let Some(w) = writer {
         w.abort();
     }
@@ -147,10 +150,17 @@ pub struct Job {
     pub started: u64,
     pub started_at: Instant,
     child: Child,
+    pid: Option<u32>,
     stdin: Option<ChildStdin>,
     pub lines: Arc<Mutex<VecDeque<String>>>,
     exit: Option<Option<i32>>,
     finished_at: Option<Instant>,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        platform::untrack(self.pid);
+    }
 }
 
 impl Job {
@@ -228,6 +238,8 @@ impl Jobs {
         let mut child = command(s, cmd, cwd)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
             .spawn().map_err(|e| format!("spawn failed: {e}"))?;
+        let pid = child.id();
+        platform::track(&child, false);
         let lines = Arc::new(Mutex::new(VecDeque::new()));
         pump(child.stdout.take().unwrap(), lines.clone());
         pump(child.stderr.take().unwrap(), lines.clone());
@@ -235,7 +247,7 @@ impl Jobs {
         let job = Job {
             id: id.clone(), command: cmd.into(), cwd: cwd.into(),
             started: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-            started_at: Instant::now(), stdin: child.stdin.take(), child, lines,
+            started_at: Instant::now(), stdin: child.stdin.take(), child, pid, lines,
             exit: None, finished_at: None,
         };
         self.map.insert(id.clone(), job);
@@ -264,5 +276,35 @@ pub async fn cancel(job: &mut Job) {
     if job.running() {
         platform::terminate(&mut job.child).await;
         job.poll();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod env_tests {
+    use super::*;
+
+    /// run_command must not hand ShellGate's token (or the tunnel token) to the commands it runs.
+    #[tokio::test]
+    async fn run_command_env_has_no_tokens() {
+        let secret = "sg-envtest-0123456789abcdef-secret";
+        std::env::set_var("SHELLGATE_TOKEN", secret);
+        std::env::set_var("TUNNEL_TOKEN", "tunnel-envtest-0123456789abcdef");
+        std::env::set_var("SG_ENVTEST_COPY", format!("Bearer {secret}"));
+        std::env::set_var("SG_ENVTEST_KEEP", "kept-value");
+        let mut s = Settings::for_tests();
+        s.shell = "sh".into();
+        s.max_output_bytes = 1_000_000;
+        s.max_timeout = 60;
+        let sem = Semaphore::new(1);
+        let v = run_once(&s, &sem, "env; set", "/", 20, None).await.unwrap();
+        let out = v.to_string();
+        std::env::remove_var("SHELLGATE_TOKEN");
+        std::env::remove_var("TUNNEL_TOKEN");
+        std::env::remove_var("SG_ENVTEST_COPY");
+        std::env::remove_var("SG_ENVTEST_KEEP");
+        assert!(out.contains("kept-value"), "env output missing: {out}");
+        assert!(!out.contains("SHELLGATE_TOKEN"), "SHELLGATE_TOKEN leaked to the child");
+        assert!(!out.contains(secret), "token value leaked to the child");
+        assert!(!out.contains("TUNNEL_TOKEN"), "TUNNEL_TOKEN leaked to the child");
     }
 }

@@ -20,7 +20,7 @@
       "redistributable": true,
       "extract": "7z",
       "files": {"amd64": ["x64/7za.exe", "x64/7za.dll"], "x86": ["7za.exe", "7za.dll"]},
-      "note": "console 7za plus the DLL; the GUI 7zFM is in the full installer which the build also fetches when -Full"
+      "note": "console 7za plus its DLL, for zip/7z. 7za cannot read ISO/UDF: win-install extracts install.wim from an ISO with the full 7z.exe + 7z.dll below"
     },
     {
       "id": "7zip-full",
@@ -33,7 +33,7 @@
       "redistributable": true,
       "extract": "7z",
       "files": {"amd64": ["7zFM.exe", "7z.exe", "7z.dll", "7zG.exe", "Lang/zh-cn.txt"]},
-      "optional": true
+      "note": "required, not optional: full 7z.exe + 7z.dll (ISO/UDF support) for win-install apply <iso> when Mount-DiskImage is unavailable"
     },
     {
       "id": "7zip-x86",
@@ -46,7 +46,7 @@
       "redistributable": true,
       "extract": "7z",
       "files": {"x86": ["7zFM.exe", "7z.exe", "7z.dll", "7zG.exe", "Lang/zh-cn.txt"]},
-      "optional": true
+      "note": "required, not optional: full 7z.exe + 7z.dll (ISO/UDF support) for win-install apply <iso> when Mount-DiskImage is unavailable"
     },
     {
       "id": "wimlib",

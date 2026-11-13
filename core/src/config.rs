@@ -7,6 +7,7 @@
 //! No secret ever has a built-in default: the token (and the optional Cloudflare tunnel token)
 //! only come from the env file / environment that the user writes on their own machine.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -118,9 +119,14 @@ fn full_key(k: &str) -> String {
     k.to_string()
 }
 
-fn load_env_file(path: &Path) {
-    let Ok(text) = fs::read_to_string(path) else { return };
+/// Values read from the config file. They live only in this process's memory: they are never
+/// written into the process environment, so commands, jobs and helpers started by ShellGate cannot
+/// read the access token or the tunnel token from their inherited environment.
+static FILE_VALUES: std::sync::RwLock<Option<HashMap<String, String>>> = std::sync::RwLock::new(None);
+
+fn parse_env_text(text: &str) -> HashMap<String, String> {
     let text = text.trim_start_matches('\u{feff}'); // Notepad may save a UTF-8 BOM
+    let mut m = HashMap::new();
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -129,15 +135,27 @@ fn load_env_file(path: &Path) {
         if let Some((k, v)) = line.split_once('=') {
             let k = full_key(k.trim());
             let v = v.trim().trim_matches('"').trim_matches('\'');
-            if env::var_os(&k).is_none() {
-                env::set_var(&k, v);
-            }
+            m.entry(k).or_insert_with(|| v.to_string()); // first occurrence wins, as before
         }
     }
+    m
+}
+
+fn load_env_file(path: &Path) {
+    let m = fs::read_to_string(path).map(|t| parse_env_text(&t)).unwrap_or_default();
+    *FILE_VALUES.write().unwrap_or_else(|e| e.into_inner()) = Some(m);
+}
+
+/// A config value: the real environment wins (as before), then the config file. Empty = unset.
+pub fn var(key: &str) -> Option<String> {
+    if let Some(v) = env::var(key).ok().filter(|v| !v.is_empty()) {
+        return Some(v);
+    }
+    FILE_VALUES.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(key).cloned()).filter(|v| !v.is_empty())
 }
 
 fn get(key: &str, default: &str) -> String {
-    env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
+    var(key).unwrap_or_else(|| default.to_string())
 }
 
 fn split(v: &str) -> Vec<String> {
@@ -145,7 +163,7 @@ fn split(v: &str) -> Vec<String> {
 }
 
 fn num<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    var(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
 fn truthy(v: &str) -> bool {
@@ -494,6 +512,22 @@ token={token}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_values_stay_out_of_the_environment() {
+        let m = parse_env_text("\u{feff}token=abc\n# c\nnet = lan\nSHELLGATE_PORT='9'\ntoken=second\n");
+        assert_eq!(m.get("SHELLGATE_TOKEN").map(String::as_str), Some("abc"));
+        assert_eq!(m.get("SHELLGATE_NET").map(String::as_str), Some("lan"));
+        assert_eq!(m.get("SHELLGATE_PORT").map(String::as_str), Some("9"));
+        let dir = std::env::temp_dir().join(format!("sg-cfg-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let f = dir.join("shellgate.env");
+        fs::write(&f, "SHELLGATE_ZZ_ENVTEST_SECRET=zz-secret-value\n").unwrap();
+        load_env_file(&f);
+        assert_eq!(var("SHELLGATE_ZZ_ENVTEST_SECRET").as_deref(), Some("zz-secret-value"));
+        assert!(env::var_os("SHELLGATE_ZZ_ENVTEST_SECRET").is_none(), "config value leaked into the process environment");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn short_keys() {

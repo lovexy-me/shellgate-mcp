@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .config import Settings
+from .config import Settings, child_env
 
 
 def _clip(data: bytes, limit: int) -> tuple[str, bool]:
@@ -44,6 +44,7 @@ async def run_process(argv: list[str], cwd: str, timeout: int, settings: Setting
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,  # own process group so timeouts kill children too
+            env=child_env(),  # ShellGate settings and tokens removed
         )
         timed_out = False
 
@@ -147,6 +148,7 @@ class JobManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            env=child_env(),  # ShellGate settings and tokens removed
         )
         job = Job(id=secrets.token_hex(4), command=command, cwd=cwd, proc=proc)
         job.reader = asyncio.create_task(self._read(job))

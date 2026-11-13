@@ -153,6 +153,7 @@ pub fn powershell_usable() -> bool {
             use std::os::windows::process::CommandExt;
             let Some(exe) = which("powershell") else { return false };
             let mut c = std::process::Command::new(exe);
+            scrub_env_std(&mut c);
             c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 7"])
                 .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW);
@@ -323,11 +324,49 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
+/// Whether a child process must not inherit this environment variable: ShellGate's own settings
+/// (`SHELLGATE_*`, which may hold the access token) and tunnel tokens. Names are compared
+/// case-insensitively (Windows environment names are case-insensitive).
+pub fn is_secret_env_name(k: &str) -> bool {
+    let k = k.to_ascii_uppercase();
+    k.starts_with("SHELLGATE_")
+        || matches!(k.as_str(), "TUNNEL_TOKEN" | "SG_TUNNEL_TOKEN" | "SG_TOKEN" | "CLOUDFLARE_TUNNEL_TOKEN" | "CF_TUNNEL_TOKEN" | "TUNNEL_ORIGIN_CERT")
+}
+
+/// Names of the variables to strip from a child's environment: the secret names above, plus any
+/// variable whose value is the access token or the tunnel token, whatever it is called.
+pub fn secret_env_keys() -> Vec<std::ffi::OsString> {
+    let secrets: Vec<String> = ["SHELLGATE_TOKEN", "SHELLGATE_TUNNEL_TOKEN"].iter()
+        .filter_map(|k| crate::config::var(k)).filter(|v| v.len() >= 16).collect();
+    std::env::vars_os()
+        .filter(|(k, v)| {
+            is_secret_env_name(&k.to_string_lossy()) || v.to_str().map(|v| secrets.iter().any(|s| v.contains(s.as_str()))).unwrap_or(false)
+        })
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Remove the secret variables from a (tokio) command's environment.
+pub fn scrub_env(c: &mut Command) {
+    for k in secret_env_keys() {
+        c.env_remove(k);
+    }
+}
+
+/// Remove the secret variables from a std command's environment.
+pub fn scrub_env_std(c: &mut std::process::Command) {
+    for k in secret_env_keys() {
+        c.env_remove(k);
+    }
+}
+
 /// A command whose whole process tree we can kill later (own process group on Unix,
-/// own console process group and no window on Windows).
+/// own console process group and no window on Windows). Its environment has ShellGate's
+/// settings and tokens removed (see `scrub_env`).
 pub fn new_command(prog: &str) -> Command {
     let mut c = Command::new(prog);
     c.kill_on_drop(true);
+    scrub_env(&mut c);
     #[cfg(unix)]
     {
         c.process_group(0);
@@ -337,6 +376,197 @@ pub fn new_command(prog: &str) -> Command {
         c.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     c
+}
+
+/// Remember a freshly spawned child so `terminate` can stop everything it starts. Windows: the
+/// child goes into its own Job Object (grandchildren follow it automatically); with
+/// `kill_on_close` the whole job dies when ShellGate exits or is killed. Unix: no-op (process groups).
+#[allow(unused_variables)]
+pub fn track(child: &Child, kill_on_close: bool) {
+    #[cfg(windows)]
+    if let (Some(pid), Some(h)) = (child.id(), child.raw_handle()) {
+        winproc::attach(pid, h as _, kill_on_close);
+    }
+}
+
+/// Forget a tracked child (it finished); closes its job without killing anything left in it,
+/// unless the job was created with `kill_on_close`.
+#[allow(unused_variables)]
+pub fn untrack(pid: Option<u32>) {
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        winproc::release(pid);
+    }
+}
+
+/// Stop the process `pid` and everything it started (no Child handle needed). Windows: its job
+/// (if tracked) and the process tree by parent id, through the Win32 API (WinPE has no taskkill).
+/// Unix: SIGTERM to the process.
+pub fn kill_pid_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        winproc::kill_tree(pid);
+        winproc::release(pid);
+    }
+    #[cfg(unix)]
+    unsafe {
+        // children started with new_command lead their own process group: signal the whole group
+        if libc::getpgid(pid as i32) == pid as i32 {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+}
+
+/// Full path of the executable of a running process, if it can be read.
+pub fn process_exe(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        winproc::image_path(pid)
+    }
+    #[cfg(unix)]
+    {
+        fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().trim_end_matches(" (deleted)").to_string())
+    }
+}
+
+#[cfg(windows)]
+mod winproc {
+    //! Job Objects and process-tree termination with the Win32 API (WinPE has no taskkill).
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    /// pid -> job handle (as usize so the map is Send)
+    static JOBS: Mutex<Option<HashMap<u32, usize>>> = Mutex::new(None);
+
+    pub fn attach(pid: u32, process: HANDLE, kill_on_close: bool) {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return;
+            }
+            if kill_on_close {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _,
+                                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+            }
+            if AssignProcessToJobObject(job, process) == 0 {
+                CloseHandle(job); // e.g. Windows 7 without nested jobs: the tree walk still works
+                return;
+            }
+            let old = JOBS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(pid, job as usize);
+            if let Some(o) = old {
+                CloseHandle(o as HANDLE);
+            }
+        }
+    }
+
+    pub fn release(pid: u32) {
+        let h = JOBS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.remove(&pid));
+        if let Some(h) = h {
+            unsafe { CloseHandle(h as HANDLE) };
+        }
+    }
+
+    fn created(pid: u32) -> Option<u64> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = std::mem::zeroed();
+            let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u);
+            CloseHandle(h);
+            (ok != 0).then(|| ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64)
+        }
+    }
+
+    /// `root` and all its descendants (by parent process id; a child must be younger than its
+    /// parent, so a recycled parent id is not followed).
+    pub fn tree(root: u32) -> Vec<u32> {
+        let mut procs: Vec<(u32, u32)> = vec![];
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+                return vec![root];
+            }
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snap, &mut e) != 0 {
+                loop {
+                    procs.push((e.th32ProcessID, e.th32ParentProcessID));
+                    if Process32NextW(snap, &mut e) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        let mut out = vec![root];
+        let mut i = 0;
+        while i < out.len() {
+            let parent = out[i];
+            let pc = created(parent);
+            for &(pid, ppid) in &procs {
+                if ppid == parent && pid != parent && pid != 0 && !out.contains(&pid) {
+                    let ok = match (pc, created(pid)) { (Some(a), Some(b)) => b >= a, _ => true };
+                    if ok {
+                        out.push(pid);
+                    }
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    pub fn terminate_pid(pid: u32) {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+
+    /// Kill the job of `root` (if tracked) and the process tree under it, children first.
+    pub fn kill_tree(root: u32) {
+        let job = JOBS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&root).copied());
+        let pids = tree(root); // before anything dies, so the parent links are still there
+        if let Some(j) = job {
+            unsafe { TerminateJobObject(j as HANDLE, 1) };
+        }
+        for pid in pids.iter().rev() {
+            if *pid != std::process::id() {
+                terminate_pid(*pid);
+            }
+        }
+    }
+
+    pub fn image_path(pid: u32) -> Option<String> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = vec![0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+            CloseHandle(h);
+            (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+        }
+    }
 }
 
 /// Build the command that runs `cmd` through the configured shell.
@@ -377,7 +607,8 @@ pub fn default_shell() -> String {
 }
 
 /// Stop a child and everything it started. Unix: SIGTERM to the group, SIGKILL after 3 s.
-/// Windows: `taskkill /T /F /PID <pid>` (whole tree), then TerminateProcess as a fallback.
+/// Windows: the child's Job Object plus its process tree (Win32 API, no taskkill: WinPE has none),
+/// then TerminateProcess as a fallback.
 pub async fn terminate(child: &mut Child) {
     let pid = child.id();
     #[cfg(unix)]
@@ -396,15 +627,14 @@ pub async fn terminate(child: &mut Child) {
     #[cfg(windows)]
     {
         if let Some(pid) = pid {
-            let mut tk = Command::new("taskkill");
-            tk.args(["/T", "/F", "/PID", &pid.to_string()])
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW);
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), tk.status()).await;
+            winproc::kill_tree(pid);
         }
         if tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await.is_err() {
             let _ = child.start_kill();
             let _ = child.wait().await;
+        }
+        if let Some(pid) = pid {
+            winproc::release(pid);
         }
     }
 }

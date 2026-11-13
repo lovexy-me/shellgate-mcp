@@ -25,7 +25,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from . import __version__
 from .audit import AuditLog, client_ip
 from . import guard
-from .config import Settings, load_settings
+from .config import Settings, child_env, load_settings
 from .policy import (ConfirmStore, sudo_argv, allowlist_violations, check_path, feeds_interpreter,
                      referenced_scripts, text_danger_reasons)
 from .redact import Redactor, footer
@@ -519,7 +519,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
                 args[1:1] = ["--glob", f"!{prot}/**"]
             if glob:
                 args[1:1] = ["--glob", glob]
-            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
+            proc = await asyncio.create_subprocess_exec(*args, env=child_env(), stdout=asyncio.subprocess.PIPE,
                                                         stderr=asyncio.subprocess.DEVNULL)
             try:
                 out, _ = await asyncio.wait_for(proc.communicate(), 60)
@@ -572,7 +572,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AuditLog]:
         if not shutil.which("docker"):
             raise FileNotFoundError("docker CLI not found")
         async with sem:
-            proc = await asyncio.create_subprocess_exec("docker", *args, stdout=asyncio.subprocess.PIPE,
+            proc = await asyncio.create_subprocess_exec("docker", *args, env=child_env(), stdout=asyncio.subprocess.PIPE,
                                                         stderr=asyncio.subprocess.PIPE)
             try:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout)

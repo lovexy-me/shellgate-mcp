@@ -8,12 +8,18 @@ $ErrorActionPreference = 'SilentlyContinue'
 $script:rc = 0
 $SG = 'X:\Program Files\ShellGate\shellgate.exe'
 
+# The config on the Ventoy stick we booted from wins (a drive with \ventoy\ventoy.json or the volume
+# label Ventoy); only when no drive looks like a Ventoy stick is the first drive letter with a config used.
+$script:EnvHow = ''
 function Find-Env {
-    if ($env:SG_ENV_FILE -and (Test-Path -LiteralPath $env:SG_ENV_FILE)) { return $env:SG_ENV_FILE }
-    foreach ($d in 'CDEFGHIJKLMNOPQRSTUVWYZ'.ToCharArray()) {
-        $p = "${d}:\shellgate\shellgate.env"
-        if (Test-Path -LiteralPath $p) { return $p }
+    if ($env:SG_ENV_FILE -and (Test-Path -LiteralPath $env:SG_ENV_FILE)) { $script:EnvHow = 'SG_ENV_FILE'; return $env:SG_ENV_FILE }
+    $c = @(foreach ($d in 'CDEFGHIJKLMNOPQRSTUVWYZ'.ToCharArray()) { if (Test-Path -LiteralPath "${d}:\shellgate\shellgate.env") { $d } })
+    foreach ($d in $c) { if (Test-Path -LiteralPath "${d}:\ventoy\ventoy.json") { $script:EnvHow = 'Ventoy 启动盘（ventoy\ventoy.json）'; return "${d}:\shellgate\shellgate.env" } }
+    foreach ($d in $c) {
+        $l = try { ([System.IO.DriveInfo]"${d}:\").VolumeLabel } catch { '' }
+        if ($l -eq 'Ventoy') { $script:EnvHow = 'Ventoy 启动盘（卷标 Ventoy）'; return "${d}:\shellgate\shellgate.env" }
     }
+    if ($c.Count) { $script:EnvHow = '按盘符找到的第一个（没认出 Ventoy 盘）'; return "$($c[0]):\shellgate\shellgate.env" }
     return $null
 }
 function Norm([string]$k) { $k = $k.Trim().ToLower(); if ($k.StartsWith('shellgate_')) { $k = $k.Substring(10) }; $k }
@@ -47,7 +53,7 @@ function Show-Status {
     if (-not $envf) { Write-Host '配置: 没找到 U 盘 \shellgate\shellgate.env（令牌不在镜像里，没有配置就不会启动）' -ForegroundColor Yellow; return }
     $c = Read-Cfg $envf; $m = Net-Mode $c
     $port = if ($c['port']) { $c['port'] } else { '8790' }
-    Write-Host "配置: $envf"
+    Write-Host "配置: $envf  [$script:EnvHow]"
     Write-Host "模式: $m  $($ModeName[$m])"
     try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 "http://127.0.0.1:$port/health"; Write-Host "健康检查: HTTP $($r.StatusCode)  $($r.Content)" -ForegroundColor Green }
     catch { Write-Host "健康检查: 127.0.0.1:$port 无响应" -ForegroundColor Red }

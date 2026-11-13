@@ -238,7 +238,7 @@ pub async fn serve(s: Settings) {
     }
     let key = ensure_key(&s);
     // SHELLGATE_ADMIN_HOST: 127.0.0.1 by default; a router may set its LAN address (the admin key is still required)
-    let host = std::env::var("SHELLGATE_ADMIN_HOST").ok().filter(|h| !h.trim().is_empty()).unwrap_or_else(|| "127.0.0.1".into());
+    let host = crate::config::var("SHELLGATE_ADMIN_HOST").filter(|h| !h.trim().is_empty()).unwrap_or_else(|| "127.0.0.1".into());
     let addr = format!("{}:{}", host.trim(), s.admin_port);
     let router = routes(s, key);
     match tokio::net::TcpListener::bind(&addr).await {

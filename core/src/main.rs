@@ -69,14 +69,10 @@ fn reexec() -> ! {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // drop the SHELLGATE_* values that came from the config file, so edits take effect
+        // config-file values live only in memory (never in the environment), so the fresh copy
+        // re-reads the file and edits take effect; real SHELLGATE_* variables are kept as they are
         let mut c = std::process::Command::new(&exe);
         c.args(&args);
-        for (k, _) in std::env::vars() {
-            if k.starts_with("SHELLGATE_") && !PRESERVE_ENV.with(|p| p.borrow().contains(&k)) {
-                c.env_remove(&k);
-            }
-        }
         let e = c.exec();
         eprintln!("restart failed: {e}");
         std::process::exit(75)
@@ -85,11 +81,6 @@ fn reexec() -> ! {
     {
         let mut c = std::process::Command::new(&exe);
         c.args(&args);
-        for (k, _) in std::env::vars() {
-            if k.starts_with("SHELLGATE_") && !PRESERVE_ENV.with(|p| p.borrow().contains(&k)) {
-                c.env_remove(&k);
-            }
-        }
         match c.spawn() {
             Ok(_) => std::process::exit(0),
             Err(e) => { eprintln!("restart failed: {e}"); std::process::exit(75) }
@@ -97,10 +88,6 @@ fn reexec() -> ! {
     }
 }
 
-thread_local! {
-    /// SHELLGATE_* variables that were set in the real environment before the config was read.
-    static PRESERVE_ENV: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
 const PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 #[cfg(unix)]
 const SHELL_NOTE: &str = "- Commands run as the service user via /bin/sh -c; cwd and env do not persist between calls.\n\
@@ -296,7 +283,6 @@ fn main() {
             _ => usage(),
         }
     }
-    PRESERVE_ENV.with(|p| *p.borrow_mut() = std::env::vars().map(|(k, _)| k).filter(|k| k.starts_with("SHELLGATE_")).collect());
     let mut open_admin = false;
     if SELF_CONFIG {
         let path = config::self_config_path(env_file.clone());
@@ -358,9 +344,17 @@ async fn run_agent(settings: config::Settings, v: Vec<String>) {
 #[allow(unused_variables)]
 fn open_browser(url: &str) {
     #[cfg(windows)]
-    { let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn(); }
+    {
+        let mut c = std::process::Command::new("rundll32");
+        platform::scrub_env_std(&mut c);
+        let _ = c.args(["url.dll,FileProtocolHandler", url]).spawn();
+    }
     #[cfg(all(unix, not(target_os = "android")))]
-    { let _ = std::process::Command::new("xdg-open").arg(url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn(); }
+    {
+        let mut c = std::process::Command::new("xdg-open");
+        platform::scrub_env_std(&mut c);
+        let _ = c.arg(url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+    }
 }
 
 #[allow(unused_variables)]
@@ -449,7 +443,7 @@ async fn serve(settings: config::Settings, open_admin: bool) {
         let url = format!("http://127.0.0.1:{}/#k={key}", net_settings.admin_port);
         eprintln!("admin page: {url}");
         tokio::spawn(admin::serve(net_settings.clone()));
-        if open_admin && !cfg!(target_os = "android") && std::env::var_os("SHELLGATE_NO_BROWSER").is_none() {
+        if open_admin && !cfg!(target_os = "android") && config::var("SHELLGATE_NO_BROWSER").is_none() {
             open_browser(&url);
         }
     }

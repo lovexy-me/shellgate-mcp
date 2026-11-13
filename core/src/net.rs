@@ -42,6 +42,9 @@ pub async fn supervise_cloudflared(s: Settings) {
     if std::fs::metadata(&log_path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
         let _ = std::fs::rename(&log_path, log_path.with_extension("log.1"));
     }
+    let pid_path = Path::new(&s.state_dir).join("cloudflared.pid");
+    let _ = PID_FILE.set(pid_path.clone());
+    kill_stale_cloudflared(&pid_path);
     let mut backoff = 5u64;
     loop {
         let log = platform::private_opts().create(true).append(true).open(&log_path);
@@ -72,13 +75,36 @@ pub async fn supervise_cloudflared(s: Settings) {
         c.arg("run")
             .env("TUNNEL_TOKEN", &s.tunnel_token)
             .stdin(Stdio::null()).stdout(out).stderr(err);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // die with ShellGate: if ShellGate is killed (even with SIGKILL) the kernel sends
+            // cloudflared SIGTERM, so no orphan keeps the tunnel up
+            let parent = std::process::id() as libc::pid_t;
+            unsafe {
+                c.pre_exec(move || {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+                    if libc::getppid() != parent {
+                        libc::_exit(1); // parent already gone before prctl took effect
+                    }
+                    Ok(())
+                });
+            }
+        }
         let started = std::time::Instant::now();
         match c.spawn() {
             Ok(mut child) => {
+                // Windows: own Job Object with KILL_ON_JOB_CLOSE, so cloudflared dies with ShellGate
+                platform::track(&child, true);
+                let pid = child.id();
+                if let Some(pid) = pid {
+                    write_pid_file(&pid_path, pid, &bin);
+                }
                 TUNNEL_RUNNING.store(true, Ordering::Relaxed);
                 TUNNEL_PID.store(child.id().unwrap_or(0), Ordering::Relaxed);
                 ev(format!("tunnel mode: cloudflared started (pid {:?}), log: {}", child.id(), log_path.display()));
                 let st = child.wait().await;
+                platform::untrack(pid);
+                let _ = std::fs::remove_file(&pid_path);
                 TUNNEL_RUNNING.store(false, Ordering::Relaxed);
                 TUNNEL_PID.store(0, Ordering::Relaxed);
                 TUNNEL_RESTARTS.fetch_add(1, Ordering::Relaxed);
@@ -94,26 +120,63 @@ pub async fn supervise_cloudflared(s: Settings) {
     }
 }
 
+/// `<state_dir>/cloudflared.pid`, set when the supervisor starts (so `stop_tunnel` can remove it).
+static PID_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn norm_path(p: &str) -> String {
+    let p = p.trim().trim_start_matches(r"\\?\");
+    if cfg!(windows) { p.replace('/', "\\").to_lowercase() } else { p.to_string() }
+}
+
+/// Record the running cloudflared: its PID and the full path of its executable.
+fn write_pid_file(path: &Path, pid: u32, bin: &str) {
+    let exe = platform::process_exe(pid)
+        .or_else(|| std::fs::canonicalize(bin).ok().map(|p| p.to_string_lossy().to_string()))
+        .unwrap_or_else(|| bin.to_string());
+    if let Ok(mut f) = platform::private_opts().create(true).write(true).truncate(true).open(path) {
+        use std::io::Write;
+        let _ = write!(f, "{pid}\n{exe}\n");
+    }
+}
+
+/// Parse `cloudflared.pid` ("PID\nEXE").
+pub fn parse_pid_file(text: &str) -> Option<(u32, String)> {
+    let mut it = text.lines();
+    let pid = it.next()?.trim().parse().ok().filter(|p| *p > 0)?;
+    let exe = it.next()?.trim().to_string();
+    (!exe.is_empty()).then_some((pid, exe))
+}
+
+/// A cloudflared left over from an earlier ShellGate that died without cleaning up (crash, power
+/// loss of the host process, kill -9 where PDEATHSIG is unavailable). Only the process recorded in
+/// the pid file is stopped, and only when its PID still runs the recorded executable; nothing else
+/// is scanned or killed by path.
+fn kill_stale_cloudflared(pid_path: &Path) {
+    let Ok(text) = std::fs::read_to_string(pid_path) else { return };
+    let _ = std::fs::remove_file(pid_path);
+    let Some((pid, exe)) = parse_pid_file(&text) else { return };
+    if pid == std::process::id() {
+        return;
+    }
+    match platform::process_exe(pid) {
+        Some(now) if norm_path(&now) == norm_path(&exe) => {
+            crate::events::ev(format!("tunnel mode: stopping cloudflared left over from an earlier run (pid {pid})"));
+            platform::kill_pid_tree(pid);
+        }
+        _ => {}
+    }
+}
+
 /// Stop the supervised cloudflared (on stop / restart), so it does not outlive ShellGate and keep
-/// the tunnel up, or pile up one extra copy per restart.
+/// the tunnel up, or pile up one extra copy per restart. Stops its whole process tree.
 pub fn stop_tunnel() {
     let pid = crate::events::TUNNEL_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
     if pid == 0 {
         return;
     }
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    #[cfg(windows)]
-    {
-        let mut c = std::process::Command::new("taskkill");
-        c.args(["/F", "/T", "/PID", &pid.to_string()]);
-        {
-            use std::os::windows::process::CommandExt;
-            c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let _ = c.status();
+    platform::kill_pid_tree(pid);
+    if let Some(p) = PID_FILE.get() {
+        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -498,6 +561,14 @@ mod tests {
         // tunnel: outbound only, firewall untouched
         assert_eq!(pe_net_plan(true, NetMode::Tunnel, true, false), (true, false));
         assert_eq!(pe_net_plan(true, NetMode::Tunnel, true, true), (false, false));
+    }
+
+    #[test]
+    fn pid_file_format() {
+        assert_eq!(parse_pid_file("123\n/opt/cf/cloudflared\n"), Some((123, "/opt/cf/cloudflared".into())));
+        assert_eq!(parse_pid_file("0\n/x\n"), None);
+        assert_eq!(parse_pid_file("12\n"), None);
+        assert_eq!(parse_pid_file("junk"), None);
     }
 
     #[test]

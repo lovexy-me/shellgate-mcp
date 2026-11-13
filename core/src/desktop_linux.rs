@@ -26,6 +26,7 @@ fn wayland() -> bool {
 
 fn run(prog: &str, args: &[String]) -> Result<Vec<u8>, String> {
     let mut c = Command::new(prog);
+    platform::scrub_env_std(&mut c);
     c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     env_display(&mut c);
     let o = c.output().map_err(|e| format!("{prog}: {e}"))?;

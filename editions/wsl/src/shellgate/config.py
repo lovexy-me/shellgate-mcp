@@ -9,18 +9,51 @@ from pathlib import Path
 DEFAULT_ENV_FILE = Path.home() / ".config" / "shellgate" / "env"
 
 
-def _load_env_file(path: Path) -> None:
-    """Minimal KEY=VALUE loader. Existing environment variables win."""
-    if not path.is_file():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+# Values read from the env file. They stay in this process's memory and are never copied into
+# os.environ, so commands and helpers started by ShellGate cannot read the token from their
+# inherited environment.
+_FILE_VALUES: dict[str, str] = {}
+
+_SECRET_NAMES = {"TUNNEL_TOKEN", "SG_TUNNEL_TOKEN", "SG_TOKEN", "CLOUDFLARE_TUNNEL_TOKEN", "CF_TUNNEL_TOKEN",
+                 "TUNNEL_ORIGIN_CERT"}
+
+
+def _parse_env_text(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in text.lstrip("\ufeff").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        out.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    return out
+
+
+def _load_env_file(path: Path) -> None:
+    """Minimal KEY=VALUE loader into memory. Existing environment variables win (see var())."""
+    _FILE_VALUES.clear()
+    if path.is_file():
+        _FILE_VALUES.update(_parse_env_text(path.read_text(encoding="utf-8")))
+
+
+def var(key: str, default: str = "") -> str:
+    """A setting: the real environment first, then the env file."""
+    v = os.environ.get(key)
+    if v is None:
+        v = _FILE_VALUES.get(key)
+    return default if v is None else v
+
+
+def is_secret_env_name(name: str) -> bool:
+    n = name.upper()
+    return n.startswith("SHELLGATE_") or n in _SECRET_NAMES
+
+
+def child_env() -> dict[str, str]:
+    """os.environ without ShellGate's settings and tokens (and any variable holding the token)."""
+    secrets_ = [s for s in (var("SHELLGATE_TOKEN"), var("SHELLGATE_TUNNEL_TOKEN")) if len(s) >= 16]
+    return {k: v for k, v in os.environ.items()
+            if not is_secret_env_name(k) and not any(s in v for s in secrets_)}
 
 
 def _split(value: str) -> list[str]:
@@ -66,7 +99,7 @@ class Settings:
 def load_settings(env_file: str | None = None) -> Settings:
     path = Path(env_file or os.environ.get("SHELLGATE_ENV_FILE", "") or DEFAULT_ENV_FILE)
     _load_env_file(path)
-    env = os.environ.get
+    env = var
 
     token = env("SHELLGATE_TOKEN", "")
     if len(token) < 32:

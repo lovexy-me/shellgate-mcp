@@ -13,6 +13,8 @@ import threading
 import time
 from pathlib import Path
 
+from .config import child_env
+
 MAX_FILES = 20
 MAX_FILE_BYTES = 5_000_000
 MIN_TIMEOUT, MAX_TIMEOUT, DEFAULT_TIMEOUT = 15, 900, 120
@@ -137,7 +139,7 @@ async def rollback(d: Path, shell: str, why: str) -> dict:
     reload_out = None
     if meta.get("reload"):
         try:
-            p = await asyncio.create_subprocess_exec(shell, "-c", meta["reload"], stdin=asyncio.subprocess.DEVNULL,
+            p = await asyncio.create_subprocess_exec(shell, "-c", meta["reload"], env=child_env(), stdin=asyncio.subprocess.DEVNULL,
                                                      stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             _, err = await asyncio.wait_for(p.communicate(), 90)
             reload_out = {"exit_code": p.returncode, "stderr": err.decode(errors="replace")[:2000]}

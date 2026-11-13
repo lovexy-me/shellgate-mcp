@@ -1,6 +1,6 @@
 @echo off
 rem ShellGate PE boot sequence (runs once from startnet.cmd):
-rem   1. find the Ventoy stick: the first drive with \shellgate\shellgate.env
+rem   1. find the Ventoy stick: the drive with \shellgate\shellgate.env that is the Ventoy stick (ventoy\ventoy.json or label Ventoy), else the first drive with it
 rem   2. logs to <stick>\shellgate\logs\pe-<date>.log
 rem   3. load drivers from <stick>\shellgate\drivers  (any *.inf, recursive)   -- like FirPE/HotPE's external driver dir
 rem   4. load plugins from <stick>\shellgate\plugins  (*.cmd run, *.7z unpacked to X:\Plugins\<name> + its autorun.cmd)
@@ -11,6 +11,16 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "SG=X:\Program Files\ShellGate\shellgate.exe"
 set "PEDIR=X:\Program Files\ShellGatePE"
 set "STICK="
+rem prefer the Ventoy stick we booted from (\ventoy\ventoy.json, then volume label Ventoy);
+rem the first drive letter with a config is only the fallback
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (
+  if not defined STICK if exist "%%d:\shellgate\shellgate.env" if exist "%%d:\ventoy\ventoy.json" set "STICK=%%d:"
+)
+if not defined STICK for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (
+  if not defined STICK if exist "%%d:\shellgate\shellgate.env" (
+    vol %%d: 2>nul | findstr /i /e /c:"Ventoy" >nul && set "STICK=%%d:"
+  )
+)
 for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (
   if not defined STICK if exist "%%d:\shellgate\shellgate.env" set "STICK=%%d:"
 )

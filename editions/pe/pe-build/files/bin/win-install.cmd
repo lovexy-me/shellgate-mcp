@@ -49,7 +49,7 @@ if exist "%SRC%\I386\" goto xp
 if exist "%SRC%\AMD64\" goto xp
 if exist "%SRC%\i386\" goto xp
 
-rem ---- ISO: 先用 PowerShell Mount-DiskImage 挂载；PE 不支持时用 7za 只解出 install.wim/esd 到目标盘临时目录
+rem ---- ISO: 先用 PowerShell Mount-DiskImage 挂载；PE 不支持时用完整版 7z.exe 只解出 install.wim/esd 到目标盘临时目录
 set "ISOTMP="
 for %%F in ("%SRC%") do if /i "%%~xF"==".iso" goto iso
 goto noiso
@@ -57,13 +57,34 @@ goto noiso
 set "ISODRV="
 if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "try{$i=Mount-DiskImage -ImagePath '%SRC%' -PassThru -ErrorAction Stop;($i|Get-Volume).DriveLetter}catch{}"`) do set "ISODRV=%%D:"
 if defined ISODRV if exist "!ISODRV!\sources\" (echo [i] ISO 已挂载到 !ISODRV!& set "SRC=!ISODRV!" & goto noiso)
-set "SZ=X:\Program Files\ShellGatePE\7zip\7za.exe"
-if not exist "!SZ!" for /f "delims=" %%Z in ('dir /b /s "X:\Program Files\ShellGatePE\7za.exe" 2^>nul') do set "SZ=%%Z"
-if not exist "!SZ!" echo [x] 无法挂载 ISO，也没有 7za；请把 ISO 解包到目录后传目录 & exit /b 2
+rem 7za（精简版）不认 ISO/UDF，必须用完整版 7z.exe（和 7z.dll 同目录）
+set "SZ=" & set "SZLITE="
+for %%Z in ("X:\Program Files\ShellGatePE\7zip-full\7z.exe" "X:\Program Files\ShellGatePE\7zip-x86\7z.exe") do if not defined SZ if exist "%%~Z" if exist "%%~dpZ7z.dll" set "SZ=%%~Z"
+if not defined SZ for /f "delims=" %%Z in ('dir /b /s "X:\Program Files\ShellGatePE\7z.exe" 2^>nul') do if not defined SZ if exist "%%~dpZ7z.dll" set "SZ=%%Z"
+if not defined SZ (
+  set "SZLITE=1"
+  set "SZ=X:\Program Files\ShellGatePE\7zip\7za.exe"
+  echo [i] 没找到完整版 7-Zip（7zip-full\7z.exe + 7z.dll），只能试精简版 7za；它通常不支持 ISO/UDF
+)
+if not exist "!SZ!" (
+  echo [x] 无法挂载 ISO，也找不到 7-Zip，不能从 ISO 解出 install 镜像。
+  echo     请换带完整版 7-Zip 的 ShellGate PE，或先在别处解压 ISO，再把 sources\install.wim/esd 的路径传给 win-install apply
+  exit /b 2
+)
 set "ISOTMP=%TGT%\$sg_iso"
-echo [i] 挂载不可用，用 7za 解出 install 镜像到 !ISOTMP!
-"!SZ!" e -y -o"!ISOTMP!" "%SRC%" sources\install.wim sources\install.esd >nul
-if exist "!ISOTMP!\install.wim" (set "SRC=!ISOTMP!\install.wim") else if exist "!ISOTMP!\install.esd" (set "SRC=!ISOTMP!\install.esd") else (echo [x] ISO 里没有 sources\install.wim/esd & rd /s /q "!ISOTMP!" 2>nul & exit /b 2)
+echo [i] 挂载不可用，用 !SZ! 解出 install 镜像到 !ISOTMP!
+for %%T in (-tudf -tiso "") do if not exist "!ISOTMP!\install.wim" if not exist "!ISOTMP!\install.esd" "!SZ!" e %%~T -y -o"!ISOTMP!" "%SRC%" sources\install.wim sources\install.esd >nul 2>nul
+if exist "!ISOTMP!\install.wim" (set "SRC=!ISOTMP!\install.wim") else if exist "!ISOTMP!\install.esd" (set "SRC=!ISOTMP!\install.esd") else goto isofail
+goto noiso
+:isofail
+rd /s /q "!ISOTMP!" 2>nul
+if defined SZLITE (
+  echo [x] 精简版 7za 不支持 ISO/UDF，解不出 sources\install.wim/esd。需要完整版 7-Zip：X:\Program Files\ShellGatePE\7zip-full\7z.exe 和 7z.dll
+  echo     或先在别处解压 ISO，再把 install.wim/esd 的路径传给 win-install apply
+) else (
+  echo [x] ISO 里没找到 sources\install.wim/esd，或 7-Zip 解压失败。请确认这是 Windows 安装 ISO
+)
+exit /b 2
 :noiso
 set "WIM=%SRC%"
 if exist "%SRC%\sources\install.wim" set "WIM=%SRC%\sources\install.wim"

@@ -52,6 +52,9 @@ try {
                 'aria2c' = 'aria2\aria2c.exe'; 'cloudflared' = 'cloudflared\cloudflared.exe'; 'win-install' = 'bin\win-install.cmd';
                 'win-offline' = 'bin\win-offline.cmd'; 'menu.hta' = 'menu.hta'; 'bootsect' = 'bin\bootsect.exe' }
     foreach ($k in $tools.Keys | Sort-Object) { Check (Test-Path (Join-Path $pe $tools[$k])) "tool $k ($($tools[$k]))" }
+    # win-install's ISO fallback needs the full 7-Zip (7za has no ISO/UDF handler): 7z.exe and 7z.dll side by side
+    $sz = if ($Arch -eq 'x86') { '7zip-x86' } else { '7zip-full' }
+    foreach ($f in '7z.exe', '7z.dll') { Check (Test-Path (Join-Path $pe "$sz\$f")) "full 7-Zip $sz\$f (ISO/UDF for win-install)" }
     $intl = (& dism.exe /Image:$mnt /Get-Intl) -join "`n"
     Check ($intl -match 'zh-CN') "UI language zh-CN"
     $sc = (& dism.exe /Image:$mnt /Get-ScratchSpace) -join "`n"
